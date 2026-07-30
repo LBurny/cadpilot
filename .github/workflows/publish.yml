@@ -3,6 +3,7 @@ name: Publish to PyPI
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:  # manual trigger → TestPyPI only
 
 jobs:
   test:
@@ -16,7 +17,27 @@ jobs:
           uv sync
           uv run --no-sync pytest -q
 
+  publish-testpypi:
+    if: github.event_name == 'workflow_dispatch'
+    needs: test
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      id-token: write  # required for Trusted Publishing (OIDC)
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: Build
+        run: uv build
+      - name: Publish to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+
   publish:
+    if: github.event_name == 'push'
     needs: test
     runs-on: ubuntu-latest
     environment: pypi
