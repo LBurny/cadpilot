@@ -4,6 +4,16 @@
 
 **AI pilots FreeCAD.** CADPilot is an MCP (Model Context Protocol) server that gives AI clients (Cherry Studio, Claude Code, ZCode, Kimi Code, Claude Desktop, …) full control of [FreeCAD](https://www.freecad.org/): create documents, build constrained sketches, run parametric features, assemble parts with persistent joints, and verify geometry — all via tool calls over XML-RPC.
 
+## Features
+
+* **Parametric modeling, end to end** — spreadsheet-driven variables, fully constrained sketches, PartDesign features (pad/pocket/revolution/…), dress-up ops, and a multi-view 2D→3D visual hull, all through one unified `cad()` tool.
+* **Step recording & rollback** — every mutation runs in a FreeCAD transaction and is recorded as a session step; `session_rollback` backtracks via native undo, so the AI can experiment and retry instead of rebuilding from scratch.
+* **Persistence** — sessions, patterns, and settings survive restarts as JSON under `~/.cadpilot/`; pause a session today, resume it tomorrow.
+* **Geometry sensing** — measure volumes/areas, inspect face/edge topology, and check interference after every step; quantitative feedback replaces guesswork on complex models.
+* **Data-driven assembly** — named anchors, residual-checked mates, connectivity audits, and persistent joints (FreeCAD 1.1 Assembly workbench) with declarative priority trimming.
+* **Workflow memory** — successful modeling recipes are stored as reusable patterns and recalled on demand; the agent gets better the more you use it.
+* **Token-friendly** — text-first responses with opt-in screenshots (768 px cap), a tiny tool surface, and on-demand operation docs keep context usage low.
+
 ## Installation
 
 ### Step 1: Install the FreeCAD addon
