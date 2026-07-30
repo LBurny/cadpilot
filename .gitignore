@@ -32,3 +32,6 @@ Thumbs.db
 
 # Allow the demo model in examples/
 !examples/ModernBicycle.FCStd
+
+# Local blog drafts (not for publication)
+docs/blog*.md
