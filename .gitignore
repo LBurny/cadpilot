@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+dist/
+build/
+*.egg-info/
+
+# FreeCAD working files (demos / backups)
+*.FCStd
+*.FCBak
+*.FCStd1
+
+# Local plans / skills
+docs/superpowers/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# IDE
+.idea/
+.vscode/
+.zcode/
+
+# Local secrets
+.env

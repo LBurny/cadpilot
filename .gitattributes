@@ -1,0 +1,7 @@
+# Normalize line endings: LF in the repository, platform-native on checkout
+* text=auto
+
+# Never convert binary assets
+*.png binary
+*.gif binary
+*.FCStd binary
