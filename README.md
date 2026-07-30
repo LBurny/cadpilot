@@ -69,7 +69,7 @@ cd cadpilot
 uv sync
 ```
 
-Then use this MCP client configuration instead of the one below (`--no-sync` skips the editable rebuild on every launch, which would fail while another server instance is running):
+Then use this MCP client configuration instead of the one below — **replace `/path/to/cadpilot` with the actual clone path** (`--no-sync` skips the editable rebuild on every launch, which would fail while another server instance is running):
 
 ```json
 {

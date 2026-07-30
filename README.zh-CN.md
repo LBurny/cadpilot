@@ -69,7 +69,7 @@ cd cadpilot
 uv sync
 ```
 
-然后改用下面的 MCP 客户端配置（`--no-sync` 跳过每次启动时的 editable 重建 —— 当有其他服务器实例正在运行时，重建会因 exe 被锁定而失败）：
+然后改用下面的 MCP 客户端配置 —— **注意把 `/path/to/cadpilot` 替换成实际的克隆路径**（`--no-sync` 跳过每次启动时的 editable 重建 —— 当有其他服务器实例正在运行时，重建会因 exe 被锁定而失败）：
 
 ```json
 {
