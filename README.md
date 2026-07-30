@@ -4,6 +4,14 @@
 
 **AI pilots FreeCAD.** CADPilot is an MCP (Model Context Protocol) server that gives AI clients (Cherry Studio, Claude Code, ZCode, Kimi Code, Claude Desktop, …) full control of [FreeCAD](https://www.freecad.org/): create documents, build constrained sketches, run parametric features, assemble parts with persistent joints, and verify geometry — all via tool calls over XML-RPC.
 
+## Showcase
+
+Models built by the AI through CADPilot — demo files live in [`examples/`](examples/):
+
+| Modern Bicycle (uncolored) | Streamlined Car (colored) |
+| :---: | :---: |
+| [![Modern bicycle modeled by CADPilot](examples/ModernBicycle.png)](examples/ModernBicycle.FCStd) | [![Streamlined car modeled by CADPilot](examples/Car.png)](examples/StreamlinedCar.FCStd) |
+
 ## Features
 
 * **Parametric modeling, end to end** — spreadsheet-driven variables, fully constrained sketches, PartDesign features (pad/pocket/revolution/…), dress-up ops, and a multi-view 2D→3D visual hull, all through one unified `cad()` tool.

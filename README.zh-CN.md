@@ -4,6 +4,14 @@
 
 **AI 驾驶 FreeCAD。** CADPilot 是一个 MCP（Model Context Protocol）服务器，让 AI 客户端（Cherry Studio、Claude Code、ZCode、Kimi Code、Claude Desktop 等）完全掌控 [FreeCAD](https://www.freecad.org/)：创建文档、构建全约束草图、运行参数化特征、以持久化关节装配零件、验证几何 —— 全部通过 XML-RPC 上的工具调用完成。
 
+## 效果展示
+
+AI 通过 CADPilot 构建的模型 —— 演示文件位于 [`examples/`](examples/)：
+
+| 现代自行车（未上色） | 流线型赛车（已上色） |
+| :---: | :---: |
+| [![CADPilot 建模的现代自行车](examples/ModernBicycle.png)](examples/ModernBicycle.FCStd) | [![CADPilot 建模的流线型赛车](examples/Car.png)](examples/StreamlinedCar.FCStd) |
+
 ## 特点
 
 * **端到端参数化建模** —— 电子表格变量驱动、全约束草图、PartDesign 特征（pad/pocket/revolution 等）、修饰操作、多视图 2D→3D 视觉外壳，全部收敛在一个统一的 `cad()` 工具里。
