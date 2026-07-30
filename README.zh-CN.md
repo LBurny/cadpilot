@@ -8,9 +8,9 @@
 
 AI 通过 CADPilot 构建的模型 —— 演示文件位于 [`examples/`](examples/)：
 
-| 现代自行车（未上色） | 流线型赛车（已上色） |
+| 现代自行车（未上色） | 跑车（已上色） |
 | :---: | :---: |
-| [![CADPilot 建模的现代自行车](examples/ModernBicycle.png)](examples/ModernBicycle.FCStd) | [![CADPilot 建模的流线型赛车](examples/Car.png)](examples/StreamlinedCar.FCStd) |
+| [![CADPilot 建模的现代自行车](examples/ModernBicycle.png)](examples/ModernBicycle.FCStd) | [![CADPilot 建模的跑车](examples/SportsCar2.png)](examples/SportsCar.FCStd) |
 
 ## 特点
 

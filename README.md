@@ -8,9 +8,9 @@
 
 Models built by the AI through CADPilot — demo files live in [`examples/`](examples/):
 
-| Modern Bicycle (uncolored) | Streamlined Car (colored) |
+| Modern Bicycle (uncolored) | Sports Car (colored) |
 | :---: | :---: |
-| [![Modern bicycle modeled by CADPilot](examples/ModernBicycle.png)](examples/ModernBicycle.FCStd) | [![Streamlined car modeled by CADPilot](examples/Car.png)](examples/StreamlinedCar.FCStd) |
+| [![Modern bicycle modeled by CADPilot](examples/ModernBicycle.png)](examples/ModernBicycle.FCStd) | [![Sports car modeled by CADPilot](examples/SportsCar2.png)](examples/SportsCar.FCStd) |
 
 ## Features
 
