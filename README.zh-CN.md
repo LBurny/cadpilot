@@ -51,6 +51,8 @@ Copy-Item -Recurse addon/CADPilot "$env:APPDATA\FreeCAD\Mod\"
 
 ### 第二步：安装 MCP 服务器
 
+#### 方式 A：PyPI（推荐）
+
 安装 [uv](https://docs.astral.sh/uv/getting-started/installation/) 后无需显式安装 —— `uvx` 首次使用时自动从 PyPI 拉取：
 
 ```bash
@@ -59,11 +61,32 @@ uvx cadpilot
 
 或用 pip：`pip install cadpilot`
 
+#### 方式 B：源码安装
+
+```bash
+git clone https://github.com/LBurny/cadpilot.git
+cd cadpilot
+uv sync
+```
+
+然后改用下面的 MCP 客户端配置（`--no-sync` 跳过每次启动时的 editable 重建 —— 当有其他服务器实例正在运行时，重建会因 exe 被锁定而失败）：
+
+```json
+{
+  "mcpServers": {
+    "cadpilot": {
+      "command": "uv",
+      "args": ["--directory", "/path/to/cadpilot", "run", "--no-sync", "cadpilot"]
+    }
+  }
+}
+```
+
 服务器通过 stdio 讲 MCP 协议，并连接 FreeCAD 插件在 `localhost:9875` 上的 XML-RPC 服务 —— 通常不需要手动运行，AI 客户端会通过下面的配置自动启动它。
 
 ## 客户端配置
 
-所有支持 stdio 的 MCP 客户端使用同一份配置 —— **command** 为 `uvx`，**args** 为 `["cadpilot"]`：
+所有支持 stdio 的 MCP 客户端使用同一份配置 —— **command** 为 `uvx`，**args** 为 `["cadpilot"]`。把下面的 JSON 片段粘贴到你所用客户端的 MCP 配置中（Claude Code、Kimi Code、Cherry Studio、ZCode、Claude Desktop、Cursor 等）：
 
 ```json
 {
@@ -75,12 +98,6 @@ uvx cadpilot
   }
 }
 ```
-
-* **Claude Code**：`claude mcp add cadpilot -- uvx cadpilot`
-* **Kimi Code**：`kimi mcp add cadpilot -- uvx cadpilot`
-* **Cherry Studio**：设置 → MCP 服务器 → 添加服务器，类型 `stdio`，命令 `uvx`，参数 `cadpilot`
-* **ZCode**：把上面的 JSON 片段加入 `~/.zcode/cli/config.json` 的 `mcp.servers` 下
-* **Claude Desktop / Cursor 等**：把 JSON 片段粘贴到对应客户端的 MCP 配置文件
 
 ### 启动选项
 
@@ -100,8 +117,6 @@ uvx cadpilot
   }
 }
 ```
-
-开发模式（从本地克隆运行而非 PyPI）：`"command": "uv"`，`"args": ["--directory", "/path/to/cadpilot", "run", "cadpilot"]`。
 
 ## 远程连接
 

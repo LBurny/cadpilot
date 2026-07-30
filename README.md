@@ -51,6 +51,8 @@ Restart FreeCAD, select **CADPilot** from the workbench list, and start the RPC 
 
 ### Step 2: Install the MCP server
 
+#### Option A: PyPI (recommended)
+
 With [uv](https://docs.astral.sh/uv/getting-started/installation/) installed, no explicit install is needed — `uvx` fetches the package from PyPI on first use:
 
 ```bash
@@ -59,11 +61,32 @@ uvx cadpilot
 
 Or with pip: `pip install cadpilot`
 
+#### Option B: From source
+
+```bash
+git clone https://github.com/LBurny/cadpilot.git
+cd cadpilot
+uv sync
+```
+
+Then use this MCP client configuration instead of the one below (`--no-sync` skips the editable rebuild on every launch, which would fail while another server instance is running):
+
+```json
+{
+  "mcpServers": {
+    "cadpilot": {
+      "command": "uv",
+      "args": ["--directory", "/path/to/cadpilot", "run", "--no-sync", "cadpilot"]
+    }
+  }
+}
+```
+
 The server speaks MCP on stdio and connects to FreeCAD's XML-RPC addon on `localhost:9875` — you normally don't run it by hand; your AI client launches it via the configuration below.
 
 ## Client setup
 
-All MCP clients that support stdio servers use the same configuration — **command** `uvx`, **args** `["cadpilot"]`:
+All MCP clients that support stdio servers use the same configuration — **command** `uvx`, **args** `["cadpilot"]`. Paste this snippet into your client's MCP configuration (Claude Code, Kimi Code, Cherry Studio, ZCode, Claude Desktop, Cursor, …):
 
 ```json
 {
@@ -75,12 +98,6 @@ All MCP clients that support stdio servers use the same configuration — **comm
   }
 }
 ```
-
-* **Claude Code**: `claude mcp add cadpilot -- uvx cadpilot`
-* **Kimi Code**: `kimi mcp add cadpilot -- uvx cadpilot`
-* **Cherry Studio**: Settings → MCP Servers → Add Server, type `stdio`, command `uvx`, args `cadpilot`
-* **ZCode**: add the JSON snippet under `mcp.servers` in `~/.zcode/cli/config.json`
-* **Claude Desktop / Cursor / …**: paste the JSON snippet into the client's MCP config file
 
 ### Startup options
 
@@ -100,8 +117,6 @@ Tool responses are text-only by default — screenshots are opt-in per call (`wi
   }
 }
 ```
-
-To run from a local clone instead of PyPI, use `"command": "uv"`, `"args": ["--directory", "/path/to/cadpilot", "run", "cadpilot"]`.
 
 ## Remote connections
 
