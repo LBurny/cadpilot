@@ -5,7 +5,7 @@ face sketch -> pocket -> fillet, then verifies the expression chain by
 changing a variable and re-measuring, and finally exercises the
 under-constrained / conflicting-constraint paths and undo.
 
-Run: uv run --no-sync python scripts/live_sketch_verify.py
+Run: uv run --no-sync python tests/live_sketch_verify.py
 """
 
 import math
