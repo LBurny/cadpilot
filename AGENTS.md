@@ -91,6 +91,16 @@ During development you can reload the addon **without restarting FreeCAD**:
    from PySide import QtCore  # or PySide6 / PySide2
 
 
+   def _start(rs):
+       result = rs.start_rpc_server(9875)
+       print("start:", result)
+       if "still stopping" in str(result):
+           # Previous stop is still draining; retry instead of giving up
+           # (giving up here leaves a half-restarted server: socket dead,
+           # no heartbeat, every GUI-dispatched call hangs).
+           QtCore.QTimer.singleShot(4000, lambda: _start(rs))
+
+
    def restart():
        for sub in [
            "ip_filter",
@@ -103,6 +113,8 @@ During development you can reload the addon **without restarting FreeCAD**:
            "commands",
            "geometry_query",
            "assembly_ops",
+           "trim_ops",
+           "joint_ops",
            "sketcher_ops",
            "feature_ops",
        ]:
@@ -110,7 +122,7 @@ During development you can reload the addon **without restarting FreeCAD**:
            if name in sys.modules:
                importlib.reload(sys.modules[name])
        rs = importlib.reload(rs_old)
-       print("start:", rs.start_rpc_server(9875))
+       _start(rs)
 
 
    # Deferred restart: the in-flight XML-RPC request blocks shutdown drain,
@@ -119,6 +131,24 @@ During development you can reload the addon **without restarting FreeCAD**:
    ```
 
 3. Wait ~8 seconds before issuing the next MCP call so the new server is ready.
+
+4. If GUI-dispatched calls (e.g. `execute_code`) hang after the reload but
+   `ping` still answers, the heartbeat/waker chain died during the race.
+   Repair via `execute_code_async` (its worker runs without GUI dispatch):
+   ```python
+   import rpc_server.gui_dispatch as gd
+   from PySide import QtCore
+   import FreeCADGui
+
+   def repair():
+       while not gd._rpc_request_queue.empty():
+           t = gd._rpc_request_queue.get()
+           if t is not gd._SHUTDOWN:
+               t()
+       QtCore.QTimer.singleShot(500, gd.process_gui_tasks)
+
+   QtCore.QTimer.singleShot(0, FreeCADGui.getMainWindow(), repair)
+   ```
 
 > **Why deferred?** `stop_rpc_server()` calls `shutdown()` which blocks until the current request drains, and `server_close()` must release the socket before `start_rpc_server()` can bind again. Running the restart synchronously inside the same `execute_code` call deadlocks because the request itself is blocking shutdown. The `QTimer` deferral runs on FreeCAD's main GUI thread after the RPC call returns.
 
