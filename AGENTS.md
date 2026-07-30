@@ -140,12 +140,14 @@ During development you can reload the addon **without restarting FreeCAD**:
    from PySide import QtCore
    import FreeCADGui
 
+
    def repair():
        while not gd._rpc_request_queue.empty():
            t = gd._rpc_request_queue.get()
            if t is not gd._SHUTDOWN:
                t()
        QtCore.QTimer.singleShot(500, gd.process_gui_tasks)
+
 
    QtCore.QTimer.singleShot(0, FreeCADGui.getMainWindow(), repair)
    ```
