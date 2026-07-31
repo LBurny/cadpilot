@@ -374,11 +374,21 @@ def verify_assembly(doc_name, checks=None, float_threshold=1.0, interference_min
     except Exception:
         return {"success": False, "error": f"Document '{doc_name}' not found."}
     try:
-        shaped = [
-            (o.Name, o.Shape)
-            for o in doc.Objects
-            if getattr(o, "Shape", None) is not None and not o.Shape.isNull()
-        ]
+        # Hidden objects (boolean bases, aggregated tool compounds, work
+        # geometry) are excluded from the audit: they are not part of the
+        # visible assembly and their overlaps with the consuming feature
+        # would be pure noise. ViewObject is absent in console mode — then
+        # everything counts as visible.
+        shaped = []
+        skipped_hidden = 0
+        for o in doc.Objects:
+            shape = getattr(o, "Shape", None)
+            if shape is None or shape.isNull():
+                continue
+            if not getattr(getattr(o, "ViewObject", None), "Visibility", True):
+                skipped_hidden += 1
+                continue
+            shaped.append((o.Name, shape))
         float_threshold = float(float_threshold)
         interference_min_volume = float(interference_min_volume)
 
@@ -505,6 +515,7 @@ def verify_assembly(doc_name, checks=None, float_threshold=1.0, interference_min
                 "interference_count": len(interferences),
                 "island_count": len(islands),
                 "component_count": len(components),
+                "skipped_hidden": skipped_hidden,
                 "checks_failed": sum(1 for c in check_results if not c.get("passed")),
             },
         }

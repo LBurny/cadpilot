@@ -79,6 +79,26 @@ def _axis_vec(value, default="Z"):
     return FreeCAD.Vector(*v)
 
 
+def _inherit_appearance(feat, base):
+    """Copy color/transparency from the base solid to a feature result.
+
+    Part booleans create a fresh ViewObject in the default gray, silently
+    dropping whatever color the user set on the base. Only the two
+    appearance properties that matter for solids are copied; every access
+    is guarded because ViewObject is absent in console mode and the
+    assignment can fail on exotic view providers.
+    """
+    src = getattr(base, "ViewObject", None)
+    dst = getattr(feat, "ViewObject", None)
+    if src is None or dst is None:
+        return
+    for prop in ("ShapeColor", "Transparency"):
+        try:
+            setattr(dst, prop, getattr(src, prop))
+        except Exception:
+            pass
+
+
 def _build_boolean(doc, spec):
     _require(spec, "op", "base", "tool")
     type_map = {"fuse": "Part::Fuse", "cut": "Part::Cut", "common": "Part::Common"}
@@ -108,6 +128,7 @@ def _build_boolean(doc, spec):
             feat.Tool = compound
     else:
         feat.Tool = _get_obj(doc, tool_val, "tool")
+    _inherit_appearance(feat, feat.Base)
     return feat
 
 

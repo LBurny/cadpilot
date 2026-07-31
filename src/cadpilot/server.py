@@ -820,8 +820,10 @@ def verify_assembly(
     Reports: floating (nearest neighbour farther than float_threshold mm),
     interferences (common volume over interference_min_volume mm3), and
     per-check pass/fail for requested anchor pairs {"obj", "anchor",
-    "target", "target_anchor", "tolerance"?}. Call after modeling/assembly
-    steps for a numeric health report instead of eyeballing screenshots.
+    "target", "target_anchor", "tolerance"?}. Hidden objects (boolean
+    bases, tool compounds) are skipped; skipped_hidden counts them. Call
+    after modeling/assembly steps for a numeric health report instead of
+    eyeballing screenshots.
 
     Args:
         checks: Optional anchor-pair distance checks (see above).
