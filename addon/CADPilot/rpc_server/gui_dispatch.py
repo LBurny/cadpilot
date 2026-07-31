@@ -109,8 +109,15 @@ def process_gui_tasks(reschedule: bool = True) -> None:
     try:
         if _rpc_request_queue.empty():
             return  # nothing queued; skip cursor/status-bar churn on idle heartbeat ticks
-        if QtWidgets.QApplication.mouseButtons() != QtCore.Qt.NoButton:
-            return  # user is dragging; defer to next tick
+        if (
+            QtWidgets.QApplication.mouseButtons() != QtCore.Qt.NoButton
+            and FreeCADGui.getMainWindow().isActiveWindow()
+        ):
+            # user is dragging in the active window; defer to next tick.
+            # (Requires an active window: a phantom/stuck button state, e.g.
+            # after a background launch or RDP session, must not starve the
+            # queue forever — see mouseButtons() with no real interaction.)
+            return
         if QtWidgets.QApplication.activePopupWidget() is not None:
             return  # context menu or popup open; defer to next tick
         if QtWidgets.QApplication.activeModalWidget() is not None:

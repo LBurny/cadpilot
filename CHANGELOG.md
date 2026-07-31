@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Phantom mouse-button state no longer starves the GUI task queue**
+  (`gui_dispatch.py`): the drag guard in `process_gui_tasks` deferred all
+  queued tasks whenever Qt reported a pressed mouse button. After a
+  background launch (or an RDP session) Qt can report `LeftButton` with no
+  real interaction, and the state cannot be cleared programmatically —
+  `ping` kept answering while every GUI-dispatched call (e.g.
+  `execute_code`) timed out, looking like a dropped connection. The guard
+  now only defers when the main window is actually active.
+
 ## v0.4.0 (2026-07-30)
 
 ### Renamed to CADPilot
