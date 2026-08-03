@@ -16,6 +16,8 @@ Robustness and performance guarantees:
    only as a fallback.
 3. Mouse-button guard: ``process_gui_tasks`` skips the current tick while
    mouse buttons are held so MCP tasks cannot interrupt 3D navigation drags.
+   Phantom/stuck button states (static between ticks) are filtered out so
+   they can never starve the queue — see ``_user_holding_button``.
 4. Clean shutdown: the ``_SHUTDOWN`` sentinel sets a flag that suppresses the
    ``finally`` reschedule, so ``stop_rpc_server`` actually stops the loop.
 5. Exception isolation: exceptions inside a task are caught, logged, and
@@ -31,12 +33,50 @@ from typing import Any
 
 import FreeCAD
 import FreeCADGui
-from PySide import QtCore, QtWidgets
+from PySide import QtCore, QtGui, QtWidgets
 
 _rpc_request_queue: "queue.Queue[Any]" = queue.Queue()
 _SHUTDOWN = object()
 _processing = False  # re-entrancy guard: True while process_gui_tasks is draining
 _processing_since: float = 0.0  # wall-clock time when _processing became True
+
+# Phantom-input detection for the mouse-button guard. A stuck mouseButtons()
+# state (e.g. after a background launch or RDP session) is *static*: same
+# buttons and same cursor position on every tick. Real drags always move the
+# cursor or change buttons. The guard defers at most this many consecutive
+# identical ticks (~500 ms apart), then treats the held button as phantom
+# and processes the queue anyway — so a phantom state can never starve RPC,
+# even while the FreeCAD window is active.
+_PHANTOM_TICK_LIMIT = 20  # 20 x 500 ms = 10 s of motionless button-hold
+_last_held_state: "tuple | None" = None
+_held_static_ticks = 0
+
+
+def _user_holding_button() -> bool:
+    """True while a real user is holding a mouse button in the active window.
+
+    Distinguishes a real drag from a phantom/stuck button state: the phantom
+    state never changes between ticks, so after ``_PHANTOM_TICK_LIMIT``
+    identical ticks it is ignored. A real user holding the button perfectly
+    still for ~10 s is the only false negative; the consequence is merely
+    that a queued task runs during the hold (pre-guard behavior).
+    """
+    global _last_held_state, _held_static_ticks
+    buttons = QtWidgets.QApplication.mouseButtons()
+    if buttons == QtCore.Qt.NoButton:
+        _last_held_state = None
+        _held_static_ticks = 0
+        return False
+    if not FreeCADGui.getMainWindow().isActiveWindow():
+        return False  # button held in some other window; not our drag
+    pos = QtGui.QCursor.pos()
+    state = (buttons, pos.x(), pos.y())
+    if state == _last_held_state:
+        _held_static_ticks += 1
+    else:
+        _last_held_state = state
+        _held_static_ticks = 0
+    return _held_static_ticks < _PHANTOM_TICK_LIMIT
 
 
 class _WakeSignal(QtCore.QObject):
@@ -109,14 +149,10 @@ def process_gui_tasks(reschedule: bool = True) -> None:
     try:
         if _rpc_request_queue.empty():
             return  # nothing queued; skip cursor/status-bar churn on idle heartbeat ticks
-        if (
-            QtWidgets.QApplication.mouseButtons() != QtCore.Qt.NoButton
-            and FreeCADGui.getMainWindow().isActiveWindow()
-        ):
+        if _user_holding_button():
             # user is dragging in the active window; defer to next tick.
-            # (Requires an active window: a phantom/stuck button state, e.g.
-            # after a background launch or RDP session, must not starve the
-            # queue forever — see mouseButtons() with no real interaction.)
+            # (Phantom/stuck button states are filtered out inside
+            # _user_holding_button — they must not starve the queue.)
             return
         if QtWidgets.QApplication.activePopupWidget() is not None:
             return  # context menu or popup open; defer to next tick
