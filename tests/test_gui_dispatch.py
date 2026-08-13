@@ -21,8 +21,7 @@ from pathlib import Path
 import pytest
 
 ADDON = (
-    Path(__file__).resolve().parent.parent
-    / "addon" / "CADPilot" / "rpc_server" / "gui_dispatch.py"
+    Path(__file__).resolve().parent.parent / "addon" / "CADPilot" / "rpc_server" / "gui_dispatch.py"
 )
 
 
@@ -147,7 +146,7 @@ def _run_ticks(mod, n):
 
 
 def test_no_button_runs_immediately(dispatch):
-    mod, state = dispatch
+    mod, _state = dispatch
     ran = []
     mod._rpc_request_queue.put(lambda: ran.append(1))
     _run_ticks(mod, 1)

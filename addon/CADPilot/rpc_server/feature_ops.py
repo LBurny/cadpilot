@@ -6,6 +6,8 @@ Builders raise on any error; the caller (_run_op_with_screenshot) aborts
 the transaction, so a failed feature leaves no residue.
 """
 
+import contextlib
+
 import FreeCAD
 import Part
 
@@ -93,10 +95,8 @@ def _inherit_appearance(feat, base):
     if src is None or dst is None:
         return
     for prop in ("ShapeColor", "Transparency"):
-        try:
+        with contextlib.suppress(Exception):
             setattr(dst, prop, getattr(src, prop))
-        except Exception:
-            pass
 
 
 def _build_boolean(doc, spec):

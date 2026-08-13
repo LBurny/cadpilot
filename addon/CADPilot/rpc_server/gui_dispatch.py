@@ -80,6 +80,7 @@ def _physical_buttons_down() -> "int | None":
         return None
     try:
         import ctypes
+
         u = ctypes.windll.user32
         if u.GetSystemMetrics(23):  # SM_SWAPBUTTON: left-handed mouse
             vk_l, vk_r = 0x02, 0x01
@@ -135,9 +136,8 @@ def _user_holding_button() -> bool:
         _held_since = now
     if _held_static_ticks >= _PHANTOM_TICK_LIMIT:
         return False  # motionless phantom cap
-    if now - _held_since >= _PHANTOM_HOLD_SECONDS:
-        return False  # continuous-hold cap (phantom + live cursor)
-    return True
+    # continuous-hold cap (phantom + live cursor)
+    return now - _held_since < _PHANTOM_HOLD_SECONDS
 
 
 class _WakeSignal(QtCore.QObject):
