@@ -16,8 +16,9 @@ Robustness and performance guarantees:
    only as a fallback.
 3. Mouse-button guard: ``process_gui_tasks`` skips the current tick while
    mouse buttons are held so MCP tasks cannot interrupt 3D navigation drags.
-   Phantom/stuck button states (static between ticks) are filtered out so
-   they can never starve the queue — see ``_user_holding_button``.
+   Phantom/stuck button states are filtered out by three independent checks
+   (OS physical button state, static-tick cap, hold-duration cap) so they
+   can never starve the queue — see ``_user_holding_button``.
 4. Clean shutdown: the ``_SHUTDOWN`` sentinel sets a flag that suppresses the
    ``finally`` reschedule, so ``stop_rpc_server`` actually stops the loop.
 5. Exception isolation: exceptions inside a task are caught, logged, and
@@ -25,6 +26,7 @@ Robustness and performance guarantees:
 """
 
 import queue
+import sys
 import threading
 import time
 import traceback
@@ -51,32 +53,91 @@ _PHANTOM_TICK_LIMIT = 20  # 20 x 500 ms = 10 s of motionless button-hold
 _last_held_state: "tuple | None" = None
 _held_static_ticks = 0
 
+# The static-tick cap alone is NOT enough: a phantom stuck button PLUS a
+# live cursor (the user keeps moving the mouse over the active window —
+# normal while inspecting a model between run steps) resets the counter on
+# every tick, so the queue defers forever (the recurring wedge). Two extra
+# bounds make the wedge impossible:
+#  1. win32 physical ground truth: GetAsyncKeyState says whether the button
+#     is REALLY down. Qt stuck + OS up = phantom, never defer.
+#  2. Hold-duration cap: the same nonzero mask held continuously longer
+#     than this is phantom even with a moving cursor (a real drag never
+#     holds that long; if one ever does, the consequence is merely that a
+#     queued task runs during the hold — pre-guard behavior).
+_PHANTOM_HOLD_SECONDS = 15.0
+_held_mask: "int | None" = None
+_held_since: float = 0.0
+
+
+def _physical_buttons_down() -> "int | None":
+    """OS-level physical mouse-button mask on Windows; None elsewhere.
+
+    Bits match Qt LeftButton/RightButton/MiddleButton (1/2/4). Honors the
+    left-handed swap setting. Never raises — diagnostics must not break
+    dispatch; on any failure returns None (heuristic paths take over).
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        u = ctypes.windll.user32
+        if u.GetSystemMetrics(23):  # SM_SWAPBUTTON: left-handed mouse
+            vk_l, vk_r = 0x02, 0x01
+        else:
+            vk_l, vk_r = 0x01, 0x02
+        mask = 0
+        if u.GetAsyncKeyState(vk_l) & 0x8000:
+            mask |= 1
+        if u.GetAsyncKeyState(vk_r) & 0x8000:
+            mask |= 2
+        if u.GetAsyncKeyState(0x04) & 0x8000:  # VK_MBUTTON
+            mask |= 4
+        return mask
+    except Exception:
+        return None
+
 
 def _user_holding_button() -> bool:
     """True while a real user is holding a mouse button in the active window.
 
-    Distinguishes a real drag from a phantom/stuck button state: the phantom
-    state never changes between ticks, so after ``_PHANTOM_TICK_LIMIT``
-    identical ticks it is ignored. A real user holding the button perfectly
-    still for ~10 s is the only false negative; the consequence is merely
-    that a queued task runs during the hold (pre-guard behavior).
+    Phantom/stuck states are filtered by three independent checks: physical
+    OS state (win32), the static-state tick cap, and the hold-duration cap.
+    A real drag inside FreeCAD moves the cursor or changes buttons and the
+    OS confirms the hold — only then do RPC tasks wait.
     """
-    global _last_held_state, _held_static_ticks
+    global _last_held_state, _held_static_ticks, _held_mask, _held_since
     buttons = QtWidgets.QApplication.mouseButtons()
     if buttons == QtCore.Qt.NoButton:
         _last_held_state = None
         _held_static_ticks = 0
+        _held_mask = None
         return False
     if not FreeCADGui.getMainWindow().isActiveWindow():
         return False  # button held in some other window; not our drag
+    physical = _physical_buttons_down()
+    if physical is not None and physical == 0:
+        # Qt claims a hold the OS says is not happening: phantom, and the
+        # static counter must not keep accumulating for it either.
+        _last_held_state = None
+        _held_static_ticks = 0
+        _held_mask = None
+        return False
     pos = QtGui.QCursor.pos()
     state = (buttons, pos.x(), pos.y())
+    now = time.monotonic()
     if state == _last_held_state:
         _held_static_ticks += 1
     else:
         _last_held_state = state
         _held_static_ticks = 0
-    return _held_static_ticks < _PHANTOM_TICK_LIMIT
+    if buttons != _held_mask:
+        _held_mask = buttons
+        _held_since = now
+    if _held_static_ticks >= _PHANTOM_TICK_LIMIT:
+        return False  # motionless phantom cap
+    if now - _held_since >= _PHANTOM_HOLD_SECONDS:
+        return False  # continuous-hold cap (phantom + live cursor)
+    return True
 
 
 class _WakeSignal(QtCore.QObject):

@@ -136,6 +136,8 @@ def dispatch(monkeypatch):
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     mod._PHANTOM_TICK_LIMIT = 5  # keep tests fast; production value is 20
+    # Tests drive the heuristic paths; real OS button state is environmental.
+    mod._physical_buttons_down = lambda: None
     return mod, state
 
 
