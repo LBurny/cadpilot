@@ -23,6 +23,7 @@ in :func:`_status` surfaces the case where someone undid work by hand.
 from __future__ import annotations
 
 import contextlib
+import math
 import time
 from typing import Any
 
@@ -403,6 +404,8 @@ def _apply_op(doc, spec: dict[str, Any]) -> dict[str, Any]:
             }
         write_journal(doc, records)
         return {"success": True, "index": rec.index, "accepted": rec.accepted}
+    if operation == "snapshot":
+        return _snapshot(doc, records, str((spec.get("params") or {}).get("note") or ""))
     if operation == "reject":
         return _reject(
             doc,
@@ -486,7 +489,12 @@ def _run_steps(doc, records, limit: int | None, upto: int | None) -> dict[str, A
             break
         res = run_record(doc, records, rec)
         executed.append(
-            {"index": rec.index, "success": bool(res.get("success")), "error": rec.error}
+            {
+                "index": rec.index,
+                "operation": rec.operation,
+                "success": bool(res.get("success")),
+                "error": rec.error,
+            }
         )
         if not res.get("success"):
             break
@@ -495,8 +503,48 @@ def _run_steps(doc, records, limit: int | None, upto: int | None) -> dict[str, A
         "executed": executed,
         "count": len(records),
         "done": sj.done_count(records),
-        "error": next((e["error"] for e in executed if not e["success"]), ""),
+        # Name the failing step: this text lands in the addon log and in MCP
+        # replies, where a bare "ValueError: ..." is undebuggable.
+        "error": next(
+            (
+                f"step {e['index']} ({e['operation']}): {e['error']}"
+                for e in executed
+                if not e["success"]
+            ),
+            "",
+        ),
     }
+
+
+def _snapshot(doc, records, note: str) -> dict[str, Any]:
+    """Bookmark the current model state as the accepted baseline.
+
+    For the "the user modeled outside the journal" flow: the marker is done +
+    accepted, so rollback/replay refuses to cross it without force — that
+    soft-lock transitively protects the manual work, whose transactions the
+    journal cannot count. objects_before (what the journal last knew) vs
+    objects_after (the world now) names exactly what happened off-journal.
+    The planned tail is KEPT: a snapshot is a marker, not a commit.
+    """
+    prev = list(records[-1].objects_after) if records else []
+    rec = sj.StepRecord(
+        index=len(records) + 1,
+        state=sj.STATE_DONE,
+        operation="snapshot",
+        label=note or "manual baseline",
+        params={"note": note},
+        atomic=False,
+        executable=False,
+        accepted=True,
+        objects_before=prev,
+        objects_after=_object_names(doc),
+        timestamp=sj.stamp(),
+    )
+    records.append(rec)
+    write_journal(doc, records)
+    added = [n for n in rec.objects_after if n not in set(prev)]
+    logger.info("journal snapshot at step %d (%d new object(s))", rec.index, len(added))
+    return {"success": True, "index": rec.index, "added": added}
 
 
 def _rollback(doc, records, to_index: int, force: bool) -> dict[str, Any]:
@@ -619,3 +667,262 @@ def _reexecute(
     write_journal(doc, records)
     res = run_record(doc, records, rec)
     return {**res, "index": index, "count": len(records), "done": sj.done_count(records)}
+
+
+# --- manual-edit sync ----------------------------------------------------------
+#
+# Human/machine collaboration needs the journal to tell the truth about the
+# model: when the user corrects a dimension (or moves/rotates a part) in
+# FreeCAD's property panel, a later reexecute/replay must not silently revert
+# that correction. This observer mirrors GUI edits on objects a done step
+# produced back into that step's ``params["obj_properties"]``. Scope is
+# deliberately narrow: only scalar properties ALREADY present in the params
+# are synced (the spec's structure is never invented), plus the Placement of
+# create_object/edit_object steps (a reexecute re-applies obj_properties and
+# would otherwise teleport the part back to the origin). Engine ops never
+# echo here — re-creation writes the same values the params already hold,
+# which the diff check swallows.
+
+_SYNC_EVENTS: list[dict[str, Any]] = []
+
+
+def pop_sync_events(doc_name: str) -> list[dict[str, Any]]:
+    """Take (and clear) the queued manual-edit notices for one document."""
+    mine = [e for e in _SYNC_EVENTS if e["doc"] == doc_name]
+    if mine:
+        _SYNC_EVENTS[:] = [e for e in _SYNC_EVENTS if e["doc"] != doc_name]
+    return mine
+
+
+def _num(value: float) -> int | float:
+    f = float(value)
+    return int(f) if f.is_integer() else f
+
+
+def _json_scalar(value) -> int | float | str | bool | None:
+    """A FreeCAD property value reduced to a JSON scalar, else None."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return _num(value)
+    if isinstance(value, str):
+        return value
+    q = getattr(value, "Value", None)  # Base.Quantity
+    if isinstance(q, (int, float)):
+        return _num(q)
+    return None
+
+
+def _same_scalar(a, b) -> bool:
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return abs(float(a) - float(b)) <= 1e-9
+    return a == b
+
+
+# Feature ops whose spec keys map onto a feature-object property (verified
+# against the builders in feature_ops.py): object property ->
+# params["obj_properties"] key. Richer values (edge selectors, links,
+# boolean tool compounds) are intentionally not synced. FreeCAD >= 1.1 moved
+# fillet/chamfer sizes off the scalar Radius/Size property into per-edge
+# Edges tuples, so both names are claimed (only the one that exists fires).
+_FEATURE_SYNC: dict[str, dict[str, str]] = {
+    "fillet": {"Radius": "radius", "Edges": "radius"},
+    "chamfer": {"Size": "size", "Edges": "size"},
+    "pad": {"Length": "length"},
+    "pocket": {"Length": "length"},
+    "revolution": {"Angle": "angle"},
+    "groove": {"Angle": "angle"},
+    "thickness": {"Value": "value"},
+    "draft": {"Angle": "angle"},
+}
+
+
+def _uniform_edge_size(edges) -> int | float | None:
+    """Uniform (index, start, end) edge-size list -> the single size, else None.
+
+    The journal spec carries one scalar radius/size, so only a uniform edit
+    maps back — per-edge sizes have no spec representation.
+    """
+    try:
+        sizes = {round(float(t[1]), 9) for t in edges} | {round(float(t[2]), 9) for t in edges}
+    except (TypeError, IndexError, ValueError):
+        return None
+    if len(sizes) == 1:
+        return _num(sizes.pop())
+    return None
+
+
+def _placement_json(pl) -> dict:
+    """FreeCAD.Placement -> the dict shape property_mapper accepts.
+
+    Rotation.Angle reads back in RADIANS while the mapper constructs with
+    DEGREES (FreeCAD.Rotation(axis, deg)) — convert here or a round-trip
+    turns 90° into 1.57°.
+    """
+    rot = pl.Rotation
+    return {
+        "Base": {"x": _num(pl.Base.x), "y": _num(pl.Base.y), "z": _num(pl.Base.z)},
+        "Rotation": {
+            "Axis": {"x": _num(rot.Axis.x), "y": _num(rot.Axis.y), "z": _num(rot.Axis.z)},
+            "Angle": _num(math.degrees(rot.Angle)),
+        },
+    }
+
+
+def _flat_placement(d: dict) -> tuple:
+    base = d.get("Base") or d.get("Position") or {}
+    rot = d.get("Rotation") or {}
+    axis = rot.get("Axis") or {}
+    return (
+        float(base.get("x", 0)),
+        float(base.get("y", 0)),
+        float(base.get("z", 0)),
+        float(axis.get("x", 0)),
+        float(axis.get("y", 0)),
+        float(axis.get("z", 1)),
+        float(rot.get("Angle", 0)),
+    )
+
+
+def _same_placement(a, b) -> bool:
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return False
+    fa, fb = _flat_placement(a), _flat_placement(b)
+    return all(abs(x - y) <= 1e-9 for x, y in zip(fa, fb, strict=True))
+
+
+def _placement_brief(d) -> str:
+    if not isinstance(d, dict):
+        return "-"
+    base = d.get("Base") or {}
+    rot = d.get("Rotation") or {}
+    axis = rot.get("Axis") or {}
+    pos = ",".join(str(_num(base.get(k, 0))) for k in "xyz")
+    ax = ",".join(str(_num(axis.get(k, 0))) for k in "xyz")
+    return f"pos({pos}) rot {_num(rot.get('Angle', 0))}deg@({ax})"
+
+
+def _tracked_objects(records) -> dict[str, dict[str, tuple[int, str]]]:
+    """object name -> {object property -> (step index, params key)}.
+
+    Later done steps win per property, so a sync lands on the step that last
+    decided that property. Placement is claimed by create_object/edit_object
+    unless a ``move`` step targets the object: a move is a RELATIVE change,
+    so it must keep owning the final pose (an absolute create-time Placement
+    plus the relative move would double-apply on reexecute).
+    """
+    moved = {str(r.params.get("obj_name") or "") for r in records if r.operation == "move"}
+    tracked: dict[str, dict[str, tuple[int, str]]] = {}
+    for rec in records:
+        if rec.state != sj.STATE_DONE:
+            continue
+        props = rec.params.get("obj_properties") or {}
+        if rec.operation in ("create_object", "edit_object"):
+            claims = {k: k for k, v in props.items() if isinstance(v, (int, float, str, bool))}
+            if rec.operation == "create_object":
+                names = set(rec.objects_after) - set(rec.objects_before)
+            else:
+                names = {str(rec.params.get("obj_name") or "")}
+        else:
+            claims = {
+                prop: key
+                for prop, key in _FEATURE_SYNC.get(rec.operation, {}).items()
+                if key in props
+            }
+            names = set(rec.objects_after) - set(rec.objects_before)
+        for name in names:
+            if not name:
+                continue
+            entry = tracked.setdefault(name, {})
+            for prop, key in claims.items():
+                entry[prop] = (rec.index, key)
+            if rec.operation in ("create_object", "edit_object") and name not in moved:
+                entry["Placement"] = (rec.index, "Placement")
+    return tracked
+
+
+class _JournalSyncObserver:
+    def __init__(self):
+        self._cache: dict[str, tuple[str, dict]] = {}
+        self._writing = False
+
+    def slotChangedObject(self, obj, prop):
+        if self._writing:
+            return
+        # An observer must never break the host's edit.
+        with contextlib.suppress(Exception):
+            self._sync(obj, prop)
+
+    def _sync(self, obj, prop) -> None:
+        doc = getattr(obj, "Document", None)
+        if doc is None:
+            return
+        text = getattr(doc, sj.JOURNAL_PROP, "") or ""
+        if not text:
+            return
+        cached = self._cache.get(doc.Name)
+        if cached is None or cached[0] != text:
+            cached = (text, _tracked_objects(sj.from_json(text)))
+            self._cache[doc.Name] = cached
+        hit = cached[1].get(getattr(obj, "Name", ""), {}).get(prop)
+        if hit is None:
+            return
+        if prop == "Placement":
+            value, same, brief = _placement_json(obj.Placement), _same_placement, _placement_brief
+        elif prop == "Edges":
+            value = _uniform_edge_size(getattr(obj, prop, None))
+            if value is None:
+                return
+            same, brief = _same_scalar, repr
+        else:
+            value = _json_scalar(getattr(obj, prop, None))
+            if value is None:
+                return
+            same, brief = _same_scalar, repr
+        records = sj.from_json(text)
+        rec = next((r for r in records if r.index == hit[0]), None)
+        if rec is None:
+            return
+        current = (rec.params.get("obj_properties") or {}).get(hit[1])
+        if same(current, value):
+            return
+        rec.params["obj_properties"][hit[1]] = value
+        self._writing = True
+        try:
+            write_journal(doc, records)
+        finally:
+            self._writing = False
+        logger.info(
+            "journal sync: step %d %s.%s = %s (manual edit)",
+            rec.index,
+            obj.Name,
+            prop,
+            brief(value),
+        )
+        _SYNC_EVENTS.append(
+            {
+                "doc": doc.Name,
+                "index": rec.index,
+                "prop": prop,
+                "old": brief(current),
+                "new": brief(value),
+            }
+        )
+        del _SYNC_EVENTS[:-50]
+
+
+_OBSERVER_ATTR = "_cadpilot_journal_sync"
+
+
+def install_sync_observer() -> None:
+    """(Re)install the singleton observer; safe across hot reloads."""
+    old = getattr(FreeCAD, _OBSERVER_ATTR, None)
+    if old is not None:
+        with contextlib.suppress(Exception):
+            FreeCAD.removeDocumentObserver(old)
+    observer = _JournalSyncObserver()
+    FreeCAD.addDocumentObserver(observer)
+    setattr(FreeCAD, _OBSERVER_ATTR, observer)
+
+
+install_sync_observer()

@@ -47,9 +47,22 @@ def test_set_plan_replaces_only_the_unexecuted_tail():
 def test_plan_rollback_counts_done_records_after_target():
     recs = [sj.build_record(_step(), i, sj.STATE_DONE, OPS) for i in (1, 2, 3)]
     recs[1].state = sj.STATE_PLANNED
+    for r in (recs[0], recs[2]):
+        r.transaction = f"CADPilot: step {r.index}"
     plan = sj.plan_rollback(recs, 0)
     assert plan["undo_count"] == 2  # only 1 and 3 actually ran
     assert plan["affected"] == [1, 3]
+
+
+def test_undo_count_skips_records_without_a_transaction():
+    """A done execute_code/snapshot record carries no transaction; counting it
+    would undo a transaction belonging to an EARLIER step (plain stack)."""
+    recs = [sj.build_record(_step(), i, sj.STATE_DONE, OPS) for i in (1, 2, 3)]
+    recs[0].transaction = "CADPilot: create_object Box"
+    recs[1].atomic = False  # execute_code: ran, but committed nothing
+    recs[2].transaction = "CADPilot: fillet Box"
+    assert sj.plan_rollback(recs, 0)["undo_count"] == 2
+    assert sj.plan_reject(recs, 2)["undo_count"] == 1
 
 
 def test_plan_rollback_flags_non_atomic_steps():
@@ -119,6 +132,8 @@ def test_meta_roundtrip_and_absent_in_old_journals():
 
 def test_plan_reject_drops_from_index_onward():
     recs = [sj.build_record(_step(), i, sj.STATE_DONE, OPS) for i in (1, 2, 3)]
+    for r in recs:
+        r.transaction = f"CADPilot: step {r.index}"
     recs += [sj.build_record(_step("pad"), 4, sj.STATE_PLANNED, OPS)]
     plan = sj.plan_reject(recs, 2)
     assert plan["undo_count"] == 2  # done steps 2 and 3

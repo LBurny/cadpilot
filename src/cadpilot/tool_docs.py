@@ -270,6 +270,10 @@ Review loop (the point of the panel: plan, release, review, fix):
   accept        mark done step `index` as reviewed; accepted steps are a soft
                 lock — rollback_to / reexecute / replay across them need
                 force=true (params.on=false un-accepts)
+  snapshot      bookmark the current state as the accepted baseline — for
+                off-journal manual modeling: done + accepted (soft-locks all
+                prior steps), non-atomic; objects_before vs objects_after
+                names what the journal missed. params.note describes it
   reject        undo step `index` and DROP everything from it onward (done
                 steps are undone, planned ones forgotten — the tail was
                 authored against step `index` existing). params.reason is

@@ -203,7 +203,10 @@ def done_count(records: list[StepRecord]) -> int:
 def plan_rollback(records: list[StepRecord], to_index: int) -> dict[str, Any]:
     """What it takes to put the model back at ``to_index``.
 
-    ``undo_count`` — how many FreeCAD transactions to undo.
+    ``undo_count`` — how many FreeCAD transactions to undo. Only records that
+    committed one count: a non-atomic execute_code/snapshot record carries no
+    transaction, and counting it would undo a transaction that belongs to an
+    EARLIER step (the undo stack is a plain stack).
     ``affected``   — the indices going back to ``planned``.
     ``blocking``   — non-atomic indices in that range: execute_code manages
                      its own transactions (or none), so undo may revert the
@@ -213,7 +216,7 @@ def plan_rollback(records: list[StepRecord], to_index: int) -> dict[str, Any]:
     """
     affected = [r for r in records if r.state == STATE_DONE and r.index > to_index]
     return {
-        "undo_count": len(affected),
+        "undo_count": sum(1 for r in affected if r.transaction),
         "affected": [r.index for r in affected],
         "blocking": [r.index for r in affected if not r.atomic],
         "accepted": [r.index for r in affected if r.accepted],
@@ -227,16 +230,17 @@ def plan_reject(records: list[StepRecord], index: int) -> dict[str, Any] | None:
     """What rejecting step ``index`` destroys: everything from it onward.
 
     Uniform semantics, mirroring "a new commit invalidates the planned tail":
-    done steps in the range are undone, planned ones dropped — the tail was
-    authored against step ``index`` existing, so keeping it would replay steps
-    against a world they were not designed for. None = no such step.
+    transaction-bearing done steps in the range are undone, planned ones
+    dropped — the tail was authored against step ``index`` existing, so
+    keeping it would replay steps against a world they were not designed
+    for. None = no such step.
     """
     if not any(r.index == index for r in records):
         return None
     drop = [r for r in records if r.index >= index]
     done = [r for r in drop if r.state == STATE_DONE]
     return {
-        "undo_count": len(done),
+        "undo_count": sum(1 for r in done if r.transaction),
         "drop": [r.index for r in drop],
         "blocking": [r.index for r in done if not r.atomic],
         "accepted": [r.index for r in done if r.accepted],

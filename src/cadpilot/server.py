@@ -541,8 +541,8 @@ def step_control(
     """Run, review, and edit steps in a document's step journal.
 
     Actions: run_next | run_all | run_to | rollback_to | reexecute |
-    accept | reject | update | insert | replay | clear_plan | reset |
-    status (index/params/force apply per action; reset needs
+    accept | reject | update | insert | replay | snapshot | clear_plan |
+    reset | status (index/params/force apply per action; reset needs
     confirm=true). Reference: operation_help("step_control").
     """
     return step_control_operation(

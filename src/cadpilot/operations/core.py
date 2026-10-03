@@ -772,6 +772,7 @@ _STEP_ACTIONS = (
     "update",
     "insert",
     "replay",
+    "snapshot",
     "clear_plan",
     "reset",
     "status",
