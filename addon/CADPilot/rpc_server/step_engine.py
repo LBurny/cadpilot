@@ -181,7 +181,6 @@ def append_execute_code(
     doc,
     *,
     code: str,
-    label: str,
     changed: bool,
     objects_before: list[str] | None = None,
 ) -> None:
@@ -210,10 +209,13 @@ def append_execute_code(
                 index=len(records) + 1,
                 state=sj.STATE_DONE,
                 operation="execute_code",
-                # A snippet is multi-line; the panel shows one row per step, so
-                # collapse the whitespace before it becomes the row label.
-                label=" ".join(str(label).split())[:80],
-                params={"code": code} if changed else {},
+                # A step row should say what the snippet DID — its first line is
+                # usually `import FreeCAD` boilerplate. The full code lives in
+                # params and is shown in the panel's detail pane.
+                label=f"execute_code: {sj.effect_label(changed, list(objects_before or []), after)}",
+                # The code is ALWAYS kept, read-only or not: the panel shows it
+                # as the step's detail, and without it a row is an opaque "{}".
+                params={"code": code},
                 transaction="CADPilot: execute_code" if changed else "",
                 atomic=changed,
                 mutated=changed,
@@ -307,6 +309,9 @@ def run_record(doc, records: list[sj.StepRecord], rec: sj.StepRecord) -> dict[st
     """Execute ``rec`` in its own transaction, journal written inside it."""
     tx = _transaction_name(rec)
     before = _object_names(doc)
+    undo_before = 0
+    with contextlib.suppress(Exception):
+        undo_before = doc.UndoCount
     doc.openTransaction(tx)
     logger.info("open transaction %r (%d objects)", tx, len(before))
     started = time.monotonic()
@@ -343,6 +348,23 @@ def run_record(doc, records: list[sj.StepRecord], rec: sj.StepRecord) -> dict[st
     doc.commitTransaction()
     with contextlib.suppress(Exception):
         doc.recompute()
+    # Self-correction for a re-run execute_code whose edited snippet stopped
+    # mutating: the commit produced no undo entry, so the record must stop
+    # claiming one — otherwise a later rollback would undo an EARLIER step's
+    # transaction off the plain stack. (A read-only run is never re-executable,
+    # so there is no path that upgrades in the other direction.)
+    if rec.operation == "execute_code":
+        produced = True
+        with contextlib.suppress(Exception):
+            produced = doc.UndoCount > undo_before
+        if not produced and (rec.atomic or rec.transaction):
+            rec.atomic = False
+            rec.mutated = False
+            rec.executable = False
+            rec.transaction = ""
+            logger.info("step %d (execute_code): re-run changed nothing, downgraded", rec.index)
+            with contextlib.suppress(Exception):
+                write_journal(doc, records)
     return res
 
 
@@ -612,8 +634,8 @@ def _rollback(doc, records, to_index: int, force: bool) -> dict[str, Any]:
         return {
             "success": False,
             "error": (
-                f"cannot roll back across non-atomic step(s) {plan['blocking']} "
-                "(execute_code without a transaction); pass force=true"
+                f"cannot roll back across non-atomic step(s) "
+                f"{sj.blocking_text(records, plan['blocking'])}; pass force=true"
             ),
         }
     if plan["accepted"] and not force:
@@ -664,8 +686,8 @@ def _reject(doc, records, index: int, force: bool, reason: str) -> dict[str, Any
         return {
             "success": False,
             "error": (
-                f"cannot reject across non-atomic step(s) {plan['blocking']} "
-                "(execute_code without a transaction); pass force=true"
+                f"cannot reject across non-atomic step(s) "
+                f"{sj.blocking_text(records, plan['blocking'])}; pass force=true"
             ),
         }
     res = undo_n(doc, plan["undo_count"])

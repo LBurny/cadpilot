@@ -54,6 +54,31 @@ def test_batch_executor_tolerates_operation_keyed_sub_ops():
     assert {"action", "operation"} <= keys
 
 
+def test_effect_label_summarises_a_snippet():
+    """An execute_code row should say what the snippet DID, not echo its first
+    line of boilerplate (`import FreeCAD` / `doc = FreeCAD.getDocument(...)`)."""
+    assert sj.effect_label(False, ["A"], ["A"]) == "read-only"
+    assert sj.effect_label(True, ["A"], ["A", "B"]) == "+1 object(s): B"
+    assert sj.effect_label(True, ["A"], ["A", "B", "C", "D", "E"]).startswith(
+        "+4 object(s): B, C, D"
+    )
+    assert sj.effect_label(True, ["A", "B"], ["A"]) == "-1 object(s)"
+    assert sj.effect_label(True, ["A"], ["A"]) == "changed properties"
+
+
+def test_blocking_text_names_the_real_operations():
+    """The force prompt used to blame execute_code for every non-atomic blocker,
+    but a snapshot marker blocks too — naming the wrong op misleads."""
+    recs = [
+        sj.build_record(_step("execute_code"), 1, sj.STATE_DONE, OPS),
+        sj.build_record(_step("snapshot"), 2, sj.STATE_DONE, OPS),
+        sj.build_record(_step("snapshot"), 3, sj.STATE_DONE, OPS),
+    ]
+    text = sj.blocking_text(recs, [2, 3])
+    assert "snapshot" in text and "execute_code" not in text
+    assert "[2, 3]" in text
+
+
 def test_roundtrip_preserves_records():
     recs = [sj.build_record(_step(), 1, sj.STATE_DONE, OPS)]
     assert sj.from_json(sj.to_json(recs)) == recs

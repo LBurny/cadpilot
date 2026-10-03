@@ -947,7 +947,6 @@ class FreeCADRPC:
                     step_engine.append_execute_code(
                         doc,
                         code=code,
-                        label=f"execute_code: {code[:60]}",
                         changed=changed,
                         objects_before=before,
                     )

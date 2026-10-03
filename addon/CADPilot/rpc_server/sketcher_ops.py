@@ -348,6 +348,50 @@ def _add_constraints(sketch, constraints: list):
 
 # --- attachment -----------------------------------------------------------------
 
+# Direction words for the semantic face selector. Face names are re-derived
+# after every feature, so a name read off one feature can silently mean a
+# different face on the next one: the sketch then attaches to the wrong plane
+# and its pocket cuts air while still reporting success (seen live — a sketch
+# meant for the top attached to the +Y side after the bore pocket shifted the
+# names). A direction is stable across features.
+_FACE_WORDS = {
+    "top": "+Z",
+    "bottom": "-Z",
+    "right": "+X",
+    "left": "-X",
+    "back": "+Y",
+    "front": "-Y",
+}
+
+
+def _resolve_semantic_face(ref, token: str) -> str:
+    """Resolve '+Z' / 'top' / '-X' … to the name of the matching planar face."""
+    want = _FACE_WORDS.get(str(token).lower(), str(token).upper())
+    if want not in ("+X", "-X", "+Y", "-Y", "+Z", "-Z"):
+        raise ValueError(
+            f"plane.face must be [obj, 'FaceN'] or a direction (+X/-Z/top/bottom/…), got {token!r}"
+        )
+    axis = "XYZ".index(want[1])
+    sign = 1.0 if want[0] == "+" else -1.0
+    best: tuple[float, str] | None = None
+    for i, face in enumerate(ref.Shape.Faces, start=1):
+        try:
+            if face.Surface.TypeId != "Part::GeomPlane":
+                continue
+            normal = face.normalAt(0, 0)
+        except Exception:
+            continue
+        if normal[axis] * sign < 0.999:  # must face along ±axis
+            continue
+        # Several faces can share a direction (e.g. a stepped top): take the
+        # farthest along it, which is the outer face a user means.
+        rank = face.CenterOfMass[axis] * sign
+        if best is None or rank > best[0]:
+            best = (rank, f"Face{i}")
+    if best is None:
+        raise ValueError(f"'{ref.Name}' has no planar face facing {want}")
+    return best[1]
+
 
 def _attach_sketch(sketch, doc, spec):
     plane = spec.get("plane", "XY")
@@ -372,6 +416,8 @@ def _attach_sketch(sketch, doc, spec):
         if ref is None:
             raise ValueError(f"plane face object '{face[0]}' not found.")
         face_name = str(face[1])
+        if face_name.startswith(("+", "-")) or face_name.lower() in _FACE_WORDS:
+            face_name = _resolve_semantic_face(ref, face_name)
         n = int(face_name[4:]) if face_name.startswith("Face") else 0
         if n < 1 or n > len(ref.Shape.Faces):
             raise ValueError(

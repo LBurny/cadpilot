@@ -69,9 +69,22 @@ Required in obj_properties: path. Optional: solid, name.""",
 mirror — parametric mirror (obj_name = base object).
 Optional in obj_properties: plane (XY/XZ/YZ, default XY) or face (selector item), name.""",
     "pattern": """\
-pattern — parametric pattern (obj_name = base object).
-Required in obj_properties: count.
-Optional: pattern_type (linear/polar), spacing, axis, angle, center, name.""",
+pattern — repeat a feature or solid (obj_name = base object).
+Required in obj_properties: count (>= 2).
+Optional: pattern_type (linear/polar, default linear), spacing, axis (X/Y/Z or
+  a direction vector), angle, center, reversed, name.
+
+Two VERY different behaviours, picked by the base object:
+- Base is a PartDesign feature (a pad/pocket/… inside a Body): a
+  PartDesign::PolarPattern / LinearPattern is created in that Body, repeating
+  the FEATURE (e.g. a bolt hole) — one solid with N holes.
+- Base is a Part-level solid (a boolean result, a primitive): a Draft array
+  replicates the whole object.
+PartDesign patterns are refused (clear error, nothing created) when the
+transform has no effect — FreeCAD 1.1 cannot drive a PartDesign pattern
+reliably through this API, and silently returning one hole instead of six is
+worse than failing. Workaround: pattern the profile (one pocket per instance,
+e.g. from execute_code) or pattern a Part-level solid with boolean ops.""",
     "move": """\
 move — relative Placement change (obj_name = object to move).
 Optional in obj_properties:
@@ -95,6 +108,12 @@ Optional: plane, offset, body, construction, external, constraints.
 - plane: "XY" / "XZ" / "YZ" (with optional offset along the plane normal),
   {"face": ["ObjName", "FaceN"], "offset": 0} to sketch on an existing solid
   face, or {"datum": "DatumPlaneName"} to sketch on a datum plane.
+  PREFER A DIRECTION OVER A FACE NAME: {"face": ["ObjName", "+Z"]} (also -Z,
+  +X/-X, +Y/-Y, top/bottom/left/right/front/back) resolves to the planar face
+  facing that way. Face names (Face1, Face2, …) are re-derived after every
+  feature, so a name read off one feature can silently mean a different face on
+  the next one — the sketch then lands on the wrong plane and its pocket cuts
+  air while still reporting success.
 - geometry: list of items; the list order is the GeoId used in constraints:
     {"type": "line", "from": [x,y], "to": [x,y]}
     {"type": "arc", "center": [x,y], "radius": r, "start_angle": deg, "end_angle": deg}

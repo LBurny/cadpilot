@@ -125,6 +125,8 @@ FreeCAD 的事务不嵌套，片段自己开的事务会合并进这一个；仅
 
 * `external: [[obj, "EdgeN"|"VertexN"], …]` 添加外部几何。只允许引用起点/终点（`mid`/`center` 会在求解时失败，因此提前拒绝）。体外目标通过幂等的 `PartDesign::SubShapeBinder` 自动桥接，因为 PartDesign 拒绝草图体外的外部几何。
 * `datum_plane` 依附到原点平面或现有面；草图通过 `plane={"datum": name}` 依附。
+* **面依附优先用方向而非面名**：`plane={"face": [obj, "+Z"]}`（以及 -Z、±X、±Y、top/bottom/…）解析为法向匹配的平面，同向多面时取沿该方向最外侧者。面名（Face1、Face2…）在每个特征后都会被重新推导，因此从一个特征读到的名字在下个特征上可能指向完全不同的面 —— 草图落到错误平面上，其 pocket 切了个空气，而调用依然报成功。同样地，没有切除任何材料的 pocket/groove 会返回告警（与该特征的前驱比较），让隐形失败变成可见失败。
+* **特征阵列**：对 PartDesign 特征，`pattern` 会在该特征所属的 Body 内创建 `PartDesign::PolarPattern`/`LinearPattern`，`Originals=[feature]`，复制的是**特征本身的贡献**（一个螺栓孔）而非整个实体。用于 Part 级基对象的 Draft 阵列复制的是基对象整个 Shape —— 对 PartDesign 特征那就等于整个零件。FreeCAD 1.1 无法通过 Python 被可靠驱动做出可用的 PartDesign 阵列，因此当变换无效果时该操作会明确报错，而不是返回"要 N 个孔只给 1 个"的零件。
 * **依附融合**：对依附在实体面上的草图做 pad/pocket 时，操作直接作用于*该*实体 —— pocket 切割它，pad 融合进它。先 pad 再布尔减是错误做法。
 * `hull` 构建视觉外壳：把 2–3 个视图轮廓草图沿各自法向拉伸后求交。结果是静态 `Part::Feature`（重载文档后存活）；同名重跑就地替换 Shape，便于迭代。
 * 任何属性中以 `=` 开头的字符串都通过 ExpressionEngine 绑定，使全链路支持电子表格驱动的参数化（`variables` 操作）。
@@ -191,7 +193,7 @@ AI 驱动 CAD 最难的问题是零件间的相对定位。CADPilot 用数据而
 
 ## 13. 测试策略
 
-pytest 套件（约 320 个测试）基于一个记录每次调用的假 XML-RPC 连接，覆盖 MCP 服务器侧：响应整形、截图策略优先级、重连行为、会话/模式状态机、`cad()` 派发、装配状态机（含 RPC 失败路径）、引导启发式，以及 docstring 预算。
+pytest 套件（约 325 个测试）基于一个记录每次调用的假 XML-RPC 连接，覆盖 MCP 服务器侧：响应整形、截图策略优先级、重连行为、会话/模式状态机、`cad()` 派发、装配状态机（含 RPC 失败路径）、引导启发式，以及 docstring 预算。
 
 插件无法脱离 FreeCAD 导入，因此第二层测试**用 `ast` 解析插件源码**，钉住那些只会在运行时静默失效的契约：`InitGui.py` 的裸 exec 命名空间规则、Steps 面板的 Qt 信号接线、日志边界两侧对 batch 子操作键名的兼容，以及 replay 对不可重跑记录的跳过。诊断套件覆盖各平台的路径布局、一个真实的 loopback XML-RPC 端点、关闭端口，以及各判定分支。
 

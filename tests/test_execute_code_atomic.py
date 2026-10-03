@@ -92,10 +92,11 @@ def test_journal_step_is_atomic_and_replayable_only_when_changed():
     # atomic/executable are driven by `changed`, not hard-coded.
     assert isinstance(kw.get("atomic"), ast.Name) and kw["atomic"].id == "changed"
     assert isinstance(kw.get("executable"), ast.Name) and kw["executable"].id == "changed"
-    # The code is stored (so replay can re-run it) only for a changed step.
+    # The snippet is ALWAYS stored: the panel shows it as the step's detail (an
+    # execute_code row used to render as an opaque "{}"), and replay re-runs it.
     params = kw["params"]
-    assert isinstance(params, (ast.If, ast.IfExp)), "params must depend on `changed`"
     assert "code" in _strings(params), "the snippet must be stored for replay"
+    assert not isinstance(params, (ast.If, ast.IfExp)), "store the code unconditionally"
 
 
 def test_replay_re_executes_a_recorded_snippet():

@@ -125,6 +125,8 @@ Notable details:
 
 * `external: [[obj, "EdgeN"|"VertexN"], …]` adds external geometry. Only start/end points may be referenced (`mid`/`center` fail at solve time and are rejected up front). Out-of-body targets are auto-bridged via an idempotent `PartDesign::SubShapeBinder`, because PartDesign rejects external geometry outside the sketch's body.
 * `datum_plane` attaches to an origin plane or an existing face; sketches attach via `plane={"datum": name}`.
+* **Face attachment prefers a direction over a name**: `plane={"face": [obj, "+Z"]}` (also -Z, ±X, ±Y, top/bottom/…) resolves to the planar face whose normal matches, breaking ties by extremity along that axis. Face names (Face1, Face2, …) are re-derived after every feature, so a name read off one feature can silently mean a different face on the next — the sketch then lands on the wrong plane and its pocket cuts air while the call still reports success. A pocket/groove that removed nothing is likewise returned as a warning (compared against the feature's predecessor), turning an invisible failure into a visible one.
+* **Feature patterns**: on a PartDesign feature, `pattern` creates a `PartDesign::PolarPattern`/`LinearPattern` in that feature's Body with `Originals=[feature]`, repeating the feature's contribution (a bolt hole) rather than the body. The Draft array used for Part-level bases replicates the base object's whole Shape, which for a PartDesign feature is the entire part. FreeCAD 1.1 cannot be driven reliably into a working PartDesign pattern through Python, so when the transform has no effect the op refuses with a clear error instead of returning a part with one hole where N were asked for.
 * **Attachment fusion**: pad/pocket on a sketch attached to a solid's face operate on *that* solid — pocket cuts it, pad fuses into it. Pad-then-boolean-cut is wrong here.
 * `hull` builds a visual hull: intersect 2–3 view-profile sketches extruded along their normals. The result is a static `Part::Feature` (survives reload); re-running with the same name replaces the Shape in place for iteration.
 * String values starting with `=` in any property are bound via the ExpressionEngine, enabling Spreadsheet-driven parametrics (`variables` op) throughout the chain.
@@ -191,7 +193,7 @@ Screenshots are **optional and off by default**:
 
 ## 13. Testing Strategy
 
-The pytest suite (~320 tests) covers the MCP-server side against a fake XML-RPC connection that records every call: response shaping, screenshot policy precedence, reconnect behavior, session/pattern state machines, `cad()` dispatch, assembly state machine (including RPC failure paths), guidance heuristics, and the docstring budget.
+The pytest suite (~325 tests) covers the MCP-server side against a fake XML-RPC connection that records every call: response shaping, screenshot policy precedence, reconnect behavior, session/pattern state machines, `cad()` dispatch, assembly state machine (including RPC failure paths), guidance heuristics, and the docstring budget.
 
 Because the addon cannot be imported without FreeCAD, a second layer of tests **parses the addon source with `ast`** to pin contracts that would otherwise fail silently at runtime: the bare-exec namespace rule in `InitGui.py`, the Qt-signal wiring of the steps panel, batch sub-op key tolerance on both sides of the journal boundary, and the replay skip of non-executable records. The diagnostics suite covers per-platform path layouts, a live loopback XML-RPC endpoint, a closed port, and the verdict branches.
 

@@ -161,6 +161,42 @@ def sub_operation(sub: dict[str, Any]) -> str:
     return str(sub.get("operation") or sub.get("action") or "")
 
 
+def blocking_text(records: list[StepRecord], indices: list[int]) -> str:
+    """Name the steps a rollback must be forced across, with their real ops.
+
+    The message used to hardcode "execute_code", but a snapshot marker is also
+    a blocking, non-transactional record — naming the wrong op sends the user
+    looking in the wrong place.
+    """
+    ops: list[str] = []
+    for index in indices:
+        rec = next((r for r in records if r.index == index), None)
+        op = rec.operation if rec is not None else "?"
+        if op not in ops:
+            ops.append(op)
+    return f"{indices} ({'/'.join(ops)} without a transaction)"
+
+
+def effect_label(changed: bool, before: list[str], after: list[str]) -> str:
+    """Describe what a snippet DID — what an execute_code step row should say.
+
+    The code's first line is usually boilerplate (``import FreeCAD`` /
+    ``doc = FreeCAD.getDocument(...)``), so the object delta is the honest
+    summary: "read-only", "+4 object(s): Hole1, …", or "changed properties" for
+    a snippet that only edited existing ones.
+    """
+    if not changed:
+        return "read-only"
+    added = [n for n in after if n not in set(before)]
+    removed = [n for n in before if n not in set(after)]
+    if added:
+        head = ", ".join(added[:3]) + (", …" if len(added) > 3 else "")
+        return f"+{len(added)} object(s): {head}"
+    if removed:
+        return f"-{len(removed)} object(s)"
+    return "changed properties"
+
+
 def build_record(
     step: dict[str, Any],
     index: int,

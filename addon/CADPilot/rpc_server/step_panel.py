@@ -122,6 +122,26 @@ def _state_icon(rec) -> QtGui.QIcon:
     return _ICON_CACHE[key]
 
 
+def _editor_text(rec) -> str:
+    """What the detail editor shows.
+
+    For an execute_code step that is the snippet itself — the panel used to show
+    a raw params dict, which for those steps was an opaque ``{}``. Editing the
+    snippet and hitting Re-run is how a user iterates on code the model wrote.
+    Every other op shows its params JSON.
+    """
+    if rec.operation == "execute_code":
+        return str((rec.params or {}).get("code") or "")
+    return json.dumps(rec.params, ensure_ascii=False, indent=2) or "{}"
+
+
+def _editor_placeholder(rec) -> str:
+    if rec.operation == "execute_code":
+        # Old journals recorded execute_code before the code was kept.
+        return "# No code recorded for this step (it predates v0.5.2)."
+    return "{}"
+
+
 def _op_label(spec: dict) -> str:
     """ "rollback_to step 4" — a short human label for a journal op spec."""
     label = str(spec.get("operation") or "?").replace("_", " ")
@@ -577,6 +597,10 @@ QLabel#PanelStatus {{ color: {c["dim"]}; padding: 5px 8px 4px 8px; }}
         parts = [f"Step {rec.index}", rec.operation, _STATE_LABEL.get(rec.state, rec.state)]
         if rec.accepted:
             parts.append("accepted")
+        if rec.operation == "execute_code":
+            # Whether the snippet touched the model is the difference between a
+            # rollback-able step and a harmless inspection — worth naming.
+            parts.append("mutating" if rec.mutated else "read-only")
         if rec.timestamp:
             parts.append(rec.timestamp)
         if rec.duration_ms:
@@ -585,10 +609,11 @@ QLabel#PanelStatus {{ color: {c["dim"]}; padding: 5px 8px 4px 8px; }}
         if rec.state == sj.STATE_DONE and gained:
             parts.append(f"{gained:+d} object(s)")
         self.detail_meta.setText(" · ".join(parts))
-        # Do not clobber a half-edited JSON on every 1s refresh: only refill
+        # Do not clobber a half-edited value on every 1s refresh: only refill
         # when the selection moved or the editor is untouched.
         if self._details_for != rec.index or not self.editor.document().isModified():
-            self.editor.setPlainText(json.dumps(rec.params, ensure_ascii=False, indent=2) or "{}")
+            self.editor.setPlaceholderText(_editor_placeholder(rec))
+            self.editor.setPlainText(_editor_text(rec))
             self.editor.document().setModified(False)
         self._details_for = rec.index
 
@@ -703,8 +728,8 @@ QLabel#PanelStatus {{ color: {c["dim"]}; padding: 5px 8px 4px 8px; }}
         force = False
         if plan["blocking"]:
             text += (
-                f"\nStep(s) {plan['blocking']} are non-atomic (execute_code), "
-                "so undo may revert the wrong change."
+                f"\nStep(s) {sj.blocking_text(self._records, plan['blocking'])} "
+                "carry no transaction, so undo may revert the wrong change."
             )
             force = True
         if not self._confirm(text):
@@ -742,11 +767,15 @@ QLabel#PanelStatus {{ color: {c["dim"]}; padding: 5px 8px 4px 8px; }}
         rec = self._selected_record()
         if rec is None:
             return
-        QtGui.QGuiApplication.clipboard().setText(
-            json.dumps(rec.params, ensure_ascii=False, indent=2)
-        )
+        QtGui.QGuiApplication.clipboard().setText(_editor_text(rec))
 
     def _edited_params(self) -> dict | None:
+        rec = self._selected_record()
+        # An execute_code step's detail IS its snippet: the editor holds raw
+        # code, so editing it and hitting Re-run is how a user iterates on a
+        # snippet the model wrote. Wrap it back into the params shape.
+        if rec is not None and rec.operation == "execute_code":
+            return {"code": self.editor.toPlainText()}
         try:
             params = json.loads(self.editor.toPlainText() or "{}")
         except json.JSONDecodeError as e:

@@ -205,31 +205,104 @@ def _build_mirror(doc, spec):
     return feat
 
 
+def _parent_body(obj):
+    """The PartDesign::Body ``obj`` belongs to, or None (a Part-level object)."""
+    for o in getattr(obj, "InList", []):
+        if o.TypeId == "PartDesign::Body":
+            return o
+    return None
+
+
+def _body_axis_datum(body, axis: str):
+    """The body origin's axis datum (App::Line) for 'X'/'Y'/'Z', or None."""
+    origin = getattr(body, "Origin", None)
+    role = f"{axis.upper()}_Axis"
+    return next(
+        (f for f in getattr(origin, "OriginFeatures", []) if getattr(f, "Role", "") == role),
+        None,
+    )
+
+
+def _build_pd_pattern(doc, body, base, spec, ptype: str, count: int):
+    """Pattern a PartDesign FEATURE inside its Body.
+
+    Draft's array replicates the base object's whole Shape — for a PartDesign
+    feature that Shape is the entire body, so arraying a hole produced N
+    overlapping copies of the whole part instead of N holes in one part. A
+    PartDesign::(Polar|Linear)Pattern with ``Originals=[feature]`` repeats the
+    feature's own contribution, which is what "pattern this hole" means.
+    """
+    axis = str(spec.get("axis", "Z")).upper()
+    if axis not in _REV_AXIS:
+        raise ValueError(f"axis must be 'X'/'Y'/'Z' for a PartDesign pattern, got {axis!r}")
+    datum = _body_axis_datum(body, axis)
+    if ptype == "polar":
+        feat = body.newObject("PartDesign::PolarPattern", spec.get("name") or "PolarPattern")
+        _set_or_bind(feat, "Angle", spec.get("angle", 360.0))
+        if datum is not None:
+            feat.Axis = (datum, [""])
+    elif ptype == "linear":
+        _require(spec, "spacing")
+        feat = body.newObject("PartDesign::LinearPattern", spec.get("name") or "LinearPattern")
+        # Length spans the pattern (count-1 gaps), matching the Draft semantics.
+        _set_or_bind(feat, "Length", float(spec["spacing"]) * (count - 1))
+        if datum is not None:
+            feat.Direction = (datum, [""])
+    else:
+        raise ValueError(f"pattern_type must be linear/polar, got {ptype!r}")
+    # AFTER the transform props: assigning Originals re-derives the shape.
+    feat.Originals = [base]
+    feat.Occurrences = count
+    feat.Reversed = bool(spec.get("reversed", False))
+    doc.recompute()
+    # FreeCAD 1.1 cannot be driven reliably into doing this through the Python
+    # API: with Originals/Axis/Angle/Occurrences set, the occurrences can come
+    # out coincident, so the pattern computes and repeats NOTHING. Returning a
+    # part with one hole where six were asked for is the worst outcome, so
+    # refuse loudly instead (verified live — see the docs for the workaround).
+    try:
+        unchanged = abs(float(feat.Shape.Volume) - float(base.Shape.Volume)) < 1e-6
+    except Exception:
+        unchanged = False
+    if unchanged:
+        raise RuntimeError(
+            f"pattern of PartDesign feature '{base.Name}' had no effect (volume unchanged at "
+            f"{round(float(base.Shape.Volume), 1)} mm^3). A PartDesign pattern cannot be driven "
+            "reliably through this API; pattern the PROFILE instead (one pocket per instance) or "
+            "pattern a Part-level solid with boolean ops. Not creating a misleading result."
+        )
+    return feat
+
+
 def _build_pattern(doc, spec):
     _require(spec, "base", "count")
-    import Draft
-
-    make_array = getattr(Draft, "make_array", None) or Draft.makeArray
     base = _get_obj(doc, spec["base"], "base")
     count = int(spec["count"])
     if count < 2:
         raise ValueError("pattern count must be >= 2.")
-    ptype = spec.get("pattern_type", "linear")
+    ptype = str(spec.get("pattern_type", "linear"))
+    if ptype not in ("linear", "polar"):
+        raise ValueError(f"pattern_type must be linear/polar, got {ptype!r}")
+    body = _parent_body(base)
+    if body is not None:
+        return _build_pd_pattern(doc, body, base, spec, ptype, count)
+
+    import Draft
+
+    make_array = getattr(Draft, "make_array", None) or Draft.makeArray
     if ptype == "linear":
         _require(spec, "spacing")
         direction = _axis_vec(spec.get("axis"), default="X")
         feat = make_array(
             base, direction * float(spec["spacing"]), FreeCAD.Vector(0, 0, 0), count, 1
         )
-    elif ptype == "polar":
+    else:
         center = spec.get("center", [0, 0, 0])
         angle = float(spec.get("angle", 360.0))
         feat = make_array(base, FreeCAD.Vector(*center), angle, count)
         axis = str(spec.get("axis", "Z")).upper()
         if axis != "Z" and hasattr(feat, "Axis"):
             feat.Axis = _axis_vec(axis)
-    else:
-        raise ValueError(f"pattern_type must be linear/polar, got {ptype!r}")
     if spec.get("name"):
         feat.Label = spec["name"]
     return feat
@@ -618,11 +691,47 @@ def _build_draft(doc, spec):
     return feat
 
 
+_CUT_TYPES = ("pocket", "groove")
+
+
+def _cut_removed_nothing(feat) -> str:
+    """Warn when a cut feature removed no material.
+
+    A pocket attached to the wrong face (or whose profile sits outside the
+    solid) cuts air and still reports success — the sketch lands on a bad plane
+    silently. The ground truth is the body's volume just before this feature:
+    a PartDesign feature's ``BaseFeature`` is its predecessor in the body.
+    """
+    try:
+        baseline = getattr(feat, "BaseFeature", None)
+        if baseline is None:
+            profile = feat.Profile[0]
+            support = list(getattr(profile, "AttachmentSupport", None) or [])
+            baseline = support[0][0] if support else None
+        if baseline is None:
+            return ""
+        prev_vol = float(baseline.Shape.Volume)
+        new_vol = float(feat.Shape.Volume)
+    except Exception:
+        return ""
+    if prev_vol <= 0 or new_vol < prev_vol - 1e-6:
+        return ""
+    return (
+        f"{feat.Name} removed no material (volume unchanged at {round(new_vol, 1)} mm^3): "
+        "the profile is probably outside the solid or the sketch attached to the wrong "
+        "face. Face names shift after every feature — prefer a direction selector, "
+        "plane={'face': [obj, '+Z']}."
+    )
+
+
 def describe_feature(feat, spec) -> dict:
-    """Extra result fields for the RPC response (sketch and hull)."""
+    """Extra result fields for the RPC response (sketch, hull, cut no-ops)."""
     if spec.get("type") == "hull":
         sh = feat.Shape
         return {"volume_mm3": round(sh.Volume, 2), "solids": len(sh.Solids)}
+    if spec.get("type") in _CUT_TYPES:
+        message = _cut_removed_nothing(feat)
+        return {"warnings": [message]} if message else {}
     if spec.get("type") != "sketch":
         return {}
     info = sketcher_ops.pop_last_sketch_info() or {}
