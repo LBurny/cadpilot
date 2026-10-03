@@ -330,6 +330,43 @@ Levels: DEBUG has per-request arg summaries and timings; INFO is the default
 and covers state changes; WARNING+ is also mirrored into FreeCAD's Report
 View. The same records go to a rotating file under FreeCAD's user data dir
 (<user data>/CADPilot/logs/cadpilot.log), so they survive a crash.""",
+    "diagnose": """\
+diagnose — find out why CADPilot cannot talk to FreeCAD.
+
+Runs entirely on the MCP side, so it still answers while FreeCAD is down,
+frozen, or was never started (get_addon_log and every other tool need a live
+connection). From the outside it probes: the RPC endpoint (ping on a 5s
+timeout, plus a raw TCP connect), the FreeCAD process, who listens on the
+port, the installed addon (symlink or copy, complete or not) in each FreeCAD
+user-data dir, the bootstrap crash log, the addon log's freshness, and
+cadpilot_settings.json.
+
+Read the verdict, then work down this order — identical on Windows, macOS
+and Linux:
+  1. Is FreeCAD running? A closed port with no process means nothing to
+     talk to.
+  2. Is the RPC server started? In FreeCAD: the CADPilot toolbar's "RPC
+     Server" toggle, or auto_start_rpc in the settings (auto-start is
+     evaluated at startup only, so enabling it later needs a restart).
+  3. Is the addon installed in the user-data dir of the FreeCAD version
+     that is actually running? FreeCAD 1.x uses a versioned level, e.g.
+     v1-1 (Windows: %APPDATA%\\FreeCAD\\v1-1\\Mod, macOS:
+     ~/Library/Application Support/FreeCAD/v1-1/Mod, Linux:
+     ~/.local/share/FreeCAD/v1-1/Mod). An addon in the wrong level never
+     loads, and older builds wrote straight into the config root.
+  4. Did it load at all? A bootstrap crash is written to initgui_debug.log
+     — in the addon dir, or next to the FreeCAD executable when __file__ is
+     unavailable under FreeCAD's bare exec(). When the addon fails to load
+     there is no workbench entry, no RPC server and a stale addon log; the
+     crash log names the cause.
+  5. Did you change anything? Addon files, the MCP client config and the MCP
+     tool list are only picked up on a restart: restart FreeCAD, then the
+     MCP client (it builds tools/list once, at startup).
+
+A listening port that does not answer ping is the one case that is not a
+setup problem: FreeCAD is up but its GUI thread is busy or wedged (modal
+dialog, long recompute, deadlock). The addon log stays readable exactly
+there — grep it with get_addon_log before restarting.""",
 }
 
 HELP_TOPICS: dict[str, str] = {

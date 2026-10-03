@@ -886,6 +886,17 @@ def get_addon_log_operation(
     return json_response(res)
 
 
+def diagnose_operation(
+    host: str,
+    port: int = 9875,
+    timeout: float = 5.0,
+) -> ToolResponse:
+    """Fault diagnosis that runs entirely on the MCP side (FreeCAD may be down)."""
+    from ..diagnostics import diagnose, format_report
+
+    return text_response(format_report(diagnose(host, port, timeout)))
+
+
 def session_pause_operation() -> ToolResponse:
     sess, err = _require_session()
     if err:

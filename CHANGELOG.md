@@ -1,9 +1,55 @@
 # Changelog
 
-## Unreleased
+## v0.5.0 (2026-10-04)
+
+### New features
+
+- **Step journal + steps panel** (`step_journal.py` / `step_engine.py` /
+  `step_panel.py`): a FreeCAD-side review loop that survives with the RPC
+  server stopped, stored on the document itself (`MCP_StepJournal`). The
+  `step_control` tool and the dock share one engine: run_next/run_all/run_to,
+  rollback_to, reexecute, accept/unaccept (soft lock), reject (undo and drop
+  the step plus everything after it), update, insert, replay (rebuild the
+  model from the journal), snapshot and reset.
+- **`snapshot` verb**: marks the current state as a done+accepted baseline for
+  the "the user modeled off-journal, let the LLM continue from here" flow —
+  the accepted soft lock protects manual work from a blind rollback, and the
+  record names what the journal missed.
+- **Manual-edit sync**: GUI edits to objects a step produced are mirrored back
+  into that step's parameters, so human corrections survive
+  reexecute/replay — including `Placement` (so a re-run does not teleport the
+  part to the origin) and, on FreeCAD ≥1.1, per-edge fillet/chamfer sizes.
+- **`diagnose` tool**: cross-platform fault diagnosis that runs on the MCP
+  side, so it still answers when FreeCAD is down or frozen. It probes the RPC
+  endpoint, the FreeCAD process, port listeners, the addon install, the
+  bootstrap crash log, the addon log's freshness and the settings, and ends
+  with a verdict plus the generic 5-step order to work through.
+- **`get_addon_log` tool**: reads the addon's ring-buffer/rotating debug log
+  (per-RPC request ids, GUI-dispatch and transaction traces) — readable even
+  when FreeCAD's GUI thread is wedged.
 
 ### Fixed
 
+- **The addon could fail to load entirely** (`InitGui.py`): FreeCAD runs it
+  with a bare `exec()` into a namespace that is not the `__globals__` of the
+  functions the file defines, so the module-level `import contextlib` was
+  invisible inside a nested helper. `find_addon_dir()` raised
+  `NameError: name 'contextlib' is not defined`, the bootstrap died, and the
+  addon silently never loaded — no workbench, no RPC server, stale log. Every
+  name the nested helpers need is now imported inside `_bootstrap()`, the
+  crash log falls back to the addon dir before the executable's directory, and
+  a test enforces the rule with an AST scope walk.
+- **Batch steps could not be re-executed** (`step_journal.py`): `cad(batch)`
+  sub-ops are journaled with the RPC schema's `action` key, but re-execution
+  read `operation`, so `reexecute`/`replay` undid the step and then failed
+  with "operation '' is not re-executable" — leaving the model one
+  transaction behind. Both keys are now accepted, on the execution side, so
+  journals written by an older addon are repaired rather than rejected.
+- **Step rollback ate the wrong transaction** (`step_journal.py`):
+  `plan_rollback`/`plan_reject` counted non-atomic records (e.g. an
+  `execute_code` inspection) toward `undo_count`, so one undo too many was
+  issued and an earlier step's object disappeared. Only transaction-bearing
+  records count now.
 - **Phantom mouse-button state no longer starves the GUI task queue**
   (`gui_dispatch.py`): the drag guard in `process_gui_tasks` deferred all
   queued tasks whenever Qt reported a pressed mouse button. After a
@@ -12,6 +58,14 @@
   `ping` kept answering while every GUI-dispatched call (e.g.
   `execute_code`) timed out, looking like a dropped connection. The guard
   now only defers when the main window is actually active.
+
+### Changed
+
+- **Tool docstrings slimmed** (13.9k → 10.6k chars across all tools): the
+  per-tool descriptions the client pays for on every `tools/list` keep only a
+  summary and brief Args; the full references live in `tool_docs.py` and are
+  served on demand by `operation_help`. The budget test now enforces
+  < 11,000 chars.
 
 ## v0.4.0 (2026-07-30)
 

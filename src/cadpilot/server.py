@@ -24,6 +24,7 @@ from .operations import (
     cad_operation,
     check_interference_operation,
     create_document_operation,
+    diagnose_operation,
     execute_code_async_operation,
     execute_code_operation,
     get_addon_log_operation,
@@ -181,19 +182,7 @@ def create_document(
     """Create a new document in FreeCAD.
 
     Args:
-        name: The name of the document to create.
-        with_screenshot: Attach a screenshot of the result (default: no screenshot).
-
-    Returns:
-        A message indicating the success or failure of the document creation.
-
-    Examples:
-        If you want to create a document named "MyDocument", you can use the following data.
-        ```json
-        {
-            "name": "MyDocument"
-        }
-        ```
+        name: Document name.
     """
     return create_document_operation(
         get_freecad_connection(), name, with_screenshot=state.resolve_screenshot(with_screenshot)
@@ -236,33 +225,21 @@ def cad(
     description: str = "",
     with_screenshot: bool | None = None,
 ) -> list[TextContent | ImageContent]:
-    """Perform a CAD modeling operation (unified mutation tool).
-
-    When a modeling session is active (session_start), successful operations
-    on the session's document are recorded as steps and can be rolled back
-    with session_rollback.
+    """CAD modeling operation (unified mutation tool).
 
     Feature ops take obj_name as the BASE object (for sketch/variables/
     datum_plane/hull it names the NEW object) and params via obj_properties.
-    Every mutation runs in one FreeCAD transaction and is auto-audited for
-    connectivity. Call operation_help("<operation>") for the full parameter
-    reference of any operation — e.g. operation_help("sketch").
+    With an active session, mutations are recorded as rollback-able steps.
+    Reference: operation_help("<operation>").
 
     Args:
-        operation: The operation to perform.
-        doc_name: The document to operate on.
         obj_type: Object type for create_object (e.g. "Part::Box").
-        obj_name: Base object name (new-object name for sketch/variables/
+        obj_name: Base object (new-object name for sketch/variables/
             datum_plane/hull).
         obj_properties: Properties/params for the operation.
         ops: Operation dicts for batch.
         stop_on_error: batch — stop at the first failed op.
         description: Note recorded into the session step log.
-        with_screenshot: Attach a screenshot (default: none; use get_view).
-
-    Returns:
-        Result message (batch: JSON with per-op results), step number when a
-        session is active, and a screenshot only when requested.
     """
     return cad_operation(
         get_freecad_connection(),
@@ -281,33 +258,28 @@ def cad(
 
 @mcp.tool()
 def execute_code_async(ctx: Context, code: str) -> list[TextContent]:
-    """Execute Python code in FreeCAD without waiting for completion.
-
-    Background thread, NOT the GUI thread: the code must NOT touch FreeCADGui,
-    the active view/selection, document objects, recompute, or save — for any
-    of that use execute_code instead (the safe default). Only for long pure
-    OCCT/CPU computations on already-fetched shapes. Use task_print(...) for
-    output (print() is not captured); poll with get_task_result(task_id).
+    """Execute Python code in FreeCAD without waiting (background thread, NOT
+    the GUI thread): the code must not touch FreeCADGui, view/selection,
+    document objects, recompute, or save — use execute_code for any of that.
+    Only for long pure CPU computations on already-fetched shapes. Use
+    task_print(...) for output (print() is not captured); poll with
+    get_task_result.
 
     Args:
-        code: Background-safe Python code to execute.
-
-    Returns:
-        A message with the task_id for polling via get_task_result.
+        code: Background-safe Python code.
     """
     return execute_code_async_operation(get_freecad_connection(), code)
 
 
 @mcp.tool()
 def get_task_result(ctx: Context, task_id: str) -> list[TextContent]:
-    """Get the status and captured output of a background task started by execute_code_async.
+    """Get the status and captured output of an execute_code_async task.
 
     Args:
-        task_id: The task ID returned by execute_code_async.
+        task_id: Task ID from execute_code_async.
 
     Returns:
-        A JSON object with status ("running" | "done" | "error"), output captured
-        via task_print(...), and the error traceback if the task failed.
+        JSON {status: running | done | error, output, traceback on error}.
     """
     return get_task_result_operation(get_freecad_connection(), task_id)
 
@@ -318,16 +290,11 @@ def execute_code(
     code: str,
     with_screenshot: bool | None = None,
 ) -> list[TextContent | ImageContent]:
-    """Execute arbitrary Python code in FreeCAD.
-
-    The code runs on FreeCAD's GUI thread with the full FreeCAD Python API
-    available (FreeCAD, FreeCADGui already imported; import Part/Draft/etc.
-    as needed). print() output is captured and returned.
+    """Execute arbitrary Python in FreeCAD's GUI thread (full FreeCAD API;
+    FreeCAD/FreeCADGui already imported). print() output is returned.
 
     Args:
-        code: The Python code to execute.
-        with_screenshot: Attach a screenshot after successful execution
-            (default: no screenshot).
+        code: Python code to execute.
     """
     return execute_code_operation(
         get_freecad_connection(), state.resolve_screenshot(with_screenshot), code
@@ -347,12 +314,9 @@ def get_view(
     """Get a screenshot of the active view.
 
     Args:
-        view_name: Camera view ("Isometric", "Front", "Top", ...).
-        width/height: Pixels; defaults to the viewport size.
+        view_name: Camera view.
+        width/height: Pixels; default is the viewport size.
         focus_object: Object to focus on; default fits all objects.
-
-    Returns:
-        A screenshot of the active view.
     """
     return get_view_operation(get_freecad_connection(), view_name, width, height, focus_object)
 
@@ -363,15 +327,7 @@ def get_objects(
     doc_name: str,
     with_screenshot: bool | None = None,
 ) -> list[TextContent | ImageContent]:
-    """Get all objects in a document.
-
-    Args:
-        doc_name: The name of the document to get the objects from.
-        with_screenshot: Attach a screenshot of the document (default: no screenshot).
-
-    Returns:
-        A list of objects in the document, and a screenshot only when requested.
-    """
+    """Get all objects in a document (screenshot only when requested)."""
     return get_objects_operation(
         get_freecad_connection(), state.resolve_screenshot(with_screenshot), doc_name
     )
@@ -384,16 +340,8 @@ def get_object(
     obj_name: str,
     with_screenshot: bool | None = None,
 ) -> list[TextContent | ImageContent]:
-    """Get an object from a document.
-
-    Args:
-        doc_name: The name of the document to get the object from.
-        obj_name: The name of the object to get.
-        with_screenshot: Attach a screenshot of the object (default: no screenshot).
-
-    Returns:
-        The object properties, and a screenshot only when requested.
-    """
+    """Get an object's properties from a document (screenshot only when
+    requested)."""
     return get_object_operation(
         get_freecad_connection(),
         state.resolve_screenshot(with_screenshot),
@@ -404,11 +352,7 @@ def get_object(
 
 @mcp.tool()
 def list_documents(ctx: Context) -> list[TextContent]:
-    """Get the list of open documents in FreeCAD.
-
-    Returns:
-        A list of document names.
-    """
+    """Get the names of open documents in FreeCAD."""
     return list_documents_operation(get_freecad_connection())
 
 
@@ -424,19 +368,16 @@ def session_start(
     name: str = "",
     create_document: bool = False,
 ) -> list[TextContent]:
-    """Start a modeling session bound to a document.
-
-    While a session is active, every successful cad() mutation on the session's
-    document is recorded as a step backed by a FreeCAD transaction, enabling
-    session_rollback for trial-and-error modeling. execute_code steps are
-    recorded as non-atomic (rollback past them is blocked unless forced).
+    """Start a modeling session bound to a document: every successful cad()
+    mutation is recorded as a transaction-backed step, so session_rollback
+    enables trial-and-error modeling. execute_code steps are non-atomic
+    (rolling back past them needs force).
 
     Args:
         name: Optional human-readable session name.
         create_document: Create the document first if it does not exist.
 
-    Returns:
-        Session info including session_id.
+    Returns: Session info including session_id.
     """
     return session_start_operation(get_freecad_connection(), doc_name, name, create_document)
 
@@ -444,7 +385,7 @@ def session_start(
 @mcp.tool()
 def session_status(ctx: Context) -> list[TextContent]:
     """Show the active session: step count, document state, next-step
-    suggestions, and risks (e.g. state drift from GUI edits, non-atomic steps).
+    suggestions, and risks (e.g. drift from GUI edits, non-atomic steps).
 
     Returns:
         JSON summary with a human-readable display_text.
@@ -457,8 +398,8 @@ def session_get_steps(ctx: Context) -> list[TextContent]:
     """Return all recorded steps and notes of the active session.
 
     Returns:
-        JSON list of steps (step_number, operation, description, params,
-        objects_after fingerprint, atomic flag, timestamp).
+        JSON list (step_number, operation, description, params, objects_after
+        fingerprint, atomic flag, timestamp).
     """
     return session_get_steps_operation()
 
@@ -469,10 +410,9 @@ def session_rollback(
     to_step: int,
     force: bool = False,
 ) -> list[TextContent]:
-    """Roll back the model to a previous step.
-
-    Undoes the matching document transactions and truncates the step log;
-    removed steps go to a redo buffer until a new cad() call discards them.
+    """Roll back the model to a previous step: undoes the matching document
+    transactions and truncates the step log; removed steps sit in a redo
+    buffer until a new cad() call discards them.
 
     Args:
         to_step: Keep steps 1..to_step; undo everything after (0 = undo all).
@@ -484,13 +424,10 @@ def session_rollback(
 
 @mcp.tool()
 def session_redo(ctx: Context, n: int = 1) -> list[TextContent]:
-    """Redo n previously rolled-back steps (valid until a new cad() operation).
+    """Redo n previously rolled-back steps (valid until a new cad() call).
 
     Args:
         n: Number of steps to restore (default 1).
-
-    Returns:
-        JSON with restored step numbers.
     """
     return session_redo_operation(get_freecad_connection(), n)
 
@@ -504,11 +441,8 @@ def session_add_note(
     """Attach a human/LLM insight to the session log (not an operation step).
 
     Args:
-        note: The note content.
+        note: Note content.
         note_type: "observation" | "assumption" | "limitation" | "correction".
-
-    Returns:
-        The recorded note entry.
     """
     return session_add_note_operation(note, note_type)
 
@@ -542,8 +476,7 @@ def step_control(
 
     Actions: run_next | run_all | run_to | rollback_to | reexecute |
     accept | reject | update | insert | replay | snapshot | clear_plan |
-    reset | status (index/params/force apply per action; reset needs
-    confirm=true). Reference: operation_help("step_control").
+    reset (needs confirm=true) | status. Reference: operation_help("step_control").
     """
     return step_control_operation(
         get_freecad_connection(), doc_name, action, index, params, force, confirm
@@ -558,10 +491,8 @@ def get_addon_log(
     since_seq: int = 0,
     limit: int = 100,
 ) -> list[TextContent]:
-    """Read the FreeCAD addon's debug log (newest last).
-
-    Use it when a call misbehaves or hangs: RPC timings, GUI-dispatch
-    deferrals, transactions and journal ops are all in here.
+    """Read the FreeCAD addon's debug log (newest last). Use it when a call
+    misbehaves or hangs: RPC timings, GUI dispatch, transactions, journal ops.
 
     Args:
         level: Min level: DEBUG | INFO | WARNING | ERROR.
@@ -575,12 +506,21 @@ def get_addon_log(
 
 
 @mcp.tool()
-def session_pause(ctx: Context) -> list[TextContent]:
-    """Pause the active session (persisted to disk; resume later).
+def diagnose(ctx: Context, host: str | None = None) -> list[TextContent]:
+    """Diagnose why CADPilot cannot reach FreeCAD — runs while FreeCAD is down
+    or frozen. Probes the RPC port, the FreeCAD process, the addon install and
+    its logs (incl. the bootstrap crash log) on Windows/macOS/Linux.
 
-    Returns:
-        Confirmation with the session_id.
+    Args:
+        host: FreeCAD host to probe; defaults to this server's --host.
     """
+    return diagnose_operation(host or state.rpc_host)
+
+
+@mcp.tool()
+def session_pause(ctx: Context) -> list[TextContent]:
+    """Pause the active session (persisted to disk; resume later). Returns
+    the session_id."""
     return session_pause_operation()
 
 
@@ -589,10 +529,8 @@ def session_resume(ctx: Context, session_id: str) -> list[TextContent]:
     """Resume a paused/completed session from disk.
 
     Args:
-        session_id: The session to resume (see session_list).
-
-    Returns:
-        Session state; warns if the bound document is no longer open.
+        session_id: The session to resume (see session_list). Warns if the
+            bound document is no longer open.
     """
     return session_resume_operation(get_freecad_connection(), session_id)
 
@@ -615,9 +553,8 @@ def session_complete(
     description: str = "",
     tags: list[str] | None = None,
 ) -> list[TextContent]:
-    """Complete the active session: store the whole workflow as a reusable
-    pattern in the pattern store (recall later with recall_patterns), and
-    optionally save the document to disk.
+    """Complete the active session: store the workflow as a reusable pattern
+    (recall later with recall_patterns) and optionally save the document.
 
     Args:
         save: Save the FreeCAD document (.FCStd).
@@ -639,12 +576,11 @@ def save_pattern(
     code: str = "",
     tags: list[str] | None = None,
 ) -> list[TextContent]:
-    """Store a reusable modeling pattern (code snippet or workflow) into the
-    pattern memory. Call this after a non-trivial approach worked.
+    """Store a reusable modeling pattern (code snippet or workflow) — call
+    this after a non-trivial approach worked.
 
-    Knowledge hierarchy: 1) your own knowledge first, 2) recall_patterns when
-    unsure, 3) inspect_freecad for API details. Successful new approaches
-    should be stored back here.
+    Knowledge hierarchy: 1) your own knowledge, 2) recall_patterns,
+    3) inspect_freecad — then store new approaches back here.
 
     Args:
         name: Short pattern name (e.g. "flanged pipe via loft").
@@ -652,8 +588,7 @@ def save_pattern(
         code: Optional Python snippet that implements it.
         tags: Retrieval tags.
 
-    Returns:
-        The stored pattern_id.
+    Returns: The stored pattern_id.
     """
     return save_pattern_operation(name, description, code, tags)
 
@@ -664,10 +599,8 @@ def recall_patterns(
     query: str,
     limit: int = 3,
 ) -> list[TextContent]:
-    """Search the pattern memory for workflows/code similar to your task.
-
-    Use when your own knowledge is insufficient, before falling back to
-    trial-and-error. Patterns come from save_pattern and completed sessions.
+    """Search the pattern memory for workflows/code similar to your task;
+    use before trial-and-error when your own knowledge is insufficient.
 
     Args:
         query: Keywords describing the task (e.g. "boolean cut holes cylinder").
@@ -697,14 +630,12 @@ def inspect_freecad(
     obj_name: str | None = None,
     dotted_name: str | None = None,
 ) -> list[TextContent]:
-    """Runtime introspection of the FreeCAD Python API (last-resort reference
-    when both your knowledge and recall_patterns are insufficient).
+    """Runtime introspection of the FreeCAD Python API — last resort when
+    your knowledge and recall_patterns are insufficient.
 
-    Two modes:
-    - Object mode: pass doc_name + obj_name for the object's TypeId, settable
-      properties (with types), public methods, and docstring.
-    - API mode: pass dotted_name (e.g. "Part.makeLoft") for its docstring, or
-      the member list of a module/class.
+    Modes: doc_name + obj_name gives the object's TypeId, settable
+    properties (with types), public methods, docstring; dotted_name (e.g.
+    "Part.makeLoft") gives its docstring or a module/class member list.
 
     Returns:
         JSON with properties/members/docstring (compact, capped).
@@ -714,18 +645,11 @@ def inspect_freecad(
 
 @mcp.tool()
 def measure_geometry(ctx: Context, doc_name: str, obj_name: str) -> list[TextContent]:
-    """Measure an object's Shape: volume, area, bounding box, center of mass,
-    element counts (solids/faces/edges/vertices), and validity (is_valid).
+    """Measure an object's Shape (must have one); use to verify design
+    targets quantitatively after modeling steps.
 
-    Use after modeling steps to verify design targets quantitatively.
-
-    Args:
-        doc_name: Document name.
-        obj_name: Object name (must have a Shape).
-
-    Returns:
-        JSON with volume_mm3, area_mm2, bbox, center_of_mass, counts,
-        is_valid, shape_type.
+    Returns: JSON volume_mm3, area_mm2, bbox, center_of_mass, element
+    counts, is_valid, shape_type.
     """
     return measure_geometry_operation(get_freecad_connection(), doc_name, obj_name)
 
@@ -739,20 +663,17 @@ def get_topology(
     limit: int = 50,
     offset: int = 0,
 ) -> list[TextContent]:
-    """List an object's faces or edges with semantic info for selection.
-
-    Faces sorted by area, edges by length, vertices by distance from origin
-    (largest/longest/farthest first). Use the index/name (Face1, Edge3, ...)
-    in follow-up operations such as fillet, boolean, or sketching on a face.
+    """List an object's faces/edges/vertices for selection — faces by area,
+    edges by length, vertices by distance (largest first). Use the
+    index/name (Face1, Edge3, ...) in fillet, boolean, sketch-on-face, etc.
 
     Args:
-        element: "faces", "edges", or "vertices".
-        limit: Max entries returned (1-200, default 50).
+        element: "faces" | "edges" | "vertices".
+        limit: Max entries (1-200, default 50).
         offset: Skip this many entries (pagination).
 
-    Returns:
-        JSON with total, returned, and a faces/edges list (index, name,
-        type, area/length, center, normal for planar faces).
+    Returns: total, returned, list(index, name, type, area/length, center,
+    normal for planar faces).
     """
     return get_topology_operation(
         get_freecad_connection(), doc_name, obj_name, element, limit, offset
@@ -761,17 +682,10 @@ def get_topology(
 
 @mcp.tool()
 def check_interference(ctx: Context, doc_name: str, obj_a: str, obj_b: str) -> list[TextContent]:
-    """Check the spatial relationship between two objects: distance and
-    intersection (common volume). Use to verify clearance or detect
-    collisions in multi-body configurations.
+    """Distance and intersection (common volume) between two objects; use
+    to verify clearance or detect collisions.
 
-    Args:
-        doc_name: Document name.
-        obj_a: First object name.
-        obj_b: Second object name.
-
-    Returns:
-        JSON with distance_mm, intersects, common_volume_mm3.
+    Returns: JSON distance_mm, intersects, common_volume_mm3.
     """
     return check_interference_operation(get_freecad_connection(), doc_name, obj_a, obj_b)
 
@@ -784,19 +698,14 @@ def get_positioning_info(
     element: Literal["face", "edge", "vertex"],
     element_index: int,
 ) -> list[TextContent]:
-    """Get detailed global-coordinate spatial info for a specific face, edge, or vertex.
-
-    Returns center, normal, axis, radius, start/end points etc. in GLOBAL
-    coordinates (already transformed by the object's Placement). Use this
-    instead of get_topology when you need precise positioning data for
-    alignment or assembly.
+    """Global-coordinate spatial info for one face/edge/vertex (center,
+    normal, axis, radius, endpoints — the object's Placement already
+    applied). Use instead of get_topology when you need precise positioning
+    for alignment or assembly.
 
     Args:
-        element: "face", "edge", or "vertex".
+        element: "face" | "edge" | "vertex".
         element_index: 0-based index (use get_topology to find indices).
-
-    Returns:
-        JSON with global center, normal, axis, radius, endpoints, and object Placement.
     """
     return get_positioning_info_operation(
         get_freecad_connection(), doc_name, obj_name, element, element_index
@@ -821,8 +730,8 @@ def align_shapes(
     Args:
         element / element_index: Element on the object to move.
         target_element / target_element_index: Element on the target.
-        mode: "touch" (face-to-face, normals opposing), "center" (translation
-            only, centers coincide), "axis" (cylindrical axes aligned).
+        mode: "touch" (face-to-face, normals opposing) | "center" (centers
+            coincide) | "axis" (cylindrical axes aligned).
         offset: Extra distance along the target normal (positive = away).
 
     Returns:
@@ -844,13 +753,12 @@ def align_shapes(
 
 @mcp.tool()
 def get_anchors(ctx: Context, doc_name: str, obj_name: str) -> list[TextContent]:
-    """List an object's assembly anchors in GLOBAL coordinates (read-only).
-
-    Auto-derives standard anchors from the Shape (bbox_center/min/max, com,
-    axis_mid/start/end for the dominant cylindrical face, face0..2_center for
-    the largest planar faces) and merges explicit named anchors defined via
-    set_anchors (explicit wins on a name clash). Call this BEFORE placing
-    parts and plan mates from the returned numbers — never guess coordinates.
+    """List an object's assembly anchors in GLOBAL coordinates (read-only):
+    auto-derived (bbox_center/min/max, com, axis_mid/start/end for the
+    dominant cylindrical face, face0..2_center for the largest planar faces)
+    merged with explicit set_anchors ones (explicit wins). Call this BEFORE
+    placing parts and plan mates from the returned numbers — never guess
+    coordinates.
 
     Returns:
         JSON with anchors: {name: {pos, dir, source: "auto"|"explicit"}}.
@@ -868,19 +776,14 @@ def set_anchors(
     coord_frame: Literal["local", "global"] = "local",
     with_screenshot: bool | None = None,
 ) -> list[TextContent]:
-    """Define explicit named anchors on an object.
-
-    Anchors persist with the document and follow Placement moves. Use
-    coord_frame="global" whenever your source coordinates are global.
+    """Define explicit named anchors on an object. Anchors persist with the
+    document and follow Placement moves. Records a modeling-session step.
 
     Args:
         anchors: {name: {"pos": [x, y, z], "dir": [x, y, z] | null}}.
         replace: Replace all existing anchors instead of merging.
-        coord_frame: "local" (stored as-is) or "global".
-        with_screenshot: Attach a screenshot (default: none).
-
-    Returns:
-        JSON with anchor_count; records a modeling-session step.
+        coord_frame: "local" (stored as-is) or "global" (converted — use
+            whenever your source coordinates are global).
     """
     return set_anchors_operation(
         get_freecad_connection(),
@@ -902,19 +805,16 @@ def assemble(
     stop_on_error: bool = True,
     with_screenshot: bool | None = None,
 ) -> list[TextContent]:
-    """Assemble parts by snapping named anchors together (ONE transaction).
-
-    Mates over `tolerance` fail the transaction. For PERSISTENT joints use
-    assembly_session; mate shape and mode semantics: operation_help("assemble").
+    """Assemble parts by snapping named anchors together (ONE transaction);
+    mates over tolerance fail and roll back. For PERSISTENT joints use
+    assembly_session. Reference: operation_help("assemble").
 
     Args:
         mates: Non-empty list of mate dicts.
         tolerance: Max allowed post-move residual in mm (default 0.1).
         stop_on_error: Abort and roll back at the first failed mate.
-        with_screenshot: Attach a screenshot (default: none).
 
-    Returns:
-        JSON with per-mate residuals and passed/failed counts.
+    Returns: JSON per-mate residuals and passed/failed counts.
     """
     return assemble_operation(
         get_freecad_connection(),
@@ -934,19 +834,17 @@ def verify_assembly(
     float_threshold: float = 1.0,
     interference_min_volume: float = 1.0,
 ) -> list[TextContent]:
-    """Audit the document's spatial sanity (read-only, pure data feedback).
-
-    Reports floating parts, interferences, and per-check distances for
-    requested anchor pairs. Hidden objects are skipped. Prefer this numeric
-    health report over eyeballing screenshots.
+    """Audit the document's spatial sanity (read-only): floating parts,
+    interferences, and distances for requested anchor pairs. Hidden objects
+    are skipped. Prefer this numeric health report over eyeballing
+    screenshots.
 
     Args:
         checks: Optional anchor-pair distance checks.
         float_threshold: Nearest-neighbour gap (mm) for "floating" (default 1.0).
         interference_min_volume: Minimum common volume (mm3) to report.
 
-    Returns:
-        JSON with floating/interferences/checks lists and a summary.
+    Returns: JSON floating/interferences/checks lists and a summary.
     """
     return verify_assembly_operation(
         get_freecad_connection(),
@@ -975,15 +873,12 @@ def assembly_session(
     """Independent assembly state machine with PERSISTENT joints (FreeCAD
     Assembly workbench) — the mate-based counterpart to one-shot `assemble`.
 
-    Workflow: start(ground=part) -> add_component(part) per part ->
-    mate(a, b, joint_type, trim?) per joint -> solve -> verify -> complete.
-    Joints persist in the document: move a parent part, call solve, and
-    children follow. rollback(to_step) un-does joints/trims and restores
-    placements atomically.
-
-    A mate ref is {"part": <name>} plus exactly ONE of face="FaceN" /
-    anchor=<name> / point=[x,y,z]. Full reference (operations, joint types,
-    trim semantics): operation_help("assembly_session").
+    Workflow: start(ground=part) -> add_component(part) -> mate(a, b,
+    joint_type, trim?) -> solve -> verify -> complete. Joints persist: move
+    a parent part, call solve, and children follow. rollback(to_step)
+    restores placements atomically. A mate ref is {"part": <name>} plus
+    exactly ONE of face="FaceN" / anchor=<name> / point=[x,y,z].
+    Reference: operation_help("assembly_session").
     """
     return assembly_session_operation(
         get_freecad_connection(),

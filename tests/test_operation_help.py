@@ -63,4 +63,4 @@ def test_tool_docstring_budget():
                     total += len(doc)
                     biggest.append((len(doc), node.name))
     biggest.sort(reverse=True)
-    assert total < 14000, f"tool docstrings total {total} chars; biggest: {biggest[:5]}"
+    assert total < 11000, f"tool docstrings total {total} chars; biggest: {biggest[:5]}"
