@@ -9,6 +9,7 @@
 * 让 AI 客户端**完整**掌控 FreeCAD：文档、参数化建模、约束草图、装配、定量验证。
 * 压低 AI 客户端的**上下文开销**：精简的工具列表、简短的 docstring、文本优先的响应、按需获取的文档。
 * 让每个变更**事务化、可回滚**，使 AI 代理能像人类设计师一样试错与回溯。
+* 支持**人机协同建模**：FreeCAD 侧的日志评审循环，让用户可以检查、修正、重放 AI 的建模过程。
 * 提供**数据驱动的空间感知**（锚点、拓扑、测量），让定位不依赖截图或猜测。
 
 ## 2. 两进程架构
@@ -40,7 +41,7 @@ FreeCAD 的文档树与 GUI API **不是线程安全的**，所有文档/GUI 操
 
 * `dispatch_to_gui(task)` 把包装后的可调用对象放入共享队列，并阻塞 RPC 线程（默认 60 秒超时），直到 GUI 线程通过**逐调用响应队列**返回结果 —— 某次调用的超时绝不会污染后续调用的响应。
 * GUI 线程通过 Qt 信号（`QueuedConnection`）被**立即**唤醒，另有 500ms 心跳定时器兜底。
-* 排空循环在鼠标按住、弹窗或模态对话框打开时跳过当前节拍，MCP 任务不会打断 3D 导航或对话框。重入守卫防止任务内部的 `processEvents` 触发嵌套排空。
+* 排空循环在鼠标按住**且主窗口确实处于活动状态**时、或有弹窗/模态对话框打开时跳过当前节拍 —— 后台启动或 RDP 会话留下的幻影按住状态曾让队列饿死（`ping` 照常应答而所有 GUI 调用全部超时）；MCP 任务不会打断 3D 导航或对话框。重入守卫防止任务内部的 `processEvents` 触发嵌套排空。
 * 任务内的异常被捕获、记录到 FreeCAD 报告视图，并以错误字符串返回 —— 绝不会杀死派发循环。
 * 停止时通过哨兵值抑制定时器重新调度，循环真正终止。
 
@@ -60,7 +61,7 @@ FreeCAD 的文档树与 GUI API **不是线程安全的**，所有文档/GUI 操
 
 ### 4.2 Docstring 预算
 
-每个 `@mcp.tool()` 的 docstring 在**每次**对话中都消耗上下文 token。因此 docstring 限制为 1–3 行摘要加简要参数；详尽的参数/语义参考放在 `tool_docs.py`，通过 `operation_help` 工具按需获取。有测试强制总 docstring 预算（< 14,000 字符）。
+每个 `@mcp.tool()` 的 docstring 在**每次**对话中都消耗上下文 token。因此 docstring 限制为 1–3 行摘要加简要参数；详尽的参数/语义参考放在 `tool_docs.py`，通过 `operation_help` 工具按需获取。有测试强制总 docstring 预算（< 11,000 字符）。
 
 ### 4.3 知识层级
 
@@ -68,7 +69,11 @@ FreeCAD 的文档树与 GUI API **不是线程安全的**，所有文档/GUI 操
 
 ## 5. 事务、会话与回滚
 
-每个提交的变更都运行在 **FreeCAD 事务**（`doc.openTransaction`）内。在此之上，建模会话（`session_start` … `session_complete`）把每个变更记录为步骤：
+每个提交的变更都运行在 **FreeCAD 事务**（`doc.openTransaction`）内。其上有两套互补的日志：MCP 侧的**建模会话**（整个会话的撤销），以及 FreeCAD 侧的**步骤日志**（用户可见、可驱动的评审循环）。
+
+### 5.1 建模会话
+
+建模会话（`session_start` … `session_complete`）把每个变更记录为步骤：
 
 * 操作、描述、参数、结果摘要
 * `objects` 指纹（排序后的对象名），用于漂移检测
@@ -76,9 +81,31 @@ FreeCAD 的文档树与 GUI API **不是线程安全的**，所有文档/GUI 操
 
 于是 `session_rollback(to_step)` 就是 `doc.undo()` × N 加日志截断 —— 无需删除重建。被移除的步骤进入重做缓冲区，直到新步骤将其清空，与 FreeCAD 的重做语义一致。`execute_code` 步骤是非原子的，会阻塞回滚（除非强制执行）。
 
-变更响应会自动审计：每次提交的 `cad()` 调用后重跑只读的连通性检查（`verify_assembly`），对断连孤岛追加警告；`session_status` 暴露风险（回滚后状态漂移、非原子步骤、文档已关闭）并给出下一步建议。审计绝不阻塞变更本身。
+变更响应会自动审计：每次提交的 `cad()` 调用后重跑只读的连通性检查（`verify_assembly`），对断连孤岛追加警告；`session_status` 暴露风险（回滚后状态漂移、非原子步骤、文档已关闭）并给出下一步建议。审计绝不阻塞变更本身，且可全局关闭（`--no-auto-audit`），超大文档也会自动跳过。
 
 会话与模式以 JSON 持久化在 `$CADPILOT_HOME`（默认 `~/.cadpilot/`），原子写入（临时文件 + 重命名）。
+
+### 5.2 步骤日志与 Steps 面板
+
+会话是 MCP 侧的构造：stdio 服务器退出即消失，坐在 FreeCAD 窗口前的人完全看不到。**步骤日志**是第二套、FreeCAD 侧的日志，存在**文档自身**（`App::PropertyString` `MCP_StepJournal`），RPC 服务器停止也存活，由共享同一引擎（`step_engine.apply_op`）的两个前端驱动：
+
+* `step_control` MCP 工具：`run_next` / `run_all` / `run_to`、`rollback_to`、`reexecute`（撤销后带合并参数重跑）、`accept`/`unaccept`（软锁）、`reject`（撤销并丢弃该步骤及其后全部）、`update` / `insert`（planned 尾部只允许追加/插入 —— 历史不可改）、`replay`（回滚到 0 并从日志重建）、`snapshot`、`reset`；
+* **Steps 面板** dock（状态圆点列表、进度条、内联 JSON 参数编辑、日志控制台），MCP 服务器不在也能工作 —— 包括打开一个已保存的文档并重放它的构建过程。
+
+让这套循环安全的语义：
+
+* 日志写入发生在每步的事务内，但 **FreeCAD 的撤销不恢复文档级属性**，因此回滚/重跑会显式对账日志；以最后一个带事务的步骤为锚的 `drift` 标志能识别出用户手工 Ctrl+Z。
+* `undo_count` 只数带事务的记录 —— 非原子的 `execute_code` 没有 undo 条目，把它计入会从普通撤销栈上吃掉更早步骤的事务。
+* accepted 步骤是软锁：`rollback_to`/`reexecute`/`replay` 跨过它需要 `force=true`；`reject` 是显式销毁、自由跨过，但跨过非原子 `execute_code` 记录仍需 force。
+* 重跑必须兼容两种键名约定：RPC batch 子操作原样记录 `{"action": ...}`，journal 原生步骤用 `{"operation": ...}` —— 日志读取端（`sj.sub_operation`）和首次执行端**都**接受两种键。
+* `run_all`/`replay` 跳过不可重跑的记录（`execute_code` 检查是正常的日志公民）：标记为 done 并列入结果的 `skipped`，而不是让整次运行失败。
+* 每个变更结果都附带紧凑的 `journal` 快照，客户端无需再追问状态。
+
+### 5.3 人机协同：GUI 修改同步与快照
+
+评审循环的目的是**人机协同建模**：AI 用 MCP 建、用户在 GUI 里改，两个方向都必须成立。一个文档观察器（reload 安全的单例）把用户对"某个已完成步骤产出的对象"的 GUI 修改同步回该步骤的参数 —— 仅 params 已有的标量键，外加 `Placement`（永远跟踪：reexecute 会重放 `obj_properties`，不同步就会把零件瞬移回原点；角度按度数存储，与 property-mapper 约定一致）。特征操作走固定的按操作映射（pad/pocket `Length`→`length`，fillet/chamfer 仅在所有边同值时回写尺寸，……）；多个已完成步骤碰同一对象时，较晚的步骤拥有该属性。
+
+`snapshot` 动词覆盖另一个方向 —— 用户在**日志之外**的手工建模：追加一条 done+accepted、不可执行的标记记录，其软锁传递性地保护手工劳动不被盲目回滚；`objects_before`/`objects_after` 的差集说出日志漏掉了什么。planned 尾部保留 —— snapshot 是标记，不是提交。
 
 ## 6. Sketcher 与 PartDesign 操作
 
@@ -148,7 +175,14 @@ AI 驱动 CAD 最难的问题是零件间的相对定位。CADPilot 用数据而
 * **名称净化**：FreeCAD 会净化文档/对象名（空格转下划线、去重）。RPC 处理器始终返回*实际*名称而非请求名称。
 * **版本容忍**：thickness/draft 同时支持 FreeCAD ≥ 1.1 的 LinkSub `Base` 布局和 ≤ 1.0 的 `Faces` 属性（运行时探测）；`Part::Mirroring` 与 `Part::Mirror` 通过探测择优。
 * **热重载**：插件可在不重启 FreeCAD 的情况下重载（停 RPC 服务器 → 延迟 `importlib.reload` 全部子模块 → 启动），并备有重启与停服排空发生竞态时的修复路径。
+* **无 FreeCAD 也能诊断**：`diagnose` 工具完全运行在 MCP 侧（从不 import FreeCAD），FreeCAD 宕机或卡死时照常回答 —— 探测 RPC 端口、FreeCAD 进程、跨所有用户数据目录的插件安装、以及引导崩溃日志，最后给出具体修复步骤。它的关键判断是：端口在**监听**但 ping 不应答 = GUI 线程卡死，而不是安装配置问题。
+* **插件调试日志**：`dbglog` 维护环形缓冲加滚动文件；`get_addon_log` 的 RPC 处理器刻意**不**走 GUI 派发，因此恰好当 GUI 线程卡死、其他调用全部挂起时日志仍可读。
+* **插件引导陷阱**：FreeCAD 用裸 `exec()` 执行 `InitGui.py`，其命名空间并非该模块的 `__globals__` —— 引导所需的每个名字都必须在引导函数**内部**导入。此处的崩溃会写进 `initgui_debug.log`（插件目录，或 `__file__` 不可用时写到 FreeCAD 可执行文件旁），正是 `diagnose` 读取它的地方。
 
 ## 13. 测试策略
 
-pytest 套件（约 200 个测试）基于一个记录每次调用的假 XML-RPC 连接，覆盖 MCP 服务器侧：响应整形、截图策略优先级、重连行为、会话/模式状态机、`cad()` 派发、装配状态机（含 RPC 失败路径）、引导启发式，以及 docstring 预算。插件侧需要真实 FreeCAD，由 `tests/live_sketch_verify.py` 做端到端验证：构建参数化支架，检查表达式传播、失败诊断和撤销。
+pytest 套件（约 310 个测试）基于一个记录每次调用的假 XML-RPC 连接，覆盖 MCP 服务器侧：响应整形、截图策略优先级、重连行为、会话/模式状态机、`cad()` 派发、装配状态机（含 RPC 失败路径）、引导启发式，以及 docstring 预算。
+
+插件无法脱离 FreeCAD 导入，因此第二层测试**用 `ast` 解析插件源码**，钉住那些只会在运行时静默失效的契约：`InitGui.py` 的裸 exec 命名空间规则、Steps 面板的 Qt 信号接线、日志边界两侧对 batch 子操作键名的兼容，以及 replay 对不可重跑记录的跳过。诊断套件覆盖各平台的路径布局、一个真实的 loopback XML-RPC 端点、关闭端口，以及各判定分支。
+
+插件侧需要真实 FreeCAD，由 `tests/live_sketch_verify.py` 做端到端验证：构建参数化支架，检查表达式传播、失败诊断和撤销。

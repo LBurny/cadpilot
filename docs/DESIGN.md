@@ -9,6 +9,7 @@ This document describes the architecture and key design decisions of CADPilot, a
 * Give AI clients **complete** control of FreeCAD: documents, parametric modeling, constrained sketches, assembly, and quantitative verification.
 * Keep the AI client's **context budget low**: small tool list, short docstrings, text-first responses, on-demand documentation.
 * Make every mutation **transactional and rollback-able**, so an AI agent can experiment and backtrack like a human designer.
+* Support **human–AI co-modeling**: a journaled review loop on the FreeCAD side, so the user can inspect, correct, and replay what the AI builds.
 * Provide **data-driven spatial awareness** (anchors, topology, measurements) so positioning does not depend on screenshots or guesswork.
 
 ## 2. Two-Process Architecture
@@ -40,7 +41,7 @@ FreeCAD's document tree and GUI APIs are **not thread-safe**; all document/GUI w
 
 * `dispatch_to_gui(task)` enqueues a wrapped callable on a shared queue and blocks the RPC thread (default 60 s timeout) until the GUI thread reports the result through a **per-call response queue** — a timeout in one call can never corrupt another call's response.
 * The GUI thread is woken **immediately** via a Qt signal (`QueuedConnection`), with a 500 ms heartbeat timer as fallback.
-* The drain loop skips ticks while mouse buttons are held, or a popup/modal is open, so MCP tasks cannot interrupt 3D navigation or dialogs. A re-entrancy guard prevents nested drains from `processEvents` inside a task.
+* The drain loop skips ticks while mouse buttons are held **and the main window is actually active** (a phantom pressed state left by a background launch or RDP session once starved the queue — `ping` answered while every GUI call timed out), or while a popup/modal is open, so MCP tasks cannot interrupt 3D navigation or dialogs. A re-entrancy guard prevents nested drains from `processEvents` inside a task.
 * Exceptions inside a task are caught, logged to FreeCAD's Report View, and returned as error strings — they never kill the dispatch loop.
 * On stop, a sentinel suppresses the timer reschedule so the loop actually terminates.
 
@@ -60,7 +61,7 @@ This keeps the resident tool list small — important because every tool definit
 
 ### 4.2 Docstring budget
 
-Every `@mcp.tool()` docstring costs context tokens in *every* conversation. Docstrings are therefore limited to a 1–3 line summary plus brief args; long parameter/semantics references live in `tool_docs.py` and are served on demand via the `operation_help` tool. A test enforces a total docstring budget (< 14,000 chars).
+Every `@mcp.tool()` docstring costs context tokens in *every* conversation. Docstrings are therefore limited to a 1–3 line summary plus brief args; long parameter/semantics references live in `tool_docs.py` and are served on demand via the `operation_help` tool. A test enforces a total docstring budget (< 11,000 chars).
 
 ### 4.3 Knowledge hierarchy
 
@@ -68,7 +69,11 @@ Prompts instruct the model to consult, in order: ① its own knowledge → ② `
 
 ## 5. Transactions, Sessions, and Rollback
 
-Every committed mutation runs inside a **FreeCAD transaction** (`doc.openTransaction`). On top of that, modeling sessions (`session_start` … `session_complete`) record each mutation as a step with:
+Every committed mutation runs inside a **FreeCAD transaction** (`doc.openTransaction`). Two complementary journals sit on top: MCP-side **modeling sessions** (whole-session undo), and the FreeCAD-side **step journal** (a review loop the user can see and drive).
+
+### 5.1 Modeling sessions
+
+Modeling sessions (`session_start` … `session_complete`) record each mutation as a step with:
 
 * operation, description, parameters, result summary
 * an `objects` fingerprint (sorted object names) for drift detection
@@ -76,9 +81,31 @@ Every committed mutation runs inside a **FreeCAD transaction** (`doc.openTransac
 
 `session_rollback(to_step)` is then just `doc.undo()` × N plus log truncation — no delete-and-rebuild. Removed steps sit in a redo buffer until a new step clears it, mirroring FreeCAD's redo semantics. `execute_code` steps are non-atomic and block rollback unless forced.
 
-Mutation responses are auto-audited: a read-only connectivity check (`verify_assembly`) re-runs after every committed `cad()` call and appends warnings about disconnected islands; `session_status` surfaces risks (state drift, non-atomic steps, closed documents) and next-step suggestions. The audit never blocks the mutation itself.
+Mutation responses are auto-audited: a read-only connectivity check (`verify_assembly`) re-runs after every committed `cad()` call and appends warnings about disconnected islands; `session_status` surfaces risks (state drift, non-atomic steps, closed documents) and next-step suggestions. The audit never blocks the mutation itself and can be disabled globally (`--no-auto-audit`); it is also skipped automatically for very large documents.
 
 Sessions and patterns persist as JSON under `$CADPILOT_HOME` (default `~/.cadpilot/`), written atomically (tmp + rename).
+
+### 5.2 Step journal and the steps panel
+
+Sessions are an MCP-side construct: they vanish when the stdio server exits and are invisible to someone sitting at the FreeCAD window. The **step journal** is a second, FreeCAD-side log that lives **on the document itself** (the `App::PropertyString` `MCP_StepJournal`), so it survives with the RPC server stopped and is shared by two front ends driving one engine (`step_engine.apply_op`):
+
+* the `step_control` MCP tool: `run_next` / `run_all` / `run_to`, `rollback_to`, `reexecute` (undo + re-run with merged params), `accept`/`unaccept` (soft lock), `reject` (undo and drop the step plus everything after), `update` / `insert` (the planned tail is append/insert-only — history is never edited), `replay` (roll back to 0 and rebuild from the journal), `snapshot`, `reset`;
+* the **Steps panel** dock (status-dot list, progress bar, inline JSON parameter editor, log console), which works with the MCP server down — including opening a saved document and replaying its build.
+
+Semantics that make the loop safe:
+
+* Journal writes happen inside each step's transaction, but **FreeCAD's undo does not restore document-level properties**, so rollback/reexecute reconcile the log explicitly; a `drift` flag anchored on the last transaction-bearing step flags a manual Ctrl+Z.
+* Only transaction-bearing records count for `undo_count` — a non-atomic `execute_code` owns no undo entry, and counting it would eat an earlier step's transaction off the plain undo stack.
+* Accepted steps are a soft lock: `rollback_to`/`reexecute`/`replay` refuse to cross one without `force=true`; `reject` is the deliberate act of destruction and crosses freely, but crossing a non-atomic `execute_code` record still needs force.
+* Re-running must resolve operation names from two key conventions: RPC batch sub-ops journal `{"action": ...}` verbatim while journal-native steps use `{"operation": ...}` — **both** the journal reader (`sj.sub_operation`) and the initial executor accept both keys.
+* `run_all`/`replay` skip non-executable records (an `execute_code` inspection is a normal journal citizen): the record is marked done and reported in the result's `skipped` list instead of failing the whole run.
+* Every mutating result carries a compact `journal` snapshot, so clients need no follow-up status call.
+
+### 5.3 Human-in-the-loop: GUI edit sync and snapshots
+
+The review loop exists for **human–AI co-modeling**: the AI builds via MCP, the user corrects in the GUI, and both directions must hold. A document observer (reload-safe singleton) mirrors GUI edits on objects a done step produced back into that step's parameters — scalar keys already present in the params, plus `Placement` (always tracked: a reexecute re-applies `obj_properties` and would otherwise teleport the part to the origin; angles are stored in degrees, matching the property-mapper convention). Feature ops sync through a fixed per-op map (pad/pocket `Length`→`length`, fillet/chamfer sizes only when all edges share one value, …); when several done steps touch one object, the later step owns each property.
+
+The `snapshot` verb covers the opposite boundary — work the user did *off-journal*: it appends a done+accepted, non-executable marker whose soft lock transitively protects the manual work from blind rollback, and whose `objects_before`/`objects_after` diff names exactly what the journal missed. The planned tail is kept — a snapshot is a marker, not a commit.
 
 ## 6. Sketcher and PartDesign Ops
 
@@ -148,7 +175,14 @@ Screenshots are **optional and off by default**:
 * **Name sanitization**: FreeCAD sanitizes document/object names (spaces → underscores, deduplication). RPC handlers always return the *actual* name, not the requested one.
 * **Version tolerance**: thickness/draft support both the FreeCAD ≥ 1.1 LinkSub `Base` layout and the ≤ 1.0 `Faces` property (probed at runtime); `Part::Mirroring` vs `Part::Mirror` is resolved by probing.
 * **Hot reload**: the addon can be reloaded without restarting FreeCAD (stop RPC server → deferred `importlib.reload` of all submodules → start), with a documented repair path if the restart races the shutdown drain.
+* **Diagnostics without a live FreeCAD**: the `diagnose` tool runs entirely on the MCP side (never imports FreeCAD), so it answers when FreeCAD is down or frozen — probing the RPC port, the FreeCAD process, the addon install across every user-data dir, and the bootstrap crash log, then ending with a concrete fix. Its key judgement: a *listening* port that does not answer ping is a wedged GUI thread, not a setup problem.
+* **Addon debug log**: `dbglog` keeps a ring buffer plus a rotating file; the `get_addon_log` RPC handler is deliberately *not* GUI-dispatched, so the log stays readable exactly when the GUI thread is wedged and every other call hangs.
+* **Addon bootstrap trap**: FreeCAD executes `InitGui.py` with a bare `exec()` into a namespace that is not the module's `__globals__` — every name the bootstrap needs is imported *inside* the bootstrap function. A crash there lands in `initgui_debug.log` (the addon dir, or next to the FreeCAD executable when `__file__` is unavailable), which is exactly where `diagnose` reads it.
 
 ## 13. Testing Strategy
 
-The pytest suite (~200 tests) covers the MCP-server side against a fake XML-RPC connection that records every call: response shaping, screenshot policy precedence, reconnect behavior, session/pattern state machines, `cad()` dispatch, assembly state machine (including RPC failure paths), guidance heuristics, and the docstring budget. The addon side requires a live FreeCAD and is verified with `tests/live_sketch_verify.py`, an end-to-end script that builds a parametric bracket, checks expression propagation, failure diagnostics, and undo.
+The pytest suite (~310 tests) covers the MCP-server side against a fake XML-RPC connection that records every call: response shaping, screenshot policy precedence, reconnect behavior, session/pattern state machines, `cad()` dispatch, assembly state machine (including RPC failure paths), guidance heuristics, and the docstring budget.
+
+Because the addon cannot be imported without FreeCAD, a second layer of tests **parses the addon source with `ast`** to pin contracts that would otherwise fail silently at runtime: the bare-exec namespace rule in `InitGui.py`, the Qt-signal wiring of the steps panel, batch sub-op key tolerance on both sides of the journal boundary, and the replay skip of non-executable records. The diagnostics suite covers per-platform path layouts, a live loopback XML-RPC endpoint, a closed port, and the verdict branches.
+
+The addon side requires a live FreeCAD and is verified with `tests/live_sketch_verify.py`, an end-to-end script that builds a parametric bracket, checks expression propagation, failure diagnostics, and undo.
