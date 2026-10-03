@@ -94,6 +94,34 @@ def _transaction_name(rec: sj.StepRecord) -> str:
     return f"CADPilot: {rec.operation} {name}".strip()
 
 
+# --- engine-echo mute -----------------------------------------------------------
+#
+# The manual-edit observer (further down) mirrors property-panel edits into
+# the journal. Undo/redo and step re-runs fire the SAME property-change
+# notifications, but they write restored or already-recorded values: syncing
+# those would undo a user's correction after the fact (the undo restores
+# Height 6, the observer "manual-edits" the journal back to 6, the re-run
+# rebuilds at 6 — the correction silently reverts). Every window where the
+# ENGINE drives the document mutes the observer; a genuine GUI edit never
+# happens inside one.
+
+_ENGINE_ACTIVE = 0
+
+
+class _EngineQuiet:
+    """Context manager: while active, the manual-edit observer stays silent."""
+
+    def __enter__(self) -> _EngineQuiet:
+        global _ENGINE_ACTIVE
+        _ENGINE_ACTIVE += 1
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        global _ENGINE_ACTIVE
+        _ENGINE_ACTIVE -= 1
+        return False
+
+
 def undo_n(doc, n: int) -> dict[str, Any]:
     """Undo up to ``n`` transactions; report how many actually went.
 
@@ -111,17 +139,20 @@ def redo_n(doc, n: int) -> dict[str, Any]:
 def _stack_op(doc, n: int, undo: bool) -> dict[str, Any]:
     if n <= 0:
         return {"success": True, "count": 0, "objects": _object_names(doc)}
-    stack = list(getattr(doc, "UndoNames" if undo else "RedoNames", []) or [])
-    done = 0
-    for _ in range(min(n, len(stack))):
-        try:
-            doc.undo() if undo else doc.redo()
-            done += 1
-        except Exception as e:
-            FreeCAD.Console.PrintWarning(f"CADPilot: {'undo' if undo else 'redo'} stopped: {e}\n")
-            break
-    with contextlib.suppress(Exception):
-        doc.recompute()
+    with _EngineQuiet():
+        stack = list(getattr(doc, "UndoNames" if undo else "RedoNames", []) or [])
+        done = 0
+        for _ in range(min(n, len(stack))):
+            try:
+                doc.undo() if undo else doc.redo()
+                done += 1
+            except Exception as e:
+                FreeCAD.Console.PrintWarning(
+                    f"CADPilot: {'undo' if undo else 'redo'} stopped: {e}\n"
+                )
+                break
+        with contextlib.suppress(Exception):
+            doc.recompute()
     return {"success": True, "count": done, "objects": _object_names(doc)}
 
 
@@ -315,14 +346,18 @@ def run_record(doc, records: list[sj.StepRecord], rec: sj.StepRecord) -> dict[st
     doc.openTransaction(tx)
     logger.info("open transaction %r (%d objects)", tx, len(before))
     started = time.monotonic()
-    try:
-        res = execute_record(doc, rec)
-    except Exception as e:
-        res = {"success": False, "error": f"{type(e).__name__}: {e}"}
+    with _EngineQuiet():
+        try:
+            res = execute_record(doc, rec)
+        except Exception as e:
+            res = {"success": False, "error": f"{type(e).__name__}: {e}"}
     rec.duration_ms = int((time.monotonic() - started) * 1000)
 
     if not res.get("success"):
-        with contextlib.suppress(Exception):
+        # abortTransaction restores the pre-step state: an undo in disguise,
+        # and restoring writes the OLD values that the observer must not
+        # mirror back over (possibly synced) params.
+        with _EngineQuiet(), contextlib.suppress(Exception):
             doc.abortTransaction()
         rec.state = sj.STATE_FAILED
         rec.error = str(res.get("error") or "unknown error")
@@ -346,7 +381,7 @@ def run_record(doc, records: list[sj.StepRecord], rec: sj.StepRecord) -> dict[st
         len(records),
     )
     doc.commitTransaction()
-    with contextlib.suppress(Exception):
+    with _EngineQuiet(), contextlib.suppress(Exception):
         doc.recompute()
     # Self-correction for a re-run execute_code whose edited snippet stopped
     # mutating: the commit produced no undo entry, so the record must stop
@@ -468,7 +503,8 @@ def _apply_op(doc, spec: dict[str, Any]) -> dict[str, Any]:
         write_journal(doc, records)
         return {"success": True, "index": rec.index, "accepted": rec.accepted}
     if operation == "snapshot":
-        return _snapshot(doc, records, str((spec.get("params") or {}).get("note") or ""))
+        p = spec.get("params") or {}
+        return _snapshot(doc, records, str(p.get("note") or ""), bool(p.get("accept_done")))
     if operation == "reject":
         return _reject(
             doc,
@@ -595,23 +631,44 @@ def _run_steps(doc, records, limit: int | None, upto: int | None) -> dict[str, A
     }
 
 
-def _snapshot(doc, records, note: str) -> dict[str, Any]:
+def _snapshot(doc, records, note: str, accept_done: bool = False) -> dict[str, Any]:
     """Bookmark the current model state as the accepted baseline.
 
-    For the "the user modeled outside the journal" flow: the marker is done +
-    accepted, so rollback/replay refuses to cross it without force — that
-    soft-lock transitively protects the manual work, whose transactions the
-    journal cannot count. objects_before (what the journal last knew) vs
-    objects_after (the world now) names exactly what happened off-journal.
-    The planned tail is KEPT: a snapshot is a marker, not a commit.
+    For the "the user modeled outside the journal" flow: review the good steps,
+    do the complex part by hand in the GUI, snapshot, and let the model continue
+    from there over MCP. The marker is done + accepted, so rollback/replay
+    refuses to cross it without force — that soft lock transitively protects
+    the manual work, whose transactions the journal cannot count.
+    objects_before (what the journal last knew) vs objects_after (the world
+    now) names exactly what happened off-journal. The planned tail is KEPT: a
+    snapshot is a marker, not a commit. ``accept_done`` accepts every done step
+    in the same call, which bundles "everything so far is correct" into the
+    baseline instead of ten separate accept clicks.
     """
-    prev = list(records[-1].objects_after) if records else []
+    # Anchor on the last DONE record's snapshot — the journal's last known
+    # state. The physical last record may be a planned tail entry, which never
+    # ran and carries no snapshot; anchoring there would claim the world before
+    # step one was empty and mark the user's whole document as "new".
+    prev = next(
+        (
+            list(r.objects_after)
+            for r in reversed(records)
+            if r.state == sj.STATE_DONE and r.objects_after
+        ),
+        [],
+    )
+    accepted = 0
+    if accept_done:
+        for r in records:
+            if r.state == sj.STATE_DONE and not r.accepted:
+                r.accepted = True
+                accepted += 1
     rec = sj.StepRecord(
         index=len(records) + 1,
         state=sj.STATE_DONE,
         operation="snapshot",
         label=note or "manual baseline",
-        params={"note": note},
+        params={"note": note, "accept_done": accept_done},
         atomic=False,
         executable=False,
         accepted=True,
@@ -622,8 +679,42 @@ def _snapshot(doc, records, note: str) -> dict[str, Any]:
     records.append(rec)
     write_journal(doc, records)
     added = [n for n in rec.objects_after if n not in set(prev)]
-    logger.info("journal snapshot at step %d (%d new object(s))", rec.index, len(added))
-    return {"success": True, "index": rec.index, "added": added}
+    logger.info(
+        "journal snapshot at step %d (%d new object(s), %d step(s) accepted)",
+        rec.index,
+        len(added),
+        accepted,
+    )
+    return {"success": True, "index": rec.index, "added": added, "accepted": accepted}
+
+
+def _remove_objects(doc, names: list[str]) -> list[str]:
+    """Delete objects by name in one transaction; returns the names removed."""
+    removed: list[str] = []
+    if not names:
+        return removed
+    present = set(_object_names(doc))
+    targets = [n for n in names if n in present]
+    if not targets:
+        return removed
+    doc.openTransaction("CADPilot: rollback cleanup")
+    try:
+        for name in targets:
+            obj = doc.getObject(name)
+            if obj is None:
+                continue
+            try:
+                doc.removeObject(name)
+                removed.append(name)
+            except Exception as exc:  # still referenced, or not removable
+                FreeCAD.Console.PrintWarning(f"CADPilot: could not remove '{name}': {exc}\n")
+        doc.recompute()
+        doc.commitTransaction()
+    except Exception:
+        with contextlib.suppress(Exception):
+            doc.abortTransaction()
+        raise
+    return removed
 
 
 def _rollback(doc, records, to_index: int, force: bool) -> dict[str, Any]:
@@ -652,20 +743,106 @@ def _rollback(doc, records, to_index: int, force: bool) -> dict[str, Any]:
     # the log match the model again, so it runs on every rollback, not just as a
     # fallback.
     records = read_journal(doc)
+    warnings: list[str] = []
+    restored = "native"
+    removed: list[str] = []
+    # The count alone cannot certify the undo: the stack is shared with the GUI,
+    # and a manual edit interleaved on it pops under this rollback's name while
+    # the journal's own transaction stays applied. The object sets tell the
+    # truth, so verify them before promising "native".
+    present = set(_object_names(doc))
+    leftover = sorted(set(sj.created_since(records, to_index)) & present)
+    expected = set(sj.objects_after_index(records, to_index))
+    journal_built = set(sj.created_since(records, 0))
+    missing = sorted(n for n in expected if n not in present and n in journal_built)
+    # Steps the undo stack cannot reach. Even when some transactions did come
+    # off, these keep their changes, which is the "rollback reported success but
+    # the objects are still there" bug.
+    stranded = sj.steps_without_undo(records, to_index)
+
+    triggers: list[str] = []
+    if res["count"] < plan["undo_count"]:
+        triggers.append(
+            f"the undo stack held only {res['count']}/{plan['undo_count']} of the "
+            "journal's transactions"
+        )
+    if stranded:
+        triggers.append(f"step(s) {stranded} own no undo entry")
+    if leftover:
+        triggers.append(
+            f"object(s) {leftover} from the rolled-back steps are still present "
+            "(off-journal edits on the undo stack?)"
+        )
+    if missing:
+        triggers.append(f"object(s) {missing} that step {to_index} should have are gone")
+
+    if triggers:
+        reason = "; ".join(triggers)
+        if not sj.unrecoverable_steps(records, to_index):
+            # Everything up to the target can be re-created from the journal, so
+            # rebuild: clear what the journal built, then run 1..to_index again.
+            # This is a true restore, unlike a partial undo.
+            removed = _remove_objects(doc, sj.created_since(records, 0))
+            records = read_journal(doc)
+            # Failed records belong in the re-run too: their transaction aborted,
+            # so re-running them is safe, and skipping them would run a later
+            # step against a missing dependency.
+            for rec in records:
+                if rec.state in (sj.STATE_DONE, sj.STATE_FAILED):
+                    rec.state = sj.STATE_PLANNED
+                    rec.transaction = ""
+                    rec.error = ""
+            write_journal(doc, records)
+            run = _run_steps(doc, records, limit=None, upto=to_index)
+            records = read_journal(doc)
+            restored = "rebuild"
+            warnings.append(
+                f"{reason}. The model was rebuilt from the journal instead: "
+                f"{len(removed)} object(s) removed and steps 1..{to_index} re-run."
+            )
+            stranded = []
+            if not run.get("success"):
+                return {
+                    "success": False,
+                    "error": f"the rebuild stopped early: {run.get('error') or 'unknown error'}",
+                    "undone": res["count"],
+                    "restored": restored,
+                    "removed": removed,
+                    "stranded": stranded,
+                    "done": sj.done_count(records),
+                    "count": len(records),
+                    "warnings": warnings,
+                }
+        else:
+            # Those steps can be neither undone nor re-run (their operation or
+            # code was never recorded), so remove the objects they introduced.
+            # Property changes they made cannot be restored.
+            removal = sj.created_since(records, to_index)
+            removed = _remove_objects(doc, removal)
+            records = read_journal(doc)
+            restored = "partial"
+            warnings.append(
+                f"{reason}. Their objects were removed ({len(removed)} object(s)), but "
+                "property changes they made (placements, dimensions) cannot be restored. "
+                "Replay the journal, or rebuild from scratch, if you need an exact state."
+            )
+            still = sorted(set(removal) & set(_object_names(doc)))
+            if still:
+                warnings.append(
+                    f"object(s) {still} could not be removed and are still in the document"
+                )
+
     extra = sj.done_count(records) - to_index
     if extra > 0:
         sj.rewind(records, extra)
         with contextlib.suppress(Exception):
             write_journal(doc, records)
-    warnings = []
-    if res["count"] < plan["undo_count"]:
-        warnings.append(
-            f"only {res['count']}/{plan['undo_count']} transactions could be undone "
-            "(the FreeCAD undo stack was shorter than the journal)"
-        )
     return {
         "success": True,
         "undone": res["count"],
+        "restored": restored,
+        "removed": removed,
+        "stranded": stranded,
         "done": sj.done_count(records),
         "count": len(records),
         "warnings": warnings,
@@ -692,6 +869,43 @@ def _reject(doc, records, index: int, force: bool, reason: str) -> dict[str, Any
         }
     res = undo_n(doc, plan["undo_count"])
     records = read_journal(doc)
+    warnings: list[str] = []
+    # The same undo-stack problems as rollback: a rejected step with no undo
+    # entry leaves its objects behind, and a manual edit interleaved on the
+    # stack pops under this reject's name. The records are about to be DROPPED,
+    # so there is no rebuild option — remove what the doomed steps introduced
+    # (a no-op when the undo was clean), then say what could not be fixed.
+    removal = sj.created_since(records, index - 1)
+    removed = _remove_objects(doc, removal)
+    records = read_journal(doc)
+    present = set(_object_names(doc))
+    still = sorted(set(removal) & present)
+    if still:
+        warnings.append(
+            f"object(s) {still} from the rejected steps could not be removed and are "
+            "still in the document"
+        )
+    kept_expected = set(sj.objects_after_index(records, index - 1))
+    gone = sorted(
+        n for n in kept_expected if n not in present and n in set(sj.created_since(records, 0))
+    )
+    if gone:
+        warnings.append(
+            f"object(s) {gone} that the kept steps created are missing (off-journal "
+            "edits on the undo stack?); replay the journal to rebuild them"
+        )
+    if res["count"] < plan["undo_count"]:
+        warnings.append(
+            f"only {res['count']}/{plan['undo_count']} transactions could be undone "
+            "(the FreeCAD undo stack was shorter than the journal)"
+        )
+    doomed = sj.steps_without_undo(records, index - 1)
+    if doomed:
+        warnings.append(
+            f"rejected step(s) {doomed} owned no undo entry, so their objects were removed "
+            f"directly ({len(removed)} object(s)); property changes they made cannot be "
+            "restored"
+        )
     del records[index - 1 :]
     write_journal(doc, records)
     logger.info(
@@ -700,13 +914,13 @@ def _reject(doc, records, index: int, force: bool, reason: str) -> dict[str, Any
         plan["drop"],
         f": {reason}" if reason else "",
     )
-    warnings = []
-    if res["count"] < plan["undo_count"]:
-        warnings.append(
-            f"only {res['count']}/{plan['undo_count']} transactions could be undone "
-            "(the FreeCAD undo stack was shorter than the journal)"
-        )
-    return {"success": True, "rejected": plan["drop"], "undone": res["count"], "warnings": warnings}
+    return {
+        "success": True,
+        "rejected": plan["drop"],
+        "undone": res["count"],
+        "removed": removed,
+        "warnings": warnings,
+    }
 
 
 def _reexecute(
@@ -733,8 +947,33 @@ def _reexecute(
                 f"{plan['accepted']}; pass force=true"
             ),
         }
-    undo_n(doc, plan["undo_count"])
+    res = undo_n(doc, plan["undo_count"])
     records = read_journal(doc)
+    # Re-running a step is only sound on a clean base: if the undo came up
+    # short or popped the wrong transactions (off-journal edits on the stack),
+    # re-running would duplicate objects under deduplicated names instead of
+    # failing. Verify the object sets first and point at rollback_to, which
+    # can rebuild, instead.
+    if res["count"] < plan["undo_count"]:
+        return {
+            "success": False,
+            "error": (
+                f"only {res['count']}/{plan['undo_count']} transactions could be undone "
+                "(the undo stack is shorter than the journal); run rollback_to first, "
+                "it can rebuild the model"
+            ),
+        }
+    present = set(_object_names(doc))
+    leftover = sorted(set(sj.created_since(records, index - 1)) & present)
+    if leftover:
+        return {
+            "success": False,
+            "error": (
+                f"undo did not restore step {index - 1} cleanly: object(s) {leftover} from "
+                "later steps are still present (off-journal edits on the undo stack?); "
+                "run rollback_to first, it can rebuild the model"
+            ),
+        }
     rec = next((r for r in records if r.index == index), None)
     if rec is None:
         return {"success": False, "error": f"step {index} disappeared during rollback"}
@@ -758,9 +997,11 @@ def _reexecute(
 # deliberately narrow: only scalar properties ALREADY present in the params
 # are synced (the spec's structure is never invented), plus the Placement of
 # create_object/edit_object steps (a reexecute re-applies obj_properties and
-# would otherwise teleport the part back to the origin). Engine ops never
-# echo here — re-creation writes the same values the params already hold,
-# which the diff check swallows.
+# would otherwise teleport the part back to the origin). Engine-driven
+# changes are ignored: re-creation writes the same values the params already
+# hold (the diff check swallows them), while undo/redo/abort write RESTORED
+# values that must never be mirrored back (see _EngineQuiet above) — that
+# echo was how a rollback/reexecute silently reverted a manual correction.
 
 _SYNC_EVENTS: list[dict[str, Any]] = []
 
@@ -926,7 +1167,10 @@ class _JournalSyncObserver:
         self._writing = False
 
     def slotChangedObject(self, obj, prop):
-        if self._writing:
+        # _writing guards the observer's own journal write; _ENGINE_ACTIVE
+        # mutes engine-driven windows (undo/redo/re-run), whose property
+        # writes are restored or already-recorded values, not manual edits.
+        if self._writing or _ENGINE_ACTIVE:
             return
         # An observer must never break the host's edit.
         with contextlib.suppress(Exception):

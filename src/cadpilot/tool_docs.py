@@ -290,9 +290,12 @@ Review loop (the point of the panel: plan, release, review, fix):
                 lock — rollback_to / reexecute / replay across them need
                 force=true (params.on=false un-accepts)
   snapshot      bookmark the current state as the accepted baseline — for
-                off-journal manual modeling: done + accepted (soft-locks all
-                prior steps), non-atomic; objects_before vs objects_after
-                names what the journal missed. params.note describes it
+                "the good steps are reviewed, I did the complex part by
+                hand, continue from here": done + accepted (soft-locks prior
+                steps), non-atomic; objects_before vs objects_after names
+                what the journal missed. params.note describes it;
+                params.accept_done=true also accepts every done step in
+                the same call
   reject        undo step `index` and DROP everything from it onward (done
                 steps are undone, planned ones forgotten — the tail was
                 authored against step `index` existing). params.reason is
@@ -305,8 +308,14 @@ Review loop (the point of the panel: plan, release, review, fix):
                 merged in; the planned tail survives (reject drops it)
 
 Housekeeping:
-  rollback_to   undo back to step `index` (0 = undo every recorded step);
-                records stay and go back to planned
+  rollback_to   put the model back at step `index` (0 = before every recorded
+                step); records stay and go back to planned. The undo result is
+                VERIFIED, not assumed: when the undo stack cannot reach the
+                target (or manual edits sit interleaved on it) the journal
+                REBUILDS instead — removes what the journal built, re-runs
+                steps 1..index — and reports `restored: native | rebuild |
+                partial` plus `warnings`; objects that predate the journal
+                are never removed
   insert        add steps (params.steps) after `index`; the planned tail is
                 insert/append-only — to change history, reject and re-plan
   clear_plan    drop not-yet-executed steps (never touches the model)

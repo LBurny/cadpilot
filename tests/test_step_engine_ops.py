@@ -82,3 +82,110 @@ def test_run_steps_skips_non_executable_records():
         n.value for n in ast.walk(func) if isinstance(n, ast.Constant) and isinstance(n.value, str)
     }
     assert "skipped" in strings
+
+
+def test_rollback_verifies_the_undo_before_promising_native():
+    """The undo stack is shared with the GUI: a manual edit interleaved on it
+    pops under a rollback's name while the popped count still matches, so the
+    count alone certified nothing and a rollback reported "native" over a
+    wrong model. _rollback must compare the object sets (sj.created_since
+    leftovers against sj.objects_after_index expectations) after undo_n."""
+    func = next(
+        n for n in ast.walk(_ENGINE) if isinstance(n, ast.FunctionDef) and n.name == "_rollback"
+    )
+    attrs = {n.attr for n in ast.walk(func) if isinstance(n, ast.Attribute)}
+    assert "created_since" in attrs, "_rollback must compute leftovers via sj.created_since"
+    assert (
+        "objects_after_index" in attrs
+    ), "_rollback must verify the object set expected at the target step"
+
+
+def test_removal_sets_come_from_record_diffs():
+    """Removal sets must be sj.created_since (before/after diffs) everywhere:
+    whole-snapshot subtraction at index 0 has an empty target, and since every
+    snapshot lists the entire document it would delete objects that predate
+    the journal — the user's own work."""
+    attrs = {n.attr for n in ast.walk(_ENGINE) if isinstance(n, ast.Attribute)}
+    assert "extra_objects" not in attrs, "the whole-snapshot variant is the data-loss bug"
+    for fname in ("_rollback", "_reject", "_reexecute"):
+        func = next(
+            n for n in ast.walk(_ENGINE) if isinstance(n, ast.FunctionDef) and n.name == fname
+        )
+        assert "created_since" in {
+            n.attr for n in ast.walk(func) if isinstance(n, ast.Attribute)
+        }, f"{fname} must compute its removal/verification set via sj.created_since"
+
+
+def test_rebuild_resets_failed_records_for_the_re_run():
+    """A failed step's transaction aborted (nothing to clean up), and a rebuild
+    that leaves it failed would run a LATER step against its missing result.
+    The reset loop in _rollback must cover failed records, not only done
+    ones."""
+    func = next(
+        n for n in ast.walk(_ENGINE) if isinstance(n, ast.FunctionDef) and n.name == "_rollback"
+    )
+    reset = [
+        n
+        for n in ast.walk(func)
+        if isinstance(n, ast.Compare)
+        and isinstance(n.left, ast.Attribute)
+        and n.left.attr == "state"
+        and any(isinstance(m, ast.Attribute) and m.attr == "STATE_FAILED" for m in ast.walk(n))
+    ]
+    assert reset, "the rebuild reset must include failed records"
+
+
+def test_snapshot_supports_the_manual_baseline_flow():
+    """The "manual work between journal steps" flow: review the good steps, do
+    the complex part by hand in the GUI, snapshot, let the model continue over
+    MCP. objects_before must anchor on the last DONE record (the physical last
+    record may be a planned tail, which never ran and carries no snapshot),
+    and accept_done bundles the accepts into the same call."""
+    func = next(
+        n for n in ast.walk(_ENGINE) if isinstance(n, ast.FunctionDef) and n.name == "_snapshot"
+    )
+    assert "accept_done" in [a.arg for a in func.args.args]
+    src = ast.unparse(func)
+    assert "STATE_DONE" in src, "objects_before must anchor on the last done record's snapshot"
+    assert "records[-1]" not in src, "a planned tail record has no snapshot to anchor on"
+
+
+def _runs_inside_engine_quiet(func) -> bool:
+    def _is_quiet(expr) -> bool:
+        if isinstance(expr, ast.Name):
+            return expr.id == "_EngineQuiet"
+        if isinstance(expr, ast.Call):
+            return isinstance(expr.func, ast.Name) and expr.func.id == "_EngineQuiet"
+        return False
+
+    return any(
+        isinstance(n, ast.With) and any(_is_quiet(i.context_expr) for i in n.items)
+        for n in ast.walk(func)
+    )
+
+
+def test_manual_edit_sync_ignores_engine_windows():
+    """The manual-edit observer must not mirror UNDO/REDO/RE-RUN property
+    writes back into the journal: undo restores the OLD value, the observer
+    "manual-edited" it back over the synced params, and the re-run rebuilt
+    at the old value — a user's correction silently reverted (live-verified
+    as "Height 10 -> reexecute -> 6"). The observer must check the mute flag,
+    and the undo/redo and re-run paths must open the window."""
+    cls = next(
+        n
+        for n in ast.walk(_ENGINE)
+        if isinstance(n, ast.ClassDef) and n.name == "_JournalSyncObserver"
+    )
+    slot = next(
+        n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "slotChangedObject"
+    )
+    names = {n.id for n in ast.walk(slot) if isinstance(n, ast.Name)}
+    assert "_ENGINE_ACTIVE" in names, "the observer must stay silent in engine windows"
+    for fname in ("_stack_op", "run_record"):
+        func = next(
+            n for n in ast.walk(_ENGINE) if isinstance(n, ast.FunctionDef) and n.name == fname
+        )
+        assert _runs_inside_engine_quiet(func), (
+            f"{fname} must run its document writes inside _EngineQuiet, or undo echoes "
+            "clobber the synced params"
+        )

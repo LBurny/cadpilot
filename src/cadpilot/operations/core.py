@@ -691,8 +691,13 @@ def session_rollback_operation(
     warnings = []
     if undone < n:
         warnings.append(
-            f"Only {undone}/{n} transactions could be undone (undo stack was shorter "
-            "than the session log — external GUI edits?); the log was truncated to match."
+            f"Only {undone}/{n} transactions could be undone, so the model was NOT fully "
+            "restored: steps recorded with no transaction behind them (a FreeCAD property "
+            "change on its own creates no undo entry, and execute_code steps older than "
+            "v0.5.2 owned none) leave their objects behind. The session log was truncated to "
+            "match what actually happened. The FreeCAD-side step journal can do better: "
+            "step_control rollback_to rebuilds the model from the journal, which removes "
+            "those objects too."
         )
     if journal and journal.get("drift"):
         warnings.append(

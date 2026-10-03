@@ -161,6 +161,71 @@ def sub_operation(sub: dict[str, Any]) -> str:
     return str(sub.get("operation") or sub.get("action") or "")
 
 
+def objects_after_index(records: list[StepRecord], index: int) -> list[str]:
+    """The object list recorded for the last done step at or before ``index``."""
+    names: list[str] = []
+    for rec in records:
+        if rec.index <= index and rec.state == STATE_DONE:
+            names = list(rec.objects_after or [])
+    return names
+
+
+def created_since(records: list[StepRecord], index: int) -> list[str]:
+    """Objects done steps after ``index`` introduced, from before/after diffs.
+
+    Diffs, never whole snapshots: ``objects_after`` lists the ENTIRE document,
+    so subtracting one step's snapshot from another's drags in objects that
+    predate the journal. At ``index`` 0 the target snapshot is empty by
+    definition, and a rollback must never delete what the journal did not
+    build — the user's own objects sit in every snapshot. A record without a
+    before-snapshot (journals written before ``objects_before`` existed)
+    falls back to the previous done record's after-list, which is the same
+    document one step earlier.
+    """
+    created: set[str] = set()
+    prev_after: set[str] = set()
+    for rec in records:
+        if rec.state != STATE_DONE:
+            continue
+        before = set(rec.objects_before) if rec.objects_before else prev_after
+        if rec.index > index:
+            created |= set(rec.objects_after or []) - before
+        if rec.objects_after:
+            prev_after = set(rec.objects_after)
+    return sorted(created)
+
+
+def steps_without_undo(records: list[StepRecord], index: int) -> list[int]:
+    """Done steps after ``index`` that own no transaction.
+
+    These are the ones a rollback cannot actually undo: FreeCAD's undo stack
+    holds nothing for them, so whatever they changed survives the rollback. A
+    journal that mixed transactional steps with older non-transactional ones is
+    exactly how a rollback ends up reporting success while the model keeps the
+    objects it was asked to drop.
+    """
+    return [
+        rec.index
+        for rec in records
+        if rec.index > index and rec.state == STATE_DONE and rec.mutated and not rec.transaction
+    ]
+
+
+def unrecoverable_steps(records: list[StepRecord], index: int) -> list[int]:
+    """Done steps up to ``index`` that nothing can put back.
+
+    Such a step may have changed the document, yet it owns no transaction (so
+    FreeCAD's undo cannot reach it) and is not re-executable (its operation or
+    code was never recorded, as in journals written before execute_code became
+    transactional). A rollback that hits one cannot restore the model exactly.
+    """
+    return [
+        rec.index
+        for rec in records
+        if rec.index <= index and rec.state == STATE_DONE and rec.mutated and not rec.executable
+    ]
+
+
 def blocking_text(records: list[StepRecord], indices: list[int]) -> str:
     """Name the steps a rollback must be forced across, with their real ops.
 

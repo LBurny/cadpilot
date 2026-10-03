@@ -661,6 +661,11 @@ QLabel#PanelStatus {{ color: {c["dim"]}; padding: 5px 8px 4px 8px; }}
             self._in_apply = False
         if res.get("success"):
             self._log(label, "ok")
+            # A rollback that rebuilt or only partially restored the model
+            # "succeeded" — the panel user clicked the button and got their
+            # answer, so without this the degradation notes stay invisible.
+            for text in res.get("warnings") or []:
+                self._log(text, "error")
         elif warn:
             self._warn(f"{label}: {res.get('error') or 'The operation failed.'}")
         return res

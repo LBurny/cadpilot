@@ -1,5 +1,69 @@
 # Changelog
 
+## v0.5.4 (2026-10-04)
+
+### Fixed
+
+- **Roll back now really restores the model** (`step_engine.py`, `step_journal.py`).
+  A rollback reported success while the objects it was asked to drop were still
+  there. Two causes: a step with no transaction behind it cannot be undone by
+  FreeCAD (a property change on its own creates no undo entry, and every
+  `execute_code` step recorded before v0.5.2 owned none), and when no step in
+  range owned a transaction the undo count was 0, so even the "the stack was
+  shorter" warning never fired. The journal was rewound to `planned` anyway, so
+  the log claimed a state the model was not in. Rollback now checks what the
+  undo stack actually holds and picks one of three paths:
+  - everything in range owns a transaction and came off the stack: unchanged
+    behavior (`restored: "native"`, no extra work);
+  - some steps own no undo entry: the objects the journal says those steps
+    introduced are removed by name, so entities a rollback was asked to drop are
+    gone. Property changes they made (placements, dimensions) cannot be
+    restored, and the reply says so (`restored: "partial"`, with the stranded
+    step numbers);
+  - steps 1..N can all be re-created from the journal: the model is rebuilt by
+    removing what the journal built and re-running 1..N, which is an exact
+    restore (`restored: "rebuild"`).
+
+  `reject` gets the same treatment for the steps it destroys. Every reply now
+  carries `restored`, `removed` and `stranded`, and the MCP-side
+  `session_rollback` no longer implies a full restore when the undo stack came
+  up short.
+
+- **Rollback verifies the undo result instead of trusting the count**
+  (`step_engine.py`). The FreeCAD undo stack is shared with the GUI: a manual
+  edit interleaved on it pops under the rollback's name while the popped count
+  still matches, so a rollback could report `native` over a wrong model. After
+  the undo, the journal now checks the object sets — objects the post-target
+  steps created must be gone, journal-built objects expected at the target must
+  be present — and escalates to the rebuild path on any discrepancy. `reexecute`
+  refuses outright when its base could not be restored cleanly (it would
+  otherwise duplicate objects under deduplicated names), pointing at
+  `rollback_to`.
+- **Rollback cleanup no longer deletes objects that predate the journal**
+  (`step_journal.py`). Every `objects_after` snapshot lists the entire
+  document, and the removal set was built by subtracting whole snapshots — at
+  index 0 the target snapshot is empty, so a rebuild/reject of the first steps
+  would delete the user's own, pre-journal objects. Removal sets are now
+  per-record before/after diffs (`created_since`), naming only what the journal
+  actually built. A rebuild also re-runs failed records (their transaction
+  aborted, so re-running is safe), reports `success: false` when the re-run
+  stops early, and the Steps panel prints result warnings (red) after a
+  success, so a rebuild/partial degradation is visible in the dock.
+- **Manual edits survive reexecute/replay for real** (`step_engine.py`). The
+  parameter sync (object → journal, so a human's correction in FreeCAD's
+  property panel is not silently reverted by a later re-run) had an undo echo:
+  reexecute popped the edit's transaction, FreeCAD restored the OLD value, and
+  the sync observer mirrored that restoration back into the journal as if it
+  were a manual edit — the re-run then rebuilt at the old value. Engine-driven
+  windows (undo/redo and step re-runs) now mute the observer (`_EngineQuiet`);
+  a genuine GUI edit never happens inside one.
+- **`snapshot` bundles the review** (`step_engine.py`): `params.accept_done`
+  accepts every done step in the same call — "the good steps are reviewed, I
+  did the complex part by hand, save a baseline, continue from here" is now one
+  call instead of ten accept clicks. Its `objects_before` anchors on the last
+  DONE record's snapshot; anchoring on the physical last record (possibly a
+  planned tail with no snapshot) marked the user's whole document as "new".
+
 ## v0.5.3 (2026-10-04)
 
 Found by stress-testing a parametric PartDesign model (variables → constrained

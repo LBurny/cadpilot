@@ -66,9 +66,24 @@ def test_effect_label_summarises_a_snippet():
     assert sj.effect_label(True, ["A"], ["A"]) == "changed properties"
 
 
+def test_steps_without_undo_are_the_ones_a_rollback_leaves_behind():
+    """The trigger for the whole fix: a step after the target that owns no
+    transaction keeps its changes, so reporting plain success there is wrong."""
+    ok = _fingerprinted("create_object", 1, [], ["A"])
+    ok.transaction = "CADPilot: create A"
+    old = _fingerprinted("execute_code", 2, ["A"], ["A", "B"], atomic=False)
+    newer = _fingerprinted("create_object", 3, ["A", "B"], ["A", "B", "C"])
+    newer.transaction = "CADPilot: create C"
+    readonly = _fingerprinted("execute_code", 4, ["A", "B", "C"], ["A", "B", "C"], mutated=False)
+    records = [ok, old, newer, readonly]
+    assert sj.steps_without_undo(records, 0) == [2]
+    assert sj.steps_without_undo(records, 2) == []
+    assert sj.steps_without_undo(records, 3) == []
+
+
 def test_blocking_text_names_the_real_operations():
     """The force prompt used to blame execute_code for every non-atomic blocker,
-    but a snapshot marker blocks too — naming the wrong op misleads."""
+    but a snapshot marker blocks too, so naming the wrong op misleads."""
     recs = [
         sj.build_record(_step("execute_code"), 1, sj.STATE_DONE, OPS),
         sj.build_record(_step("snapshot"), 2, sj.STATE_DONE, OPS),
@@ -77,6 +92,67 @@ def test_blocking_text_names_the_real_operations():
     text = sj.blocking_text(recs, [2, 3])
     assert "snapshot" in text and "execute_code" not in text
     assert "[2, 3]" in text
+
+
+def _fingerprinted(op, index, before, after, **extra):
+    rec = sj.build_record(_step(op), index, sj.STATE_DONE, OPS)
+    rec.objects_before = list(before)
+    rec.objects_after = list(after)
+    for key, value in extra.items():
+        setattr(rec, key, value)
+    return rec
+
+
+def test_created_since_lists_what_post_target_steps_added():
+    """A step with no undo entry cannot be undone, but the journal still knows
+    which objects it introduced (its before/after diff). This is what a
+    rollback removes for real."""
+    recs = [
+        _fingerprinted("create_object", 1, [], ["Plate"]),
+        _fingerprinted("create_object", 2, ["Plate"], ["Plate", "Rib"]),
+        _fingerprinted("create_object", 3, ["Plate", "Rib"], ["Plate", "Rib", "Tab"]),
+    ]
+    assert sj.created_since(recs, 1) == ["Rib", "Tab"]
+    assert sj.created_since(recs, 0) == ["Plate", "Rib", "Tab"]
+    assert sj.created_since(recs, 3) == []
+
+
+def test_created_since_keeps_objects_that_predate_the_journal():
+    """Every objects_after snapshot lists the ENTIRE document, so subtracting
+    whole snapshots (with an empty target at index 0) dragged the user's own
+    objects into the removal set — a rebuild would have deleted them. The
+    diffs name only what the journal built."""
+    recs = [
+        _fingerprinted("create_object", 1, ["Legacy"], ["Legacy", "New"]),
+        _fingerprinted("create_object", 2, ["Legacy", "New"], ["Legacy", "New", "Extra"]),
+    ]
+    assert sj.created_since(recs, 0) == ["Extra", "New"]
+    assert sj.created_since(recs, 1) == ["Extra"]
+
+
+def test_created_since_falls_back_to_the_previous_done_snapshot():
+    """A record without a before-list (hand-corrupted journal) must diff
+    against the previous done record's after-list, not against an empty
+    world — the fallback keeps objects the earlier steps already knew."""
+    recs = [
+        _fingerprinted("create_object", 1, [], ["Legacy"]),
+        _fingerprinted("create_object", 2, [], ["Legacy", "Rib"]),
+    ]
+    assert sj.created_since(recs, 1) == ["Rib"]
+    assert sj.created_since(recs, 0) == ["Legacy", "Rib"]
+
+
+def test_unrecoverable_steps_flags_what_nothing_can_put_back():
+    """Recorded before execute_code became transactional: no undo entry, no
+    stored code, so neither undo nor a rebuild can restore it."""
+    old = _fingerprinted("execute_code", 1, [], ["Ghost"], atomic=False, executable=False)
+    later = _fingerprinted("execute_code", 2, ["Ghost"], ["Ghost", "Kept"], atomic=True)
+    later.transaction = "CADPilot: execute_code"
+    later.executable = True
+    readonly = _fingerprinted("execute_code", 3, ["Ghost"], ["Ghost"], atomic=False, mutated=False)
+    assert sj.unrecoverable_steps([old, later, readonly], 3) == [1]
+    # A read-only step changed nothing, so it is not a problem.
+    assert sj.unrecoverable_steps([readonly], 3) == []
 
 
 def test_roundtrip_preserves_records():
