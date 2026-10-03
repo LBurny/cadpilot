@@ -79,11 +79,21 @@ FreeCAD 的文档树与 GUI API **不是线程安全的**，所有文档/GUI 操
 * `objects` 指纹（排序后的对象名），用于漂移检测
 * 模型或用户附加的笔记（观察/假设）
 
-于是 `session_rollback(to_step)` 就是 `doc.undo()` × N 加日志截断 —— 无需删除重建。被移除的步骤进入重做缓冲区，直到新步骤将其清空，与 FreeCAD 的重做语义一致。`execute_code` 步骤是非原子的，会阻塞回滚（除非强制执行）。
+于是 `session_rollback(to_step)` 就是 `doc.undo()` × N 加日志截断 —— 无需删除重建。被移除的步骤进入重做缓冲区，直到新步骤将其清空，与 FreeCAD 的重做语义一致。`execute_code` 同样是事务化的（见 5.1.1）。
 
 变更响应会自动审计：每次提交的 `cad()` 调用后重跑只读的连通性检查（`verify_assembly`），对断连孤岛追加警告；`session_status` 暴露风险（回滚后状态漂移、非原子步骤、文档已关闭）并给出下一步建议。审计绝不阻塞变更本身，且可全局关闭（`--no-auto-audit`），超大文档也会自动跳过。
 
 会话与模式以 JSON 持久化在 `$CADPILOT_HOME`（默认 `~/.cadpilot/`），原子写入（临时文件 + 重命名）。
+
+### 5.1.1 事务化的 `execute_code`
+
+在 FreeCAD 里裸改属性**不产生**任何 undo 条目，因此改动模型的片段过去对回滚完全不可见。而 AI 代理频繁使用 `execute_code`，这让日志实际上根本无法回滚。现在插件把每个片段都包进事务并返回 `changed`（提交是否产生了 undo 条目）：
+
+* **改动文档**的运行成为原子步骤，占一条 undo 条目，并保存代码以便 `reexecute`/`replay` 重跑 —— execute_code 建出的模型也能像声明式模型一样重放；
+* **只读**运行（检查）提交空事务、不产生 undo 条目，记录为既不阻塞回滚、也不会被重跑的步骤；
+* 抛异常的片段会中止事务，因此失败的运行不会留下半截改动。
+
+FreeCAD 的事务不嵌套，片段自己开的事务会合并进这一个；仅当当前没有未决事务时，包装层才开启事务。
 
 ### 5.2 步骤日志与 Steps 面板
 
@@ -95,10 +105,10 @@ FreeCAD 的文档树与 GUI API **不是线程安全的**，所有文档/GUI 操
 让这套循环安全的语义：
 
 * 日志写入发生在每步的事务内，但 **FreeCAD 的撤销不恢复文档级属性**，因此回滚/重跑会显式对账日志；以最后一个带事务的步骤为锚的 `drift` 标志能识别出用户手工 Ctrl+Z。
-* `undo_count` 只数带事务的记录 —— 非原子的 `execute_code` 没有 undo 条目，把它计入会从普通撤销栈上吃掉更早步骤的事务。
-* accepted 步骤是软锁：`rollback_to`/`reexecute`/`replay` 跨过它需要 `force=true`；`reject` 是显式销毁、自由跨过，但跨过非原子 `execute_code` 记录仍需 force。
+* `undo_count` 只数带事务的记录 —— 非原子的 `execute_code` 没有 undo 条目，把它计入会从普通撤销栈上吃掉更早步骤的事务。只读记录（`mutated=False`）还**不**阻塞回滚：它可证明没有改变任何东西，跨过它不可能回退错的改动。
+* accepted 步骤是软锁：`rollback_to`/`reexecute`/`replay` 跨过它需要 `force=true`；`reject` 是显式销毁、自由跨过，但跨过可能改动的非原子记录仍需 force。
 * 重跑必须兼容两种键名约定：RPC batch 子操作原样记录 `{"action": ...}`，journal 原生步骤用 `{"operation": ...}` —— 日志读取端（`sj.sub_operation`）和首次执行端**都**接受两种键。
-* `run_all`/`replay` 跳过不可重跑的记录（`execute_code` 检查是正常的日志公民）：标记为 done 并列入结果的 `skipped`，而不是让整次运行失败。
+* `run_all`/`replay` 跳过不可重跑的记录（只读的 `execute_code` 检查是正常的日志公民）：标记为 done 并列入结果的 `skipped`，而不是让整次运行失败。改动文档的 `execute_code` 步骤是可执行的 —— 保存的片段通过与 RPC 处理器相同的执行器重跑。
 * 每个变更结果都附带紧凑的 `journal` 快照，客户端无需再追问状态。
 
 ### 5.3 人机协同：GUI 修改同步与快照
@@ -181,7 +191,7 @@ AI 驱动 CAD 最难的问题是零件间的相对定位。CADPilot 用数据而
 
 ## 13. 测试策略
 
-pytest 套件（约 310 个测试）基于一个记录每次调用的假 XML-RPC 连接，覆盖 MCP 服务器侧：响应整形、截图策略优先级、重连行为、会话/模式状态机、`cad()` 派发、装配状态机（含 RPC 失败路径）、引导启发式，以及 docstring 预算。
+pytest 套件（约 320 个测试）基于一个记录每次调用的假 XML-RPC 连接，覆盖 MCP 服务器侧：响应整形、截图策略优先级、重连行为、会话/模式状态机、`cad()` 派发、装配状态机（含 RPC 失败路径）、引导启发式，以及 docstring 预算。
 
 插件无法脱离 FreeCAD 导入，因此第二层测试**用 `ast` 解析插件源码**，钉住那些只会在运行时静默失效的契约：`InitGui.py` 的裸 exec 命名空间规则、Steps 面板的 Qt 信号接线、日志边界两侧对 batch 子操作键名的兼容，以及 replay 对不可重跑记录的跳过。诊断套件覆盖各平台的路径布局、一个真实的 loopback XML-RPC 端点、关闭端口，以及各判定分支。
 

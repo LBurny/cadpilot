@@ -172,8 +172,31 @@ def record_commit(
         return None
 
 
-def append_non_atomic(doc, *, label: str) -> None:
-    """Record an execute_code step: no transaction, so rollback past it is unsafe."""
+def object_names(doc) -> list[str]:
+    """Public fingerprint of the document's object set (sorted names)."""
+    return _object_names(doc)
+
+
+def append_execute_code(
+    doc,
+    *,
+    code: str,
+    label: str,
+    changed: bool,
+    objects_before: list[str] | None = None,
+) -> None:
+    """Record an execute_code step.
+
+    ``changed`` says whether the snippet produced an undo entry, i.e. whether it
+    mutated the document inside the wrapper transaction the RPC handler opened
+    around it:
+
+    * changed -> ATOMIC and replayable. The code is stored in ``params`` so
+      ``reexecute``/``replay`` can re-run it, and rollback treats it like any
+      other transaction-bearing step.
+    * unchanged -> a read-only inspection. Non-atomic (rollback must not stop at
+      it) and non-executable (replay must not re-run it).
+    """
     try:
         records = read_journal(doc)
         after = _object_names(doc)
@@ -190,9 +213,12 @@ def append_non_atomic(doc, *, label: str) -> None:
                 # A snippet is multi-line; the panel shows one row per step, so
                 # collapse the whitespace before it becomes the row label.
                 label=" ".join(str(label).split())[:80],
-                params={},
-                atomic=False,
-                executable=False,
+                params={"code": code} if changed else {},
+                transaction="CADPilot: execute_code" if changed else "",
+                atomic=changed,
+                mutated=changed,
+                executable=changed,
+                objects_before=list(objects_before or []),
                 objects_after=after,
                 timestamp=sj.stamp(),
             )
@@ -240,6 +266,20 @@ def _execute_one(doc, operation: str, params: dict[str, Any]) -> dict[str, Any]:
         spec = {"type": operation, "base": params.get("obj_name"), **props}
         try:
             return {"success": True, "object_name": create_feature_gui(doc, spec).Name}
+        except Exception as e:
+            return {"success": False, "error": f"{type(e).__name__}: {e}"}
+    if operation == "execute_code":
+        # Re-run a recorded snippet (reexecute/replay). It runs inside the step's
+        # own transaction (opened by run_record) and through the SAME executor
+        # the RPC handler uses, so it sees the namespace it was written against.
+        code = str(params.get("code") or "")
+        if not code:
+            return {"success": False, "error": "execute_code step has no recorded code"}
+        from rpc_server import rpc_server as _rs
+
+        try:
+            _rs.exec_snippet(code)
+            return {"success": True}
         except Exception as e:
             return {"success": False, "error": f"{type(e).__name__}: {e}"}
     return {"success": False, "error": f"operation '{operation}' is not re-executable"}

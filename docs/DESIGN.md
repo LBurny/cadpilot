@@ -79,11 +79,21 @@ Modeling sessions (`session_start` … `session_complete`) record each mutation 
 * an `objects` fingerprint (sorted object names) for drift detection
 * notes (observations/assumptions) attached by the model or user
 
-`session_rollback(to_step)` is then just `doc.undo()` × N plus log truncation — no delete-and-rebuild. Removed steps sit in a redo buffer until a new step clears it, mirroring FreeCAD's redo semantics. `execute_code` steps are non-atomic and block rollback unless forced.
+`session_rollback(to_step)` is then just `doc.undo()` × N plus log truncation — no delete-and-rebuild. Removed steps sit in a redo buffer until a new step clears it, mirroring FreeCAD's redo semantics. `execute_code` is transactional too (see 5.1.1).
 
 Mutation responses are auto-audited: a read-only connectivity check (`verify_assembly`) re-runs after every committed `cad()` call and appends warnings about disconnected islands; `session_status` surfaces risks (state drift, non-atomic steps, closed documents) and next-step suggestions. The audit never blocks the mutation itself and can be disabled globally (`--no-auto-audit`); it is also skipped automatically for very large documents.
 
 Sessions and patterns persist as JSON under `$CADPILOT_HOME` (default `~/.cadpilot/`), written atomically (tmp + rename).
+
+### 5.1.1 Transactional `execute_code`
+
+A bare property write in FreeCAD creates **no** undo entry, so a snippet that changes the model was previously invisible to rollback. Since an AI agent reaches for `execute_code` constantly, that made the journal effectively non-rollback-able. The addon now wraps every snippet in a transaction and reports `changed` (whether the commit produced an undo entry):
+
+* a **mutating** run becomes an atomic step that owns one undo entry, and its code is stored so `reexecute`/`replay` can re-run it — an execute_code-built model replays like a declarative one;
+* a **read-only** run (an inspection) commits an empty transaction, adds no undo entry, and is recorded as a step that neither blocks a rollback nor is re-run;
+* a snippet that raises aborts the transaction, so a failing run leaves no half-applied mutations.
+
+Transactions do not nest, so a snippet that manages its own transaction merges into this one. The wrapper only opens a transaction when none is pending.
 
 ### 5.2 Step journal and the steps panel
 
@@ -95,10 +105,10 @@ Sessions are an MCP-side construct: they vanish when the stdio server exits and 
 Semantics that make the loop safe:
 
 * Journal writes happen inside each step's transaction, but **FreeCAD's undo does not restore document-level properties**, so rollback/reexecute reconcile the log explicitly; a `drift` flag anchored on the last transaction-bearing step flags a manual Ctrl+Z.
-* Only transaction-bearing records count for `undo_count` — a non-atomic `execute_code` owns no undo entry, and counting it would eat an earlier step's transaction off the plain undo stack.
-* Accepted steps are a soft lock: `rollback_to`/`reexecute`/`replay` refuse to cross one without `force=true`; `reject` is the deliberate act of destruction and crosses freely, but crossing a non-atomic `execute_code` record still needs force.
+* Only transaction-bearing records count for `undo_count` — a non-atomic `execute_code` owns no undo entry, and counting it would eat an earlier step's transaction off the plain undo stack. A read-only record (`mutated=False`) additionally does **not** block a rollback: it provably changed nothing, so crossing it cannot revert the wrong change.
+* Accepted steps are a soft lock: `rollback_to`/`reexecute`/`replay` refuse to cross one without `force=true`; `reject` is the deliberate act of destruction and crosses freely, but crossing a mutating non-atomic record still needs force.
 * Re-running must resolve operation names from two key conventions: RPC batch sub-ops journal `{"action": ...}` verbatim while journal-native steps use `{"operation": ...}` — **both** the journal reader (`sj.sub_operation`) and the initial executor accept both keys.
-* `run_all`/`replay` skip non-executable records (an `execute_code` inspection is a normal journal citizen): the record is marked done and reported in the result's `skipped` list instead of failing the whole run.
+* `run_all`/`replay` skip non-executable records (a read-only `execute_code` inspection is a normal journal citizen): the record is marked done and reported in the result's `skipped` list instead of failing the whole run. Mutating `execute_code` steps are executable — their stored snippet is re-run through the same executor the RPC handler uses.
 * Every mutating result carries a compact `journal` snapshot, so clients need no follow-up status call.
 
 ### 5.3 Human-in-the-loop: GUI edit sync and snapshots
@@ -181,7 +191,7 @@ Screenshots are **optional and off by default**:
 
 ## 13. Testing Strategy
 
-The pytest suite (~310 tests) covers the MCP-server side against a fake XML-RPC connection that records every call: response shaping, screenshot policy precedence, reconnect behavior, session/pattern state machines, `cad()` dispatch, assembly state machine (including RPC failure paths), guidance heuristics, and the docstring budget.
+The pytest suite (~320 tests) covers the MCP-server side against a fake XML-RPC connection that records every call: response shaping, screenshot policy precedence, reconnect behavior, session/pattern state machines, `cad()` dispatch, assembly state machine (including RPC failure paths), guidance heuristics, and the docstring budget.
 
 Because the addon cannot be imported without FreeCAD, a second layer of tests **parses the addon source with `ast`** to pin contracts that would otherwise fail silently at runtime: the bare-exec namespace rule in `InitGui.py`, the Qt-signal wiring of the steps panel, batch sub-op key tolerance on both sides of the journal boundary, and the replay skip of non-executable records. The diagnostics suite covers per-platform path layouts, a live loopback XML-RPC endpoint, a closed port, and the verdict branches.
 

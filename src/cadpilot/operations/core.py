@@ -139,24 +139,30 @@ def execute_code_operation(
     try:
         res = freecad.execute_code(code, screenshot=_shot_params(with_screenshot))
         if res["success"]:
-            # Record as a NON-ATOMIC step: user code may manage its own
-            # transactions (or none), so the session cannot guarantee that
-            # doc.undo() reverses exactly this step. Rollback past it is
-            # blocked unless forced.
+            # The addon wraps the snippet in a FreeCAD transaction; ``changed``
+            # says whether it produced an undo entry. A mutating snippet is an
+            # ATOMIC step — rollback/replay treat it like any other cad() step.
+            # A read-only run is NOT recorded: it owns no transaction, and a
+            # session step it cannot undo would break the log's one-transaction-
+            # per-step invariant (and block rollback). Older addons send no
+            # flag; treat that as read-only, the conservative default.
+            changed = bool(res.get("changed"))
             sess = get_current_session()
             step_note = ""
-            if sess is not None and sess.status == "active":
+            if changed and sess is not None and sess.status == "active":
                 step = sess.add_step(
                     "execute_code",
                     f"execute_code: {code[:80]}",
                     params_summary=code[:200],
                     result_summary=str(res.get("message", ""))[:200],
-                    atomic=False,
+                    atomic=True,
                 )
                 save_session(sess)
                 step_note = (
-                    f" (recorded as non-atomic step #{step.step_number} of session '{sess.name}')"
+                    f" (recorded as atomic step #{step.step_number} of session '{sess.name}')"
                 )
+            elif not changed:
+                step_note = " (read-only: no document change, not recorded as a step)"
             response = text_response(f"Code executed successfully: {res['message']}{step_note}")
             return add_screenshot_if_available(response, res.get("screenshot"), not with_screenshot)
         return text_response(f"Failed to execute code: {res['error']}")

@@ -94,6 +94,22 @@ def _read_b64(path: str) -> str | None:
         return None
 
 
+def exec_snippet(code: str, out=None) -> None:
+    """Run a snippet in a COPY of this module's namespace.
+
+    Assignments must not leak into (and corrupt) the RPC server's globals, and
+    a journal-replayed snippet must see exactly the names it was written
+    against — ``FreeCAD``, ``FreeCADGui``, ``Part`` and the rest live in this
+    module's globals. Shared by the ``execute_code`` RPC and by journal replay.
+    """
+    ns = {**globals()}
+    if out is None:
+        exec(code, ns)
+    else:
+        with contextlib.redirect_stdout(out):
+            exec(code, ns)
+
+
 class FreeCADRPC:
     """RPC server for FreeCAD"""
 
@@ -878,6 +894,12 @@ class FreeCADRPC:
         Use execute_code_async for heavy OCCT boolean ops (fuse/cut)
         that would block the GUI thread too long.
 
+        The snippet is wrapped in a FreeCAD transaction, so a document change
+        it makes becomes a single undo entry the step journal can roll back,
+        re-run or replay. A snippet that changes nothing (an inspection) leaves
+        no undo entry and is recorded as a read-only step. The result carries
+        ``changed`` so the caller knows which kind it was.
+
         When ``screenshot`` params are given and the code succeeds, the
         screenshot is captured in the same GUI dispatch — no race with
         intervening ops.
@@ -885,27 +907,50 @@ class FreeCADRPC:
         output_buffer = io.StringIO()
 
         # Capture the screenshot in the same GUI dispatch if requested (single
-        # RPC round trip, no race with intervening ops). execute_code is not
-        # transactional (user code manages its own transactions).
+        # RPC round trip, no race with intervening ops).
         tmp_path = _make_tmp_png() if screenshot is not None else None
 
         def combined_task():
-            # Run user code in a COPY of the module namespace (same as
-            # execute_code_async): assignments in user code must not leak into
-            # and corrupt this RPC module's globals across calls.
-            exec_globals = {**globals()}
-            try:
-                with contextlib.redirect_stdout(output_buffer):
-                    exec(code, exec_globals)
-            except Exception:
-                raise
-            # Logged as NON-ATOMIC: user code manages its own transactions (or
-            # none), so the journal cannot claim doc.undo() reverses exactly
-            # this step. Rollback across it demands force.
-            try:
+            doc = None
+            with contextlib.suppress(Exception):
                 doc = FreeCAD.ActiveDocument
+            # Wrap the snippet in a transaction so its document changes become
+            # exactly one undo entry (a bare property write is otherwise NOT
+            # undoable at all). An empty commit adds no undo entry, so a
+            # read-only inspection costs nothing. Transactions do not nest: a
+            # snippet that opens its own merges into this one, and if one is
+            # ALREADY open we leave it untouched — we cannot attribute its
+            # changes — and record the step conservatively.
+            wrapped = doc is not None and not doc.HasPendingTransaction
+            undo_before = doc.UndoCount if wrapped else 0
+            before = step_engine.object_names(doc)
+            if wrapped:
+                doc.openTransaction("CADPilot: execute_code")
+            try:
+                exec_snippet(code, output_buffer)
+            except BaseException:
+                # A failing snippet must not leave half-applied mutations.
+                if wrapped:
+                    with contextlib.suppress(Exception):
+                        doc.abortTransaction()
+                raise
+            changed = False
+            if wrapped:
+                with contextlib.suppress(Exception):
+                    doc.commitTransaction()  # empty -> no undo entry
+                    changed = doc.UndoCount > undo_before
+            # A snippet that changed the document is ATOMIC and replayable;
+            # a read-only one stays non-atomic, so rollback neither stops at it
+            # nor re-runs it.
+            try:
                 if doc is not None:
-                    step_engine.append_non_atomic(doc, label=f"execute_code: {code[:60]}")
+                    step_engine.append_execute_code(
+                        doc,
+                        code=code,
+                        label=f"execute_code: {code[:60]}",
+                        changed=changed,
+                        objects_before=before,
+                    )
             except Exception:
                 pass
             # Capture screenshot in the same GUI dispatch if requested
@@ -917,13 +962,14 @@ class FreeCADRPC:
                     screenshot.get("height"),
                     screenshot.get("focus_object"),
                 )
-                return True, tmp_path if shot is True else None
-            return True, None
+                return True, tmp_path if shot is True else None, changed
+            return True, None, changed
 
         try:
             out = dispatch_to_gui(combined_task, timeout=self.EXECUTE_CODE_TIMEOUT)
             if isinstance(out, tuple) and len(out) >= 2:
                 res, shot_path = out[0], out[1]
+                changed = out[2] if len(out) > 2 else False
             else:
                 # Timeout or error from dispatch layer
                 code_preview = code if len(code) <= 800 else code[:800] + "\n...(truncated)"
@@ -936,6 +982,7 @@ class FreeCADRPC:
                 FreeCAD.Console.PrintMessage("Python code executed successfully.\n")
                 result = {
                     "success": True,
+                    "changed": bool(changed),
                     "message": "Python code executed successfully.\nOutput: "
                     + output_buffer.getvalue(),
                 }

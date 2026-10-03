@@ -298,11 +298,14 @@ Every mutating action's reply carries a compact `journal` snapshot (counts,
 drift flag, per-step index/state/label/error/accepted) — one call tells you
 the new state; use status only when you need the full params.
 
-`rollback_to`/`reexecute`/`replay` refuse to cross a non-atomic step
-(execute_code, which manages its own transactions or none) unless force=true.
-Re-execution is only available for modeling steps (create_object /
-edit_object / delete_object / batch / PartDesign & Part features); assembly
-and anchor steps are logged and rollback-able but not re-runnable.""",
+`rollback_to`/`reexecute`/`replay` refuse to cross a non-atomic step unless
+force=true. An execute_code run that changed the document is wrapped in a
+transaction and counts as atomic AND re-runnable (its code is stored, so replay
+re-executes it); only a read-only execute_code run stays non-atomic and is
+skipped by replay. Re-execution is available for modeling steps (create_object /
+edit_object / delete_object / batch / execute_code / PartDesign & Part
+features); assembly and anchor steps are logged and rollback-able but not
+re-runnable.""",
     "get_addon_log": """\
 get_addon_log — read the FreeCAD addon's in-memory debug log.
 

@@ -370,8 +370,8 @@ def session_start(
 ) -> list[TextContent]:
     """Start a modeling session bound to a document: every successful cad()
     mutation is recorded as a transaction-backed step, so session_rollback
-    enables trial-and-error modeling. execute_code steps are non-atomic
-    (rolling back past them needs force).
+    enables trial-and-error modeling. An execute_code run that changes the
+    document is atomic too; a read-only one still needs force to roll past.
 
     Args:
         name: Optional human-readable session name.

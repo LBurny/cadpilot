@@ -110,6 +110,33 @@ def test_plan_rollback_flags_non_atomic_steps():
     assert sj.plan_rollback(recs, 0)["blocking"] == [2]
 
 
+def test_mutating_execute_code_counts_and_does_not_block():
+    """A snippet that changed the document is wrapped in a transaction, so it
+    counts for undo_count and is NOT a blocker — the whole point of the fix."""
+    recs = [sj.build_record(_step(), 1, sj.STATE_DONE, OPS)]
+    recs[0].transaction = "CADPilot: create_object Box"
+    recs.append(sj.build_record(_step("execute_code"), 2, sj.STATE_DONE, OPS))
+    recs[1].atomic = True
+    recs[1].transaction = "CADPilot: execute_code"
+    recs[1].executable = True
+    plan = sj.plan_rollback(recs, 0)
+    assert plan["undo_count"] == 2
+    assert plan["blocking"] == []
+
+
+def test_read_only_execute_code_neither_blocks_nor_counts():
+    """An inspection changed nothing, so crossing it cannot revert the wrong
+    change and it owns no transaction — it must not stand in rollback's way."""
+    recs = [sj.build_record(_step(), 1, sj.STATE_DONE, OPS)]
+    recs[0].transaction = "CADPilot: create_object Box"
+    recs.append(sj.build_record(_step("execute_code"), 2, sj.STATE_DONE, OPS))
+    recs[1].atomic = False
+    recs[1].mutated = False
+    plan = sj.plan_rollback(recs, 0)
+    assert plan["undo_count"] == 1
+    assert plan["blocking"] == []
+
+
 def test_last_atomic_done_skips_trailing_non_atomic_record():
     """Drift anchors on the last transaction-bearing step.
 

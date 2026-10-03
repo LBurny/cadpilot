@@ -36,6 +36,11 @@ class StepRecord:
     params: dict[str, Any] = field(default_factory=dict)
     transaction: str = ""
     atomic: bool = True
+    # mutated=False: the step provably changed nothing (a read-only execute_code,
+    # confirmed by the absence of an undo entry). It owns no transaction, so it
+    # cannot make undo revert the wrong change — it neither blocks a rollback nor
+    # counts for undo_count, and replay skips it.
+    mutated: bool = True
     executable: bool = True
     objects_before: list[str] = field(default_factory=list)
     objects_after: list[str] = field(default_factory=list)
@@ -59,6 +64,7 @@ class StepRecord:
             params=dict(data.get("params") or {}),
             transaction=data.get("transaction", ""),
             atomic=bool(data.get("atomic", True)),
+            mutated=bool(data.get("mutated", True)),
             executable=bool(data.get("executable", True)),
             objects_before=list(data.get("objects_before") or []),
             objects_after=list(data.get("objects_after") or []),
@@ -219,9 +225,10 @@ def plan_rollback(records: list[StepRecord], to_index: int) -> dict[str, Any]:
     transaction, and counting it would undo a transaction that belongs to an
     EARLIER step (the undo stack is a plain stack).
     ``affected``   — the indices going back to ``planned``.
-    ``blocking``   — non-atomic indices in that range: execute_code manages
-                     its own transactions (or none), so undo may revert the
-                     wrong change and the caller must ask for force.
+    ``blocking``   — non-atomic indices in that range that may have changed the
+                     document without a transaction: undo would revert the wrong
+                     change, so the caller must ask for force. A read-only
+                     execute_code (mutated=False) is not one of them.
     ``accepted``   — reviewed indices in that range: rolling back across them
                      discards someone's approval, so the caller must force.
     """
@@ -229,7 +236,7 @@ def plan_rollback(records: list[StepRecord], to_index: int) -> dict[str, Any]:
     return {
         "undo_count": sum(1 for r in affected if r.transaction),
         "affected": [r.index for r in affected],
-        "blocking": [r.index for r in affected if not r.atomic],
+        "blocking": [r.index for r in affected if not r.atomic and r.mutated],
         "accepted": [r.index for r in affected if r.accepted],
     }
 
@@ -253,7 +260,7 @@ def plan_reject(records: list[StepRecord], index: int) -> dict[str, Any] | None:
     return {
         "undo_count": sum(1 for r in done if r.transaction),
         "drop": [r.index for r in drop],
-        "blocking": [r.index for r in done if not r.atomic],
+        "blocking": [r.index for r in done if not r.atomic and r.mutated],
         "accepted": [r.index for r in done if r.accepted],
     }
 

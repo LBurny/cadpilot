@@ -160,14 +160,31 @@ def test_cad_screenshot_only_when_requested(fake_freecad, isolated_home):
     assert any(c.type == "image" for c in resp)
 
 
-# --- execute_code non-atomic step ----------------------------------------------
+# --- execute_code step accounting ----------------------------------------------
 
 
-def test_execute_code_records_non_atomic_step(fake_freecad, isolated_home):
+def test_execute_code_that_changed_the_document_is_an_atomic_step(fake_freecad, isolated_home):
+    """The addon wraps a mutating snippet in a transaction, so the session
+    records an atomic step and rollback can undo it."""
     sess = _start_session(fake_freecad)
-    resp = execute_code_operation(fake_freecad, False, "print(1)")
-    assert "non-atomic step #1" in _text(resp)
-    assert sess.steps[0].atomic is False
+    fake_freecad.result_overrides["execute_code"] = {
+        "success": True,
+        "message": "Python code executed successfully.",
+        "changed": True,
+    }
+    resp = execute_code_operation(fake_freecad, False, "b.Height = 10")
+    assert "atomic step #1" in _text(resp)
+    assert sess.steps[0].atomic is True
+
+
+def test_execute_code_read_only_is_not_recorded(fake_freecad, isolated_home):
+    """An inspection owns no transaction; recording it would break the session
+    log's one-transaction-per-step invariant and block rollback. The fake's
+    default result carries no `changed`, i.e. an older addon — conservative."""
+    sess = _start_session(fake_freecad)
+    resp = execute_code_operation(fake_freecad, False, "print(FreeCAD.listDocuments())")
+    assert "read-only" in _text(resp)
+    assert sess.step_count == 0
 
 
 # --- rollback / redo -------------------------------------------------------------
