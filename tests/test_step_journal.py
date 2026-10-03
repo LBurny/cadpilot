@@ -1,5 +1,6 @@
 """Step journal model/arithmetic — pure logic, no FreeCAD needed."""
 
+import ast
 import sys
 from pathlib import Path
 
@@ -24,6 +25,33 @@ def test_sub_operation_tolerates_action_keyed_batch_ops():
     assert sj.sub_operation({"action": "create_object"}) == "create_object"
     assert sj.sub_operation({"operation": "pad", "action": "ignored"}) == "pad"
     assert sj.sub_operation({}) == ""
+
+
+def test_batch_executor_tolerates_operation_keyed_sub_ops():
+    """The execution half of the same contract: _run_one_operation must read
+    the sub-op name from "action" OR "operation" — journal-native batches carry
+    the latter and must not die "unknown action: None" on their INITIAL run
+    (they already replayed fine thanks to sub_operation). rpc_server imports
+    FreeCAD, so this parses the source instead of importing it."""
+    tree = ast.parse((_ADDON / "rpc_server" / "rpc_server.py").read_text(encoding="utf-8"))
+    func = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "_run_one_operation"
+    )
+    assigns = [
+        n
+        for n in ast.walk(func)
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "action" for t in n.targets)
+    ]
+    keys = {
+        n.value
+        for a in assigns
+        for n in ast.walk(a.value)
+        if isinstance(n, ast.Constant) and isinstance(n.value, str)
+    }
+    assert {"action", "operation"} <= keys
 
 
 def test_roundtrip_preserves_records():

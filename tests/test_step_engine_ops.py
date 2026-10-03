@@ -60,3 +60,25 @@ def test_batch_is_executable():
             assert "batch" in strings
             return
     raise AssertionError("EXECUTABLE_OPS assignment not found")
+
+
+def test_run_steps_skips_non_executable_records():
+    """run_all/replay must not die on a non-executable record — an execute_code
+    inspection is a normal journal citizen, and hard-failing on it made replay
+    unusable after any inspection. _run_steps needs an executable guard that
+    marks the record done and continues, and must report the skips."""
+    func = next(
+        n for n in ast.walk(_ENGINE) if isinstance(n, ast.FunctionDef) and n.name == "_run_steps"
+    )
+    guards = [
+        n
+        for n in ast.walk(func)
+        if isinstance(n, ast.If)
+        and any(isinstance(m, ast.Attribute) and m.attr == "executable" for m in ast.walk(n.test))
+        and any(isinstance(m, ast.Continue) for s in n.body for m in ast.walk(s))
+    ]
+    assert guards, "_run_steps must skip (continue) records that are not executable"
+    strings = {
+        n.value for n in ast.walk(func) if isinstance(n, ast.Constant) and isinstance(n.value, str)
+    }
+    assert "skipped" in strings

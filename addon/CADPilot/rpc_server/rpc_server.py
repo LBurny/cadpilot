@@ -429,7 +429,9 @@ class FreeCADRPC:
         When ``is_batch`` is True, create_object skips per-object recompute
         (the batch handler does one recompute after all ops).
         """
-        action = op.get("action") if isinstance(op, dict) else None
+        # Both key conventions must work here: RPC batch ops carry "action",
+        # journal-native steps carry "operation" (mirrors sj.sub_operation).
+        action = (op.get("action") or op.get("operation")) if isinstance(op, dict) else None
         try:
             if action == "create_object":
                 obj = Object(
@@ -462,6 +464,12 @@ class FreeCADRPC:
                 except Exception as e:
                     return {"success": False, "action": action, "error": str(e)}
             else:
+                if action is None:
+                    return {
+                        "success": False,
+                        "action": None,
+                        "error": "sub-op has no 'action' (or 'operation') key",
+                    }
                 return {"success": False, "action": action, "error": f"unknown action: {action!r}"}
         except Exception as e:
             return {"success": False, "action": action, "error": f"{type(e).__name__}: {e}"}

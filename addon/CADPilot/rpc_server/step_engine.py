@@ -480,6 +480,7 @@ def _status(doc, records: list[sj.StepRecord]) -> dict[str, Any]:
 
 def _run_steps(doc, records, limit: int | None, upto: int | None) -> dict[str, Any]:
     executed: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
     while True:
         if upto is not None and sj.done_count(records) >= upto:
             break
@@ -488,6 +489,17 @@ def _run_steps(doc, records, limit: int | None, upto: int | None) -> dict[str, A
         rec = sj.next_planned(records)
         if rec is None:
             break
+        if not rec.executable:
+            # execute_code & co. own no transaction and cannot be re-run, and a
+            # read-only inspection is a normal journal citizen — run_all and
+            # replay must not die on one. Mark it done (a rollback never undid
+            # its effects, if any) and continue past it.
+            rec.state = sj.STATE_DONE
+            rec.error = ""
+            rec.result = "skipped: not re-executable"
+            skipped.append({"index": rec.index, "operation": rec.operation})
+            logger.info("step %d (%s): skipped, not re-executable", rec.index, rec.operation)
+            continue
         res = run_record(doc, records, rec)
         executed.append(
             {
@@ -499,9 +511,13 @@ def _run_steps(doc, records, limit: int | None, upto: int | None) -> dict[str, A
         )
         if not res.get("success"):
             break
+    if skipped:
+        # Skips mutate no Shape, so there is no transaction to write inside of.
+        write_journal(doc, records)
     return {
         "success": all(e["success"] for e in executed),
         "executed": executed,
+        "skipped": skipped,
         "count": len(records),
         "done": sj.done_count(records),
         # Name the failing step: this text lands in the addon log and in MCP
