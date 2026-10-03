@@ -11,13 +11,14 @@ Recipe (verified live on FreeCAD 1.1.3):
 """
 
 import contextlib
-import logging
 import math
 
 import FreeCAD as App
 import Part
 
-logger = logging.getLogger("CADPilot")
+from rpc_server import dbglog
+
+logger = dbglog.get_logger("assembly")
 
 ASSEMBLY_NAME = "MCP_Assembly"
 
@@ -256,11 +257,22 @@ def _op_mate(doc, spec: dict) -> dict:
     # then locks the chain. Skipping preSolve lands mates with faces
     # perpendicular (JCS coincide but faces don't).
     JointObject, _ = _joint_mods()
-    if j.JointType in JointObject.JointUsingPreSolve:
+    used_pre_solve = j.JointType in JointObject.JointUsingPreSolve
+    if used_pre_solve:
         j.Proxy.preSolve(j)
     asm.solve(True)
     doc.recompute()
     mm, deg = _residual(j)
+    # preSolve vs. solve-only is the difference between a correct mate and
+    # faces landing perpendicular; record which path ran and how it settled.
+    logger.debug(
+        "mate %s (%s): preSolve=%s residual=%.3fmm/%.2fdeg",
+        j.Name,
+        spec["joint"],
+        used_pre_solve,
+        mm,
+        deg,
+    )
     res = {
         "joint": j.Name,
         "residual_mm": mm,
@@ -418,4 +430,10 @@ def assembly_op(doc, spec: dict) -> dict:
     fn = _DISPATCH.get(op)
     if fn is None:
         raise ValueError(f"unknown assembly operation {op!r}")
-    return fn(doc, spec)
+    try:
+        return fn(doc, spec)
+    except Exception:
+        # The RPC layer reports a bare string to the client; the traceback has
+        # to be captured here or it is lost (the solver errors are opaque).
+        logger.error("assembly op %r failed: %s", op, spec, exc_info=True)
+        raise

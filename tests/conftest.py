@@ -5,9 +5,28 @@ on RPC call patterns (e.g. that the screenshot is requested inline instead of
 via a second get_active_screenshot call).
 """
 
+import os
+
 import pytest
 
 from cadpilot.session_state import set_current_session
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _isolate_addon_logs(tmp_path_factory):
+    """Keep the addon log pipeline out of the developer's home directory.
+
+    Importing ``rpc_server.request_log`` (or any addon module calling
+    ``dbglog.get_logger``) runs ``setup_logging()``, which without this would
+    create ``<home>/.cadpilot/CADPilot/logs`` on the test machine.
+    """
+    previous = os.environ.get("CADPILOT_LOG_DIR")
+    os.environ["CADPILOT_LOG_DIR"] = str(tmp_path_factory.mktemp("addon-logs"))
+    yield
+    if previous is None:
+        os.environ.pop("CADPILOT_LOG_DIR", None)
+    else:
+        os.environ["CADPILOT_LOG_DIR"] = previous
 
 
 class FakeFreeCADConnection:
@@ -182,6 +201,50 @@ class FakeFreeCADConnection:
         self._record("save_document", doc_name, path)
         return self._result(
             "save_document", {"success": True, "file_name": path or f"{doc_name}.FCStd"}
+        )
+
+    def get_step_journal(self, doc_name):
+        self._record("get_step_journal", doc_name)
+        return self._result(
+            "get_step_journal",
+            {
+                "success": True,
+                "document": doc_name,
+                "count": 0,
+                "done": 0,
+                "planned": 0,
+                "drift": False,
+                "records": [],
+            },
+        )
+
+    def journal_op(self, doc_name, spec):
+        self._record("journal_op", doc_name, spec)
+        return self._result(
+            "journal_op",
+            {"success": True, "count": 0, "done": 0, "planned": 0},
+        )
+
+    def get_addon_log(self, level=None, grep=None, since_seq=0, limit=100):
+        self._record("get_addon_log", level, grep, since_seq, limit)
+        return self._result(
+            "get_addon_log",
+            {
+                "success": True,
+                "records": [
+                    {
+                        "seq": 1,
+                        "time": "2026-10-03T18:00:00.000",
+                        "level": "INFO",
+                        "name": "CADPilot.rpc",
+                        "thread": "Thread-1",
+                        "request": "req#1",
+                        "message": "-> ping()",
+                        "detail": "",
+                    }
+                ],
+                "status": {"level": "INFO", "setup_done": True, "log_file": "x.log"},
+            },
         )
 
     def inspect_freecad(self, doc_name=None, obj_name=None, dotted_name=None):

@@ -576,15 +576,40 @@ def session_status_operation(freecad: FreeCADConnection) -> ToolResponse:
     suggestions = suggest_next_steps(sess, object_names or [])
     risks = detect_risks(sess, doc_open, object_names)
 
+    # The addon keeps its own step journal for the GUI panel, and the panel can
+    # roll back and re-run steps without the MCP server — so the two logs drift
+    # apart. Report that instead of silently trusting this one.
+    journal = _journal_snapshot(freecad, sess.doc_name) if doc_open else None
+    journal_risks: list[str] = []
+    if journal:
+        if journal.get("drift"):
+            journal_risks.append(
+                "The addon step journal no longer matches FreeCAD's undo stack "
+                "(the model was undone or redone outside cad() — e.g. from the "
+                "CADPilot Steps panel or Ctrl+Z). Prefer step_control for rollback."
+            )
+        if journal.get("done", 0) != sess.step_count:
+            journal_risks.append(
+                f"Session log has {sess.step_count} step(s) but the addon journal "
+                f"has {journal.get('done', 0)} executed — they are out of sync."
+            )
+
     lines = [
         f"📊 **{sess.name}** (doc `{sess.doc_name}`, {sess.step_count} steps, {sess.status})",
     ]
+    if journal:
+        lines.append(
+            f"🗂 Addon journal: {journal.get('done', 0)} done, "
+            f"{journal.get('planned', 0)} planned"
+            + (" — ⚠ drift from the undo stack" if journal.get("drift") else "")
+        )
     if suggestions:
         lines.append("\n💡 **Next steps:**")
         lines.extend(f"- `{s['tool']}` {s['operation']}: {s['reason']}" for s in suggestions)
-    if risks:
+    if risks or journal_risks:
         lines.append("\n⚠️ **Risks:**")
         lines.extend(f"- {r['message']}" for r in risks)
+        lines.extend(f"- {msg}" for msg in journal_risks)
     return json_response(
         {
             "success": True,
@@ -597,7 +622,9 @@ def session_status_operation(freecad: FreeCADConnection) -> ToolResponse:
             "document_open": doc_open,
             "object_count": len(object_names or []),
             "next_steps": suggestions,
-            "risks": risks,
+            "risks": risks + [{"message": msg, "severity": "warning"} for msg in journal_risks],
+            "journal": journal,
+            "journal_risks": journal_risks,
             "display_text": "\n".join(lines),
         }
     )
@@ -641,6 +668,10 @@ def session_rollback_operation(
             "Pass force=True to roll back anyway (at your own risk)."
         )
     n = sess.step_count - to_step
+    # Read the addon journal BEFORE undoing: the panel can roll back / re-run
+    # behind the session log's back, and an undo rewinds the journal too — so a
+    # post-undo read would hide exactly the drift this check exists to catch.
+    journal = _journal_snapshot(freecad, sess.doc_name)
     try:
         res = freecad.undo_transactions(sess.doc_name, n)
     except Exception as e:
@@ -654,6 +685,12 @@ def session_rollback_operation(
         warnings.append(
             f"Only {undone}/{n} transactions could be undone (undo stack was shorter "
             "than the session log — external GUI edits?); the log was truncated to match."
+        )
+    if journal and journal.get("drift"):
+        warnings.append(
+            "The addon step journal reported drift from FreeCAD's undo stack before this "
+            "rollback; the undo count was taken from the session log and may have rolled "
+            "back more or less than intended."
         )
     removed = sess.truncate_to(sess.step_count - undone)
     save_session(sess)
@@ -718,6 +755,132 @@ def session_add_note_operation(note: str, note_type: str = "observation") -> Too
     entry = sess.add_note(note, note_type)
     save_session(sess)
     return json_response({"success": True, "note": entry})
+
+
+# --- step journal (staged "plan first, execute later" modeling) --------------
+
+_STEP_ACTIONS = (
+    "run_next",
+    "run_all",
+    "run_to",
+    "rollback_to",
+    "reexecute",
+    "accept",
+    "reject",
+    "update",
+    "insert",
+    "replay",
+    "clear_plan",
+    "reset",
+    "status",
+)
+
+
+def _journal_snapshot(freecad: FreeCADConnection, doc_name: str) -> dict[str, Any] | None:
+    """Best-effort step-journal read: None on an old addon or any failure.
+
+    Never let a diagnostics read break the caller — the journal is an addon
+    feature that a stale Mod/ install simply does not have.
+    """
+    try:
+        res = freecad.get_step_journal(doc_name)
+    except Exception:
+        return None
+    return res if isinstance(res, dict) and res.get("success") else None
+
+
+def step_plan_operation(
+    freecad: FreeCADConnection,
+    doc_name: str,
+    steps: list[dict[str, Any]],
+    description: str = "",
+) -> ToolResponse:
+    """Submit a plan to the addon's step journal WITHOUT executing it."""
+    if not isinstance(steps, list) or not steps:
+        return text_response("step_plan requires a non-empty steps list")
+    for i, step in enumerate(steps, start=1):
+        if not isinstance(step, dict) or not step.get("operation"):
+            return text_response(
+                f"step {i} must be a dict with an 'operation' key "
+                "(the same shape cad() takes: operation / obj_name / obj_type / obj_properties)"
+            )
+    try:
+        res = freecad.journal_op(
+            doc_name, {"operation": "set_plan", "steps": steps, "description": description}
+        )
+    except Exception as e:
+        return text_response(f"step_plan failed: {e!s}")
+    if not res.get("success"):
+        return text_response(f"step_plan failed: {res.get('error')}")
+    lines = [
+        f"Plan accepted: {res.get('planned', len(steps))} step(s) queued, nothing applied yet."
+    ]
+    if description:
+        lines.append(description)
+    for i, step in enumerate(steps, start=1):
+        lines.append(f"  {i}. {step.get('description') or step.get('operation')}")
+    lines.append(
+        "Release them in FreeCAD's CADPilot Steps panel, or call "
+        "step_control(action='run_next') / action='run_all'. Then review each "
+        "step: accept / reject / update / reexecute / replay — every mutating "
+        "reply carries a compact journal snapshot, no extra status call needed."
+    )
+    return text_response("\n".join(lines))
+
+
+def step_control_operation(
+    freecad: FreeCADConnection,
+    doc_name: str,
+    action: str,
+    index: int = 0,
+    params: dict[str, Any] | None = None,
+    force: bool = False,
+    confirm: bool = False,
+) -> ToolResponse:
+    """Drive the step journal: run, roll back, or re-run recorded steps."""
+    if action not in _STEP_ACTIONS:
+        return text_response(f"unknown action '{action}'. Supported: {', '.join(_STEP_ACTIONS)}")
+    spec: dict[str, Any] = {
+        "operation": action,
+        "index": index,
+        "params": params or {},
+        "force": force,
+        "confirm": confirm,
+    }
+    try:
+        res = freecad.journal_op(doc_name, spec)
+    except Exception as e:
+        return text_response(f"step_control failed: {e!s}")
+    if not res.get("success"):
+        return text_response(f"step_control '{action}' failed: {res.get('error')}")
+    return json_response(res)
+
+
+def get_addon_log_operation(
+    freecad: FreeCADConnection,
+    level: str | None = None,
+    grep: str | None = None,
+    since_seq: int = 0,
+    limit: int = 100,
+) -> ToolResponse:
+    """Read the FreeCAD addon's debug log (ring buffer, newest last)."""
+    try:
+        res = freecad.get_addon_log(level, grep, since_seq, limit)
+    except AttributeError:
+        # A stale Mod/ install simply has no such RPC. Say so usefully instead
+        # of leaking an attribute error about the client proxy.
+        return text_response(
+            "The FreeCAD addon does not provide a debug log (it predates this "
+            "feature). Upgrade the addon in FreeCAD's Mod/ directory."
+        )
+    except Exception as e:
+        return text_response(f"Could not read the addon log: {e!s}")
+    if not isinstance(res, dict) or not res.get("success"):
+        error = res.get("error") if isinstance(res, dict) else res
+        return text_response(f"Could not read the addon log: {error}")
+    if not res.get("records"):
+        return text_response(f"No records match. Log status: {res.get('status')}")
+    return json_response(res)
 
 
 def session_pause_operation() -> ToolResponse:

@@ -12,6 +12,7 @@ import FreeCAD
 import FreeCADGui
 from PySide import QtCore
 
+from rpc_server import dbglog, step_engine
 from rpc_server.assembly_ops import (
     assemble as _assemble,
 )
@@ -48,10 +49,10 @@ from rpc_server.gui_dispatch import (
     process_gui_tasks,
     request_shutdown,
 )
-from rpc_server.ip_filter import FilteredXMLRPCServer
 from rpc_server.joint_ops import assembly_op as _assembly_op
-from rpc_server.object_factory import create_object_gui
-from rpc_server.property_mapper import Object, set_object_property
+from rpc_server.object_factory import create_object_gui, delete_object_gui, edit_object_gui
+from rpc_server.property_mapper import Object
+from rpc_server.request_log import LoggedXMLRPCServer
 from rpc_server.serialize import serialize_object
 from rpc_server.settings import load_settings
 from rpc_server.view_manager import save_active_screenshot
@@ -112,6 +113,7 @@ class FreeCADRPC:
         doc_name: str | None = None,
         transaction: str | None = None,
         commit_if=None,
+        journal: dict | None = None,
     ) -> dict:
         """Run ``gui_fn`` on the GUI thread and, when ``screenshot`` params are
         given and the op succeeded, capture the screenshot in the SAME GUI
@@ -130,6 +132,13 @@ class FreeCADRPC:
         and the result carries ``"transaction": False``.
         Successful results include ``objects`` — the sorted document object
         names — as a cheap state fingerprint for rollback verification.
+
+        ``journal`` describes a step to append to the document's step log when
+        the transaction commits: ``{"operation", "label", "params", "atomic"}``.
+        The record is written INSIDE the transaction so it commits with the
+        model change — but note that it is NOT reverted by ``doc.undo()``
+        (FreeCAD does not undo document-level properties); step_engine
+        reconciles the log explicitly on rollback.
         """
         tmp_path = _make_tmp_png() if screenshot is not None else None
 
@@ -147,6 +156,7 @@ class FreeCADRPC:
                         in_transaction = True
                     except Exception as e:
                         FreeCAD.Console.PrintWarning(f"CADPilot: cannot open transaction: {e}\n")
+            objects_before = sorted(o.Name for o in doc.Objects) if doc is not None else []
             try:
                 res = gui_fn()
             except Exception:
@@ -155,11 +165,27 @@ class FreeCADRPC:
                 raise
             ok = res is True or (isinstance(res, dict) and res.get("success"))
             should_commit = ok if commit_if is None else bool(commit_if(res))
+            objects = None
             if in_transaction:
                 if should_commit:
+                    objects = sorted(o.Name for o in doc.Objects) if doc is not None else []
+                    if journal and doc is not None:
+                        step_engine.record_commit(
+                            doc,
+                            operation=journal.get("operation", "unknown"),
+                            label=journal.get("label", ""),
+                            params=journal.get("params"),
+                            transaction=transaction,
+                            atomic=bool(journal.get("atomic", True)),
+                            executable=journal.get("executable"),
+                            objects_before=objects_before,
+                            objects_after=objects,
+                        )
                     doc.commitTransaction()
+                    dbglog.get_logger("tx").info("committed transaction %r", transaction)
                 else:
                     doc.abortTransaction()
+                    dbglog.get_logger("tx").info("aborted transaction %r", transaction)
             # Whenever a transaction was committed the document changed, so the
             # caller needs the fingerprint even for partial batch failures —
             # otherwise the session log and the undo stack would desync.
@@ -169,12 +195,13 @@ class FreeCADRPC:
             # created it (defensive: no caller passes doc_name=None today).
             if doc is None:
                 doc = FreeCAD.ActiveDocument
-            objects = []
-            if doc is not None:
-                try:
-                    objects = sorted(o.Name for o in doc.Objects)
-                except Exception:
-                    objects = []
+            if objects is None:
+                objects = []
+                if doc is not None:
+                    try:
+                        objects = sorted(o.Name for o in doc.Objects)
+                    except Exception:
+                        objects = []
             if tmp_path is None:
                 return res, None, in_transaction, objects
             shot = save_active_screenshot(
@@ -239,6 +266,15 @@ class FreeCADRPC:
             screenshot,
             doc_name=doc_name,
             transaction=f"CADPilot: create_object {obj.name}",
+            journal={
+                "operation": "create_object",
+                "label": f"create {obj.type} '{obj.name}'",
+                "params": {
+                    "obj_name": obj.name,
+                    "obj_type": obj.type,
+                    "obj_properties": obj.properties,
+                },
+            },
         )
 
     def create_feature(self, doc_name, feature_spec: dict, screenshot: dict | None = None):
@@ -263,6 +299,16 @@ class FreeCADRPC:
             screenshot,
             doc_name=doc_name,
             transaction=f"CADPilot: {feature_spec.get('type', 'feature')} {feature_spec.get('base', '')}",
+            journal={
+                "operation": feature_spec.get("type", "feature"),
+                "label": f"{feature_spec.get('type')} on '{feature_spec.get('base')}'",
+                "params": {
+                    "obj_name": feature_spec.get("base"),
+                    "obj_properties": {
+                        k: v for k, v in feature_spec.items() if k not in ("type", "base")
+                    },
+                },
+            },
         )
 
     def assembly_op(self, doc_name: str, spec: dict):
@@ -288,6 +334,11 @@ class FreeCADRPC:
             None,
             doc_name=doc_name,
             transaction=f"CADPilot: assembly {spec.get('operation', 'op')}",
+            journal={
+                "operation": "assembly",
+                "label": f"assembly {spec.get('operation', 'op')}",
+                "params": {},
+            },
         )
 
     def edit_object(
@@ -307,6 +358,11 @@ class FreeCADRPC:
             screenshot,
             doc_name=doc_name,
             transaction=f"CADPilot: edit_object {obj.name}",
+            journal={
+                "operation": "edit_object",
+                "label": f"edit '{obj.name}'",
+                "params": {"obj_name": obj.name, "obj_properties": obj.properties},
+            },
         )
 
     def delete_object(self, doc_name: str, obj_name: str, screenshot: dict | None = None):
@@ -316,6 +372,11 @@ class FreeCADRPC:
             screenshot,
             doc_name=doc_name,
             transaction=f"CADPilot: delete_object {obj_name}",
+            journal={
+                "operation": "delete_object",
+                "label": f"delete '{obj_name}'",
+                "params": {"obj_name": obj_name},
+            },
         )
 
     def execute_operations(
@@ -355,6 +416,11 @@ class FreeCADRPC:
             doc_name=doc_name,
             transaction=f"CADPilot: batch ({len(ops)} ops)",
             commit_if=lambda res: any(r.get("success") for r in res.get("results", [])),
+            journal={
+                "operation": "batch",
+                "label": f"batch ({len(ops)} ops)",
+                "params": {"ops": ops},
+            },
         )
 
     def _run_one_operation(self, doc_name: str, op, is_batch: bool = False) -> dict:
@@ -423,38 +489,21 @@ class FreeCADRPC:
             stack_attr = "UndoNames" if undo else "RedoNames"
             try:
                 stack_before = list(getattr(doc, stack_attr, []) or [])
-                stack_known = True
             except Exception:
                 stack_before = []
-                stack_known = False
-            # When the stack is known to be empty there is nothing to undo —
-            # don't attempt n blind undo() calls that only fail via exceptions.
-            limit = min(n, len(stack_before)) if stack_known else n
-            done = 0
-            for _ in range(limit):
-                try:
-                    if undo:
-                        doc.undo()
-                    else:
-                        doc.redo()
-                    done += 1
-                except Exception as e:
-                    FreeCAD.Console.PrintWarning(
-                        f"CADPilot: {'undo' if undo else 'redo'} stopped: {e}\n"
-                    )
-                    break
-            with contextlib.suppress(Exception):
-                doc.recompute()
+            # step_engine owns the loop: it never calls undo()/redo() blind past
+            # the end of the stack and reports the count that actually went.
+            res = step_engine.undo_n(doc, n) if undo else step_engine.redo_n(doc, n)
             try:
                 stack_after = list(getattr(doc, stack_attr, []) or [])
             except Exception:
                 stack_after = []
             return {
                 "success": True,
-                "count": done,
+                "count": res.get("count", 0),
                 "stack_before": stack_before,
                 "stack_after": stack_after,
-                "objects": sorted(o.Name for o in doc.Objects),
+                "objects": res.get("objects", []),
             }
 
         res = dispatch_to_gui(task)
@@ -469,6 +518,64 @@ class FreeCADRPC:
     def redo_transactions(self, doc_name: str, n: int = 1) -> dict[str, Any]:
         """Redo n previously undone transactions (only valid until a new op)."""
         return self._undo_redo(doc_name, n, undo=False)
+
+    # --- step journal (steps panel / staged execution) -----------------------
+
+    def get_step_journal(self, doc_name: str) -> dict[str, Any]:
+        """Read the document's step journal (read-only, no transaction)."""
+
+        def task():
+            try:
+                doc = FreeCAD.getDocument(doc_name)
+            except Exception:
+                return f"Document '{doc_name}' not found."
+            return step_engine.apply_op(doc, {"operation": "status"})
+
+        res = dispatch_to_gui(task)
+        if isinstance(res, dict):
+            return res
+        return _err(res)
+
+    def journal_op(self, doc_name: str, spec: dict) -> dict[str, Any]:
+        """Step-journal operation: set_plan / run_* / rollback_to / reexecute.
+
+        Each executed step opens its own transaction and writes the journal
+        inside it, so FreeCAD's undo/redo keeps the log in lockstep.
+        """
+
+        def task():
+            try:
+                doc = FreeCAD.getDocument(doc_name)
+            except Exception:
+                return f"Document '{doc_name}' not found."
+            return step_engine.apply_op(doc, spec or {})
+
+        res = dispatch_to_gui(task)
+        if isinstance(res, dict):
+            return res
+        return _err(res)
+
+    # --- diagnostics ----------------------------------------------------------
+
+    def get_addon_log(
+        self,
+        level: str | None = None,
+        grep: str | None = None,
+        since_seq: int = 0,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """Read this addon's in-memory debug log.
+
+        Deliberately NOT dispatched to the GUI thread: the ring buffer is
+        thread-safe and holds no FreeCAD state, so the log stays readable
+        exactly when it is most needed — while the GUI thread is wedged and
+        every other RPC is blocked behind it.
+        """
+        try:
+            records = dbglog.query(level=level, grep=grep, since_seq=since_seq, limit=limit)
+        except Exception as e:
+            return {"success": False, "error": f"{type(e).__name__}: {e}"}
+        return {"success": True, "records": records, "status": dbglog.status()}
 
     def save_document(self, doc_name: str, path: str | None = None) -> dict[str, Any]:
         """Save a document (saveAs when path is given)."""
@@ -559,6 +666,11 @@ class FreeCADRPC:
             None,  # no screenshot for now
             doc_name=doc_name,
             transaction=f"CADPilot: align_shapes {obj_name}",
+            journal={
+                "operation": "align_shapes",
+                "label": f"align '{obj_name}' -> '{target_obj_name}'",
+                "params": {},
+            },
         )
 
     # --- assembly toolchain ---------------------------------------------------
@@ -584,6 +696,11 @@ class FreeCADRPC:
             screenshot,
             doc_name=doc_name,
             transaction=f"CADPilot: set_anchors {obj_name}",
+            journal={
+                "operation": "set_anchors",
+                "label": f"anchors on '{obj_name}'",
+                "params": {},
+            },
         )
 
     def assemble(
@@ -600,6 +717,11 @@ class FreeCADRPC:
             transaction="CADPilot: assemble",
             # commit whenever at least one mate passed (mirrors batch semantics)
             commit_if=lambda res: isinstance(res, dict) and res.get("passed", 0) > 0,
+            journal={
+                "operation": "assemble",
+                "label": f"assemble {len(mates)} mate(s)",
+                "params": {},
+            },
         )
 
     def verify_assembly(
@@ -769,6 +891,15 @@ class FreeCADRPC:
                     exec(code, exec_globals)
             except Exception:
                 raise
+            # Logged as NON-ATOMIC: user code manages its own transactions (or
+            # none), so the journal cannot claim doc.undo() reverses exactly
+            # this step. Rollback across it demands force.
+            try:
+                doc = FreeCAD.ActiveDocument
+                if doc is not None:
+                    step_engine.append_non_atomic(doc, label=f"execute_code: {code[:60]}")
+            except Exception:
+                pass
             # Capture screenshot in the same GUI dispatch if requested
             if tmp_path is not None:
                 shot = save_active_screenshot(
@@ -908,47 +1039,10 @@ class FreeCADRPC:
         return create_object_gui(doc_name, obj, recompute=recompute)
 
     def _edit_object_gui(self, doc_name: str, obj: Object):
-        try:
-            doc = FreeCAD.getDocument(doc_name)
-        except Exception:
-            FreeCAD.Console.PrintError(f"Document '{doc_name}' not found.\n")
-            return f"Document '{doc_name}' not found.\n"
-
-        obj_ins = doc.getObject(obj.name)
-        if not obj_ins:
-            FreeCAD.Console.PrintError(f"Object '{obj.name}' not found in document '{doc_name}'.\n")
-            return f"Object '{obj.name}' not found in document '{doc_name}'.\n"
-
-        try:
-            has_expressions = any(
-                isinstance(v, str) and v.startswith("=") for v in obj.properties.values()
-            )
-            set_object_property(doc, obj_ins, obj.properties)
-            doc.recompute()
-            if has_expressions and "Invalid" in [str(s) for s in obj_ins.State]:
-                return (
-                    f"Expression(s) on '{obj.name}' failed to evaluate "
-                    "(check expression syntax and referenced cells/objects)."
-                )
-            FreeCAD.Console.PrintMessage(f"Object '{obj.name}' updated via RPC.\n")
-            return True
-        except Exception as e:
-            return str(e)
+        return edit_object_gui(doc_name, obj)
 
     def _delete_object_gui(self, doc_name: str, obj_name: str):
-        try:
-            doc = FreeCAD.getDocument(doc_name)
-        except Exception:
-            FreeCAD.Console.PrintError(f"Document '{doc_name}' not found.\n")
-            return f"Document '{doc_name}' not found.\n"
-
-        try:
-            doc.removeObject(obj_name)
-            doc.recompute()
-            FreeCAD.Console.PrintMessage(f"Object '{obj_name}' deleted via RPC.\n")
-            return True
-        except Exception as e:
-            return str(e)
+        return delete_object_gui(doc_name, obj_name)
 
     def _save_active_screenshot(
         self,
@@ -976,13 +1070,14 @@ def start_rpc_server(port=9875):
                 "RPC Server is still stopping (a request is draining); try again in a few seconds."
             )
 
+    dbglog.setup_logging()
     settings = load_settings()
     remote_enabled = settings.get("remote_enabled", False)
     allowed_ips = settings.get("allowed_ips", "127.0.0.1")
 
     host = "0.0.0.0" if remote_enabled else "127.0.0.1"
 
-    rpc_server_instance = FilteredXMLRPCServer(
+    rpc_server_instance = LoggedXMLRPCServer(
         (host, port), allowed_ips_str=allowed_ips, allow_none=True, logRequests=False
     )
     rpc_server_instance.register_instance(FreeCADRPC())

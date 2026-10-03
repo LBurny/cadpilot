@@ -4,7 +4,7 @@ import ipaddress
 import re
 from xmlrpc.server import SimpleXMLRPCServer
 
-import FreeCAD
+from rpc_server import dbglog
 
 
 class FilteredXMLRPCServer(SimpleXMLRPCServer):
@@ -23,7 +23,7 @@ class FilteredXMLRPCServer(SimpleXMLRPCServer):
                     return True
         except ValueError:
             pass
-        FreeCAD.Console.PrintWarning(f"CADPilot: Rejected connection from {client_ip}\n")
+        dbglog.get_logger("net").warning("rejected connection from %s", client_ip)
         return False
 
 
@@ -66,8 +66,8 @@ def validate_allowed_ips(allowed_ips_str):
 
 
 def _parse_allowed_ips(allowed_ips_str):
-    """Parse a comma-separated string of IPs/subnets into a list of ip_network objects."""
+    """Parse a comma-separated list of IPs/subnets into a list of ip_network objects."""
     valid, errors = validate_allowed_ips(allowed_ips_str)
     for msg in errors:
-        FreeCAD.Console.PrintWarning(f"CADPilot: {msg}, skipping\n")
+        dbglog.get_logger("net").warning("%s, skipping", msg)
     return [ipaddress.ip_network(entry, strict=False) for entry in valid]

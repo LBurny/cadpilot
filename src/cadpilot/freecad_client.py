@@ -11,6 +11,20 @@ logger = logging.getLogger("CADPilot")
 # still executing the request, and retrying would double-execute it.
 _RECOVERABLE_ERRORS = (ConnectionError, http.client.HTTPException)
 
+_IPV4_LOOPBACK = "127.0.0.1"
+
+
+def _resolve_connect_host(host: str) -> str:
+    """Pin the loopback NAME to IPv4.
+
+    ``localhost`` resolves to ``::1`` first on a dual-stack machine, but the
+    addon binds 127.0.0.1 (or 0.0.0.0) only — so the IPv6 connect has to fail
+    before the fallback succeeds. Measured on Windows: 2032ms for every single
+    call via ``localhost``, 0ms via ``127.0.0.1``. Any other host is passed
+    through untouched (remote FreeCAD keeps working).
+    """
+    return _IPV4_LOOPBACK if host.strip().lower() == "localhost" else host
+
 
 class _TimeoutTransport(xmlrpc.client.Transport):
     """XML-RPC transport with a configurable socket timeout.
@@ -31,7 +45,7 @@ class _TimeoutTransport(xmlrpc.client.Transport):
 
 class FreeCADConnection:
     def __init__(self, host: str = "localhost", port: int = 9875, timeout: float = 150):
-        self._uri = f"http://{host}:{port}"
+        self._uri = f"http://{_resolve_connect_host(host)}:{port}"
         self._timeout = timeout
         self.server = self._make_proxy(timeout)
 
@@ -166,6 +180,24 @@ class FreeCADConnection:
 
     def redo_transactions(self, doc_name: str, n: int = 1) -> dict[str, Any]:
         return self._invoke("redo_transactions", doc_name, n)
+
+    def get_step_journal(self, doc_name: str) -> dict[str, Any]:
+        """Read the addon-side step journal (the steps panel's data source)."""
+        return self._invoke("get_step_journal", doc_name)
+
+    def journal_op(self, doc_name: str, spec: dict[str, Any]) -> dict[str, Any]:
+        """Step-journal op: set_plan / run_next / rollback_to / reexecute."""
+        return self._invoke("journal_op", doc_name, spec)
+
+    def get_addon_log(
+        self,
+        level: str | None = None,
+        grep: str | None = None,
+        since_seq: int = 0,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """Read the addon's in-memory debug log (ring buffer, newest last)."""
+        return self._invoke("get_addon_log", level, grep, since_seq, limit)
 
     def save_document(self, doc_name: str, path: str | None = None) -> dict[str, Any]:
         return self._invoke("save_document", doc_name, path)

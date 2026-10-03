@@ -7,6 +7,9 @@ dist/
 build/
 *.egg-info/
 
+# FreeCAD addon runtime diagnostics (any stray log left next to the addon)
+*.log
+
 # FreeCAD working files (demos / backups)
 *.FCStd
 *.FCBak

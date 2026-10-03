@@ -10,7 +10,11 @@ _SETTINGS_FILENAME = "cadpilot_settings.json"
 _DEFAULT_SETTINGS = {
     "remote_enabled": False,
     "allowed_ips": "127.0.0.1",
-    "auto_start_rpc": False,
+    "auto_start_rpc": True,
+    "step_panel_visible": False,
+    "log_level": "INFO",
+    "log_dir": "",
+    "log_ring_size": 2000,
 }
 
 

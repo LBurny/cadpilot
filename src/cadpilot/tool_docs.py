@@ -238,16 +238,107 @@ Mates run in order; later mates see earlier moves. Every mate's residual
 A mate whose residual exceeds tolerance fails: stop_on_error=True aborts the
 whole transaction (nothing moves); False commits the passing mates.
 For PERSISTENT joints use assembly_session instead.""",
+    "step_plan": """\
+step_plan — submit a plan to FreeCAD's step journal WITHOUT executing it.
+
+Each entry is a cad() argument dict, so the panel can run it later:
+    {"operation": "create_object", "obj_type": "Part::Box", "obj_name": "Base",
+     "description": "base plate"}
+    {"operation": "pad", "obj_name": "Sketch", "obj_properties": {"Length": 20}}
+
+The plan lands in the document's journal as `planned` steps and shows up in
+the CADPilot Steps panel; `description` becomes the panel's plan title, and a
+per-step `description` becomes its row label — write both for the human
+watching the panel. Nothing touches the model until a step is released — by
+the user clicking ▶ in the panel, or via step_control. A new cad() call
+discards whatever part of the plan has not run yet, because it was planned
+against a document state that no longer exists.
+
+Batch steps work too: {"operation": "batch", "ops": [...]} runs the ops in one
+transaction as one step.""",
+    "step_control": """\
+step_control — run, review, and edit steps in a document's journal.
+
+Execution:
+  run_next      execute the first planned step
+  run_all       execute planned steps until one fails or none remain
+  run_to        execute until step `index` is done
+  replay        roll back to `index` (default 0) and re-run everything —
+                rebuilds the model from the journal after manual edits
+
+Review loop (the point of the panel: plan → release → review → fix):
+  accept        mark done step `index` as reviewed; accepted steps are a soft
+                lock — rollback_to / reexecute / replay across them need
+                force=true (params.on=false un-accepts)
+  reject        undo step `index` and DROP everything from it onward (done
+                steps are undone, planned ones forgotten — the tail was
+                authored against step `index` existing). params.reason is
+                logged. Reject never stops at accepted steps: it is the
+                deliberate act of destruction
+  update        edit a PLANNED/FAILED step without running it: params merge
+                top-level (obj_properties is replaced wholesale — send the
+                full dict), params.label renames the row
+  reexecute     roll back to just before `index`, then run it with `params`
+                merged in; the planned tail survives (reject drops it)
+
+Housekeeping:
+  rollback_to   undo back to step `index` (0 = undo every recorded step);
+                records stay and go back to planned
+  insert        add steps (params.steps) after `index`; the planned tail is
+                insert/append-only — to change history, reject and re-plan
+  clear_plan    drop not-yet-executed steps (never touches the model)
+  reset         forget the whole journal (pass confirm=true)
+  status        full records incl. params + meta (plan description)
+
+Every mutating action's reply carries a compact `journal` snapshot (counts,
+drift flag, per-step index/state/label/error/accepted) — one call tells you
+the new state; use status only when you need the full params.
+
+`rollback_to`/`reexecute`/`replay` refuse to cross a non-atomic step
+(execute_code, which manages its own transactions or none) unless force=true.
+Re-execution is only available for modeling steps (create_object /
+edit_object / delete_object / batch / PartDesign & Part features); assembly
+and anchor steps are logged and rollback-able but not re-runnable.""",
+    "get_addon_log": """\
+get_addon_log — read the FreeCAD addon's in-memory debug log.
+
+Every record carries: seq (strictly increasing within this FreeCAD session),
+time, level, name (logger, e.g. CADPilot.rpc), thread, request ("req#42" —
+the RPC that caused it, carried across onto the GUI thread), message, detail
+(traceback or an extra payload).
+
+The request id is what makes cross-thread work followable: one `-> cad(...)`
+line on the RPC thread and the `open transaction` / `GUI task ran after Nms`
+lines it caused all share the same req#.
+
+Incremental reads: pass since_seq = the seq of the last record you saw to get
+only what is new (the `status` field reports level, buffered/capacity, and the
+log file path).
+
+What is worth grepping for when debugging:
+  "GUI dispatch timed out"   — the GUI thread never picked the task up
+  "wake/heartbeat chain"     — timeout with an idle GUI thread: the waker died
+  "mouse guard:"             — a drag (or a phantom hold) deferred the queue
+  "aborted transaction"      — a modeling op failed and was rolled back
+  "journal <op> failed"      — a steps-panel button did not take effect
+
+Levels: DEBUG has per-request arg summaries and timings; INFO is the default
+and covers state changes; WARNING+ is also mirrored into FreeCAD's Report
+View. The same records go to a rotating file under FreeCAD's user data dir
+(<user data>/CADPilot/logs/cadpilot.log), so they survive a crash.""",
 }
 
 HELP_TOPICS: dict[str, str] = {
     **{
         op: f'cad(operation="{op}")'
         for op in CAD_OP_DOCS
-        if op != "assembly_session" and op != "assemble"
+        if op not in ("assembly_session", "assemble", "step_plan", "step_control", "get_addon_log")
     },
     "assembly_session": "assembly_session tool (persistent-joint assembly)",
     "assemble": "assemble tool (one-shot anchor snapping)",
+    "step_plan": "step_plan tool (submit a plan without executing it)",
+    "step_control": "step_control tool (run / roll back / re-run steps)",
+    "get_addon_log": "get_addon_log tool (read the addon's debug log)",
 }
 
 

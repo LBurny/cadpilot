@@ -8,6 +8,7 @@ from .core import (
     execute_code_async_operation,
     execute_code_operation,
     execute_operations_operation,
+    get_addon_log_operation,
     get_anchors_operation,
     get_object_operation,
     get_objects_operation,
@@ -32,6 +33,8 @@ from .core import (
     session_start_operation,
     session_status_operation,
     set_anchors_operation,
+    step_control_operation,
+    step_plan_operation,
     verify_assembly_operation,
 )
 
@@ -45,6 +48,7 @@ __all__ = [
     "execute_code_async_operation",
     "execute_code_operation",
     "execute_operations_operation",
+    "get_addon_log_operation",
     "get_anchors_operation",
     "get_object_operation",
     "get_objects_operation",
@@ -69,5 +73,7 @@ __all__ = [
     "session_start_operation",
     "session_status_operation",
     "set_anchors_operation",
+    "step_control_operation",
+    "step_plan_operation",
     "verify_assembly_operation",
 ]

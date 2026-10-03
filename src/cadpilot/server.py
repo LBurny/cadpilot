@@ -1,4 +1,7 @@
 import logging
+import os
+import threading
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any, Literal
@@ -23,6 +26,7 @@ from .operations import (
     create_document_operation,
     execute_code_async_operation,
     execute_code_operation,
+    get_addon_log_operation,
     get_anchors_operation,
     get_object_operation,
     get_objects_operation,
@@ -47,6 +51,8 @@ from .operations import (
     session_start_operation,
     session_status_operation,
     set_anchors_operation,
+    step_control_operation,
+    step_plan_operation,
     verify_assembly_operation,
 )
 from .prompt_text import ASSET_CREATION_STRATEGY
@@ -55,8 +61,28 @@ from .server_state import ServerState
 logging.basicConfig(
     level=logging.WARNING, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
+
+
+def _resolve_mcp_log_level(raw: str | None) -> str:
+    """A valid level name from ``CADPILOT_LOG_LEVEL``; INFO when unusable.
+
+    ``logger.setLevel`` raises ValueError on an unknown name, so this has to be
+    validated rather than passed straight through — a typo in the environment
+    must not stop the server from starting.
+    """
+    name = (raw or "INFO").upper()
+    return name if isinstance(logging.getLevelName(name), int) else "INFO"
+
+
 logger = logging.getLogger("CADPilot")
-logger.setLevel(logging.INFO)
+# Previously hardcoded to INFO; CADPILOT_LOG_LEVEL makes a debug session
+# possible without editing code. basicConfig only sets the ROOT level, so this
+# explicit level is what actually gates these records.
+logger.setLevel(_resolve_mcp_log_level(os.environ.get("CADPILOT_LOG_LEVEL")))
+
+# Records mirrored out of the addon (see _maybe_start_log_forwarder) get their
+# own logger so they stay distinguishable from this process's own output.
+addon_logger = logging.getLogger("CADPilot.addon")
 
 state = ServerState()
 
@@ -98,6 +124,54 @@ def get_freecad_connection() -> FreeCADConnection:
             state.freecad_connection = None
             raise Exception("Failed to connect to FreeCAD. Make sure the FreeCAD addon is running.")
     return state.freecad_connection
+
+
+# Opt-in mirror of the addon's log into this process's stderr. Off by default:
+# it costs a poll every 2s and duplicates records a caller may also fetch via
+# get_addon_log. Turn it on (CADPILOT_FORWARD_ADDON_LOG=1) when driving FreeCAD
+# unattended — that way a wedged addon still leaves its last activity visible in
+# the MCP process's own output, where get_addon_log can no longer reach it.
+_FORWARD_INTERVAL = 2.0
+_log_forwarder: threading.Thread | None = None
+
+
+def _maybe_start_log_forwarder() -> None:
+    """Start the poller when CADPILOT_FORWARD_ADDON_LOG is set. Never raises."""
+    global _log_forwarder
+    if _log_forwarder is not None:
+        return
+    if os.environ.get("CADPILOT_FORWARD_ADDON_LOG", "").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return
+
+    def loop() -> None:
+        cursor = 0
+        while True:
+            time.sleep(_FORWARD_INTERVAL)
+            try:
+                res = get_freecad_connection().get_addon_log(
+                    level="INFO", grep=None, since_seq=cursor, limit=50
+                )
+            except Exception:
+                continue  # addon busy or restarting; the next tick retries
+            if not isinstance(res, dict) or not res.get("success"):
+                continue
+            for record in res.get("records") or []:
+                cursor = max(cursor, int(record.get("seq", cursor)))
+                addon_logger.info(
+                    "[addon %s %s %s] %s",
+                    record.get("level"),
+                    record.get("request"),
+                    record.get("name"),
+                    record.get("message"),
+                )
+
+    _log_forwarder = threading.Thread(target=loop, name="cadpilot-log-forward", daemon=True)
+    _log_forwarder.start()
+    logger.info("Forwarding the addon log to this process's stderr every %ss", _FORWARD_INTERVAL)
 
 
 @mcp.tool()
@@ -254,10 +328,6 @@ def execute_code(
         code: The Python code to execute.
         with_screenshot: Attach a screenshot after successful execution
             (default: no screenshot).
-
-    Returns:
-        A message indicating the success or failure of the code execution, the
-        output of the code execution, and a screenshot only when requested.
     """
     return execute_code_operation(
         get_freecad_connection(), state.resolve_screenshot(with_screenshot), code
@@ -401,18 +471,13 @@ def session_rollback(
 ) -> list[TextContent]:
     """Roll back the model to a previous step.
 
-    Undoes the corresponding document transactions in FreeCAD and truncates
-    the step log. Removed steps go to a redo buffer (session_redo) until a new
-    cad() operation discards them.
+    Undoes the matching document transactions and truncates the step log;
+    removed steps go to a redo buffer until a new cad() call discards them.
 
     Args:
         to_step: Keep steps 1..to_step; undo everything after (0 = undo all).
         force: Roll back even across non-atomic execute_code steps (risky:
             undo may revert the wrong change).
-
-    Returns:
-        JSON with undone count, removed step numbers, post-rollback object
-        list, and a fingerprint consistency check.
     """
     return session_rollback_operation(get_freecad_connection(), to_step, force)
 
@@ -446,6 +511,67 @@ def session_add_note(
         The recorded note entry.
     """
     return session_add_note_operation(note, note_type)
+
+
+@mcp.tool()
+def step_plan(
+    ctx: Context,
+    doc_name: str,
+    steps: list[dict[str, Any]],
+    description: str = "",
+) -> list[TextContent]:
+    """Submit a modeling plan to FreeCAD without executing it.
+
+    Steps are cad() argument dicts that wait for release in the CADPilot Steps
+    panel (or via step_control). Reference: operation_help("step_plan").
+    """
+    return step_plan_operation(get_freecad_connection(), doc_name, steps, description)
+
+
+@mcp.tool()
+def step_control(
+    ctx: Context,
+    doc_name: str,
+    action: str,
+    index: int = 0,
+    params: dict[str, Any] | None = None,
+    force: bool = False,
+    confirm: bool = False,
+) -> list[TextContent]:
+    """Run, review, and edit steps in a document's step journal.
+
+    Actions: run_next | run_all | run_to | rollback_to | reexecute |
+    accept | reject | update | insert | replay | clear_plan | reset |
+    status (index/params/force apply per action; reset needs
+    confirm=true). Reference: operation_help("step_control").
+    """
+    return step_control_operation(
+        get_freecad_connection(), doc_name, action, index, params, force, confirm
+    )
+
+
+@mcp.tool()
+def get_addon_log(
+    ctx: Context,
+    level: str = "INFO",
+    grep: str = "",
+    since_seq: int = 0,
+    limit: int = 100,
+) -> list[TextContent]:
+    """Read the FreeCAD addon's debug log (newest last).
+
+    Use it when a call misbehaves or hangs: RPC timings, GUI-dispatch
+    deferrals, transactions and journal ops are all in here.
+
+    Args:
+        level: Min level: DEBUG | INFO | WARNING | ERROR.
+        grep: Substring filter on message and detail.
+        since_seq: Only records after this sequence number.
+        limit: Max records (default 100).
+    """
+    return get_addon_log_operation(
+        get_freecad_connection(), level or None, grep or None, since_seq, limit
+    )
 
 
 @mcp.tool()
@@ -692,15 +818,12 @@ def align_shapes(
 ) -> list[TextContent]:
     """Move an object so one of its elements aligns with a target element.
 
-    Modes: "touch" (face-to-face, normals opposing), "center" (centers
-    coincide, translation only), "axis" (cylindrical axes aligned).
-    offset: extra distance along target normal after alignment ("touch" only).
-
     Args:
         element / element_index: Element on the object to move.
         target_element / target_element_index: Element on the target.
-        mode: Alignment mode: "touch", "center", or "axis".
-        offset: Extra distance along target normal (positive = away).
+        mode: "touch" (face-to-face, normals opposing), "center" (translation
+            only, centers coincide), "axis" (cylindrical axes aligned).
+        offset: Extra distance along the target normal (positive = away).
 
     Returns:
         JSON with success and the new Placement.
@@ -747,15 +870,14 @@ def set_anchors(
 ) -> list[TextContent]:
     """Define explicit named anchors on an object.
 
-    Stored on the object (persists with the document) and follows Placement
-    moves. coord_frame="global" converts document coords to local via the
-    inverse Placement — use it whenever your source coordinates are global.
+    Anchors persist with the document and follow Placement moves. Use
+    coord_frame="global" whenever your source coordinates are global.
 
     Args:
         anchors: {name: {"pos": [x, y, z], "dir": [x, y, z] | null}}.
         replace: Replace all existing anchors instead of merging.
         coord_frame: "local" (stored as-is) or "global".
-        with_screenshot: Attach a screenshot of the result (default: no screenshot).
+        with_screenshot: Attach a screenshot (default: none).
 
     Returns:
         JSON with anchor_count; records a modeling-session step.
@@ -782,14 +904,11 @@ def assemble(
 ) -> list[TextContent]:
     """Assemble parts by snapping named anchors together (ONE transaction).
 
-    Each mate: {"obj", "anchor", "target", "target_anchor",
-                "mode": "center"|"touch"|"axis", "offset": float=0}.
-    Per-mate residuals (mm, plus degrees for touch/axis) are measured AFTER
-    the move; a mate over tolerance fails. For PERSISTENT joints use
-    assembly_session. Full semantics: operation_help("assemble").
+    Mates over `tolerance` fail the transaction. For PERSISTENT joints use
+    assembly_session; mate shape and mode semantics: operation_help("assemble").
 
     Args:
-        mates: Non-empty list of mate dicts (see above).
+        mates: Non-empty list of mate dicts.
         tolerance: Max allowed post-move residual in mm (default 0.1).
         stop_on_error: Abort and roll back at the first failed mate.
         with_screenshot: Attach a screenshot (default: none).
@@ -817,16 +936,12 @@ def verify_assembly(
 ) -> list[TextContent]:
     """Audit the document's spatial sanity (read-only, pure data feedback).
 
-    Reports: floating (nearest neighbour farther than float_threshold mm),
-    interferences (common volume over interference_min_volume mm3), and
-    per-check pass/fail for requested anchor pairs {"obj", "anchor",
-    "target", "target_anchor", "tolerance"?}. Hidden objects (boolean
-    bases, tool compounds) are skipped; skipped_hidden counts them. Call
-    after modeling/assembly steps for a numeric health report instead of
-    eyeballing screenshots.
+    Reports floating parts, interferences, and per-check distances for
+    requested anchor pairs. Hidden objects are skipped. Prefer this numeric
+    health report over eyeballing screenshots.
 
     Args:
-        checks: Optional anchor-pair distance checks (see above).
+        checks: Optional anchor-pair distance checks.
         float_threshold: Nearest-neighbour gap (mm) for "floating" (default 1.0).
         interference_min_volume: Minimum common volume (mm3) to report.
 
@@ -947,4 +1062,5 @@ def main():
     logger.info(f"Screenshots by default: {state.with_screenshots}")
     logger.info(f"Auto connectivity audit: {state.auto_audit}")
     logger.info(f"Connecting to FreeCAD RPC server at: {state.rpc_host}")
+    _maybe_start_log_forwarder()
     mcp.run()

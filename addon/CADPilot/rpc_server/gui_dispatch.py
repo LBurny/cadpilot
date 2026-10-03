@@ -29,13 +29,15 @@ import queue
 import sys
 import threading
 import time
-import traceback
 from collections.abc import Callable
 from typing import Any
 
-import FreeCAD
 import FreeCADGui
 from PySide import QtCore, QtGui, QtWidgets
+
+from rpc_server import dbglog
+
+logger = dbglog.get_logger("gui")
 
 _rpc_request_queue: "queue.Queue[Any]" = queue.Queue()
 _SHUTDOWN = object()
@@ -119,6 +121,7 @@ def _user_holding_button() -> bool:
     if physical is not None and physical == 0:
         # Qt claims a hold the OS says is not happening: phantom, and the
         # static counter must not keep accumulating for it either.
+        logger.debug("mouse guard: phantom hold rejected by OS ground truth (mask=%s)", buttons)
         _last_held_state = None
         _held_static_ticks = 0
         _held_mask = None
@@ -135,9 +138,14 @@ def _user_holding_button() -> bool:
         _held_mask = buttons
         _held_since = now
     if _held_static_ticks >= _PHANTOM_TICK_LIMIT:
+        logger.debug("mouse guard: motionless phantom cap hit (%d ticks)", _held_static_ticks)
         return False  # motionless phantom cap
     # continuous-hold cap (phantom + live cursor)
-    return now - _held_since < _PHANTOM_HOLD_SECONDS
+    held_for = now - _held_since
+    if held_for >= _PHANTOM_HOLD_SECONDS:
+        logger.debug("mouse guard: hold-duration cap hit (%.1fs)", held_for)
+        return False
+    return True
 
 
 class _WakeSignal(QtCore.QObject):
@@ -214,6 +222,7 @@ def process_gui_tasks(reschedule: bool = True) -> None:
             # user is dragging in the active window; defer to next tick.
             # (Phantom/stuck button states are filtered out inside
             # _user_holding_button — they must not starve the queue.)
+            logger.debug("mouse guard: deferring queue (real drag in the active window)")
             return
         if QtWidgets.QApplication.activePopupWidget() is not None:
             return  # context menu or popup open; defer to next tick
@@ -237,13 +246,19 @@ def process_gui_tasks(reschedule: bool = True) -> None:
                 task = _rpc_request_queue.get()
                 if task is _SHUTDOWN:
                     shutdown = True
+                    logger.info(
+                        "GUI dispatch shutting down (queue depth %d)",
+                        _rpc_request_queue.qsize(),
+                    )
                     return
                 try:
                     task()
                 except Exception as e:
-                    FreeCAD.Console.PrintError(
-                        f"CADPilot: unhandled exception in GUI task: {type(e).__name__}: {e}\n"
-                        f"{traceback.format_exc()}"
+                    logger.error(
+                        "unhandled exception in GUI task: %s: %s",
+                        type(e).__name__,
+                        e,
+                        exc_info=True,
                     )
         finally:
             if app is not None:
@@ -278,25 +293,43 @@ def dispatch_to_gui(task: Callable[[], Any], timeout: float = 60) -> Any:
     """
     response_queue: queue.Queue[Any] = queue.Queue(maxsize=1)
     cancelled = threading.Event()
+    # Captured HERE, on the RPC thread: the GUI thread has no request id of its
+    # own, so this is what keeps a call's deferred work correlatable with the
+    # request that caused it.
+    inherited_request = dbglog.request_id()
 
     def _wrapped() -> None:
         if cancelled.is_set():
             return  # caller timed out and went away; don't run a stale task
+        dbglog.set_request_id(inherited_request)
         try:
             res = task()
         except Exception as e:
-            FreeCAD.Console.PrintError(
-                f"CADPilot: GUI task raised {type(e).__name__}: {e}\n{traceback.format_exc()}"
-            )
+            logger.error("GUI task raised %s: %s", type(e).__name__, e, exc_info=True)
             res = f"{type(e).__name__}: {e}"
+        finally:
+            dbglog.clear_request_id()
         response_queue.put(res)
 
+    queued_at = time.monotonic()
     _rpc_request_queue.put(_wrapped)
     if _waker is not None:
         _waker.wake()  # immediate wake via Qt signal (thread-safe)
 
     try:
-        return response_queue.get(timeout=timeout)
+        result = response_queue.get(timeout=timeout)
+        waited = (time.monotonic() - queued_at) * 1000
+        if waited > 1000:
+            logger.warning(
+                "GUI task waited %.1fms (queue depth %d)", waited, _rpc_request_queue.qsize()
+            )
+        else:
+            # INFO, not DEBUG: this is the line that proves where a call spent
+            # its time (RPC thread vs. GUI queue), so it has to be there by
+            # default. The mouse-guard deferrals below stay DEBUG — they repeat
+            # every 500ms tick during a drag.
+            logger.info("GUI task ran after %.1fms", waited)
+        return result
     except queue.Empty:
         cancelled.set()  # a not-yet-started task must not run after we give up
         # Diagnose why: if _processing is still True, the GUI thread is occupied
@@ -307,6 +340,16 @@ def dispatch_to_gui(task: Callable[[], Any], timeout: float = 60) -> Any:
                 f" (GUI thread has been busy for {busy_for:.1f}s — "
                 "consider execute_code_async for heavy OCCT operations)"
             )
+            logger.error("GUI dispatch timed out after %ss%s", timeout, hint)
         else:
             hint = ""
+            # Idle GUI thread + timeout means the waker/heartbeat chain is dead,
+            # not that FreeCAD is busy — the failure mode that used to wedge the
+            # addon with nothing in any log to show for it.
+            logger.error(
+                "GUI dispatch timed out after %ss with an idle GUI thread (queue depth %d) "
+                "— the waker/heartbeat chain may be dead",
+                timeout,
+                _rpc_request_queue.qsize(),
+            )
         return {"success": False, "error": f"GUI dispatch timed out after {timeout}s{hint}"}

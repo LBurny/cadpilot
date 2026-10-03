@@ -153,3 +153,22 @@ def test_get_objects_legacy_list_response_still_works(monkeypatch):
     proxy = DocQueryProxy([{"Name": "Box"}])
     conn, _ = _make_conn(monkeypatch, lambda n: proxy)
     assert conn.get_objects("Doc") == [{"Name": "Box"}]
+
+
+def test_localhost_is_pinned_to_ipv4(monkeypatch):
+    """`localhost` resolves to ::1 first, which the addon never binds.
+
+    The failed IPv6 connect cost ~2s per call on Windows; the loopback name is
+    therefore rewritten at connection time.
+    """
+    monkeypatch.setattr(FreeCADConnection, "_make_proxy", lambda self, timeout: None)
+    assert FreeCADConnection()._uri == "http://127.0.0.1:9875"
+    assert FreeCADConnection(host="LOCALHOST")._uri == "http://127.0.0.1:9875"
+
+
+def test_remote_hosts_are_passed_through(monkeypatch):
+    monkeypatch.setattr(FreeCADConnection, "_make_proxy", lambda self, timeout: None)
+    assert FreeCADConnection(host="192.168.1.50")._uri == "http://192.168.1.50:9875"
+    assert (
+        FreeCADConnection(host="build-box.local", port=9999)._uri == "http://build-box.local:9999"
+    )
