@@ -15,11 +15,12 @@ AI 通过 CADPilot 构建的模型 —— 演示文件位于 [`examples/`](examp
 ## 特点
 
 * **端到端参数化建模** —— 电子表格变量驱动、全约束草图、PartDesign 特征（pad/pocket/revolution 等）、修饰操作、多视图 2D→3D 视觉外壳，全部收敛在一个统一的 `cad()` 工具里。
-* **步骤记录与回滚** —— 每个变更都在 FreeCAD 事务内执行并记录为会话步骤；`session_rollback` 基于原生撤销回溯，AI 可以大胆试错、随时重来，而不是从头重建。
+* **步骤日志与评审循环** —— 每个变更同时记录在 FreeCAD 侧的日志里，并显示在 **Steps 面板**中：按计划执行、接受好的步骤（软锁）、拒绝或回滚其余、就地修改参数、从日志整体 replay 重建。在 GUI 里的手工修改会同步回步骤记录；`session_rollback` 仍用于整个会话的撤销。
 * **持久化** —— 会话、模式与设置以 JSON 存于 `~/.cadpilot/`，重启不丢；今天暂停的会话，明天接着做。
 * **几何感知** —— 每步之后测量体积/面积、检查面/边拓扑、检测干涉；复杂建模时用定量反馈取代猜测。
 * **数据驱动装配** —— 命名锚点、带残差校验的配合、连通性审计，以及持久化关节（FreeCAD 1.1 Assembly 工作台）与声明式优先级裁剪。
 * **工作流记忆** —— 成功的建模套路存为可复用模式，按需召回；越用越聪明。
+* **内置故障诊断** —— `diagnose` 工具在 Windows/macOS/Linux 上探测 RPC 端口、FreeCAD 进程、插件安装与日志，并给出具体修复建议 —— FreeCAD 卡死或未启动时也能用。`get_addon_log` 在 GUI 卡死时仍能读取插件的调试环形日志。
 * **省 token** —— 文本优先响应、截图按需开启（768px 封顶）、精简的工具面、按需获取的操作文档，上下文占用极低。
 
 ## 安装
@@ -28,7 +29,9 @@ AI 通过 CADPilot 构建的模型 —— 演示文件位于 [`examples/`](examp
 
 FreeCAD 插件目录：
 
-* Windows：`%APPDATA%\FreeCAD\Mod\`
+* Windows：
+  * FreeCAD 1.1：`%APPDATA%\FreeCAD\v1-1\Mod\`
+  * FreeCAD 1.0：`%APPDATA%\FreeCAD\Mod\`
 * macOS：
   * FreeCAD 1.1：`~/Library/Application Support/FreeCAD/v1-1/Mod/`
   * FreeCAD 1.0：`~/Library/Application Support/FreeCAD/v1-0/Mod/`
@@ -51,8 +54,8 @@ cp -r addon/CADPilot ~/.FreeCAD/Mod/
 mkdir -p ~/Library/Application\ Support/FreeCAD/v1-1/Mod/
 cp -r addon/CADPilot ~/Library/Application\ Support/FreeCAD/v1-1/Mod/
 
-# Windows（PowerShell）
-Copy-Item -Recurse addon/CADPilot "$env:APPDATA\FreeCAD\Mod\"
+# Windows（PowerShell，FreeCAD 1.1）
+Copy-Item -Recurse addon/CADPilot "$env:APPDATA\FreeCAD\v1-1\Mod\"
 ```
 
 重启 FreeCAD，从工作台列表选择 **CADPilot**，点击 **CADPilot** 工具栏中的 **Start RPC Server** 启动 RPC 服务器。如需每次启动 FreeCAD 时自动运行，在 **CADPilot** 菜单中勾选 **Auto-Start Server**。
@@ -114,6 +117,7 @@ uv sync
 * `--with-screenshots`：每个变更/读取类工具响应都附带截图（适合多模态模型）
 * `--only-text-feedback`：永不返回截图，即使调用方请求（纯文本模型的硬保证）
 * `--host <ip>`：连接另一台机器上的 FreeCAD 实例
+* `--no-auto-audit`：跳过每次变更后的连通性审计（超大模型用）
 
 ```json
 {
@@ -133,15 +137,24 @@ RPC 服务器默认只监听 `localhost`。要从局域网内另一台机器控�
 1. 在 **CADPilot** 工具栏勾选 **Remote Connections**（下次重启后绑定 `0.0.0.0`），并点击 **Configure Allowed IPs** 输入允许连接的 IP 或 CIDR 网段（逗号分隔），例如 `192.168.1.100, 10.0.0.0/24`。只有列出的地址可以连接；修改设置后需重启 RPC 服务器。
 2. 让 MCP 服务器指向该机器：`"args": ["cadpilot", "--host", "192.168.1.100"]`。
 
+## 故障排查
+
+连不上？让 AI 跑一下 **`diagnose`** 工具 —— 它会检查 RPC 端口、FreeCAD 进程、插件安装与日志（Windows/macOS/Linux），最后给出具体的修复步骤，FreeCAD 卡死或未启动时也能用。两条能解决大多数问题的规则：
+
+1. 插件改动只在启动时加载 —— 安装或更新插件后**重启 FreeCAD**。
+2. MCP 工具列表在启动时构建 —— 修改服务器配置或版本后**重启 MCP 客户端**。
+
 ## 工具
 
 * **`cad`** —— 统一 CAD 变更工具：`create_object` / `edit_object` / `delete_object` / `batch`，参数化特征（`boolean` / `fillet` / `chamfer` / `loft` / `sweep` / `mirror` / `pattern` / `move`），Sketcher/PartDesign 操作（`variables` / `sketch` / `pad` / `pocket` / `revolution` / `groove` / `thickness` / `draft` / `datum_plane` / `hull`）。边/面选择器由 `get_topology` 提供；每个变更都在事务内执行、可回滚。
 * **`execute_code` / `execute_code_async` / `get_task_result`** —— 在 FreeCAD 中执行任意 Python（GUI 线程安全），或对耗时 OCCT 计算使用后台执行 + 轮询。
 * **建模会话** —— `session_start` / `session_status` / `session_get_steps` / `session_rollback` / `session_redo` / `session_add_note` / `session_pause` / `session_resume` / `session_list` / `session_complete`：步骤记录 + 基于 FreeCAD 原生事务撤销的回滚。
+* **步骤日志** —— `step_control` 驱动与 Steps 面板共享的 FreeCAD 侧评审循环：`run_next` / `run_all` / `rollback_to` / `reexecute` / `accept` / `reject` / `update` / `insert` / `replay` / `snapshot`。日志存在文档上，RPC 服务器停掉时面板照常工作。
 * **知识层级** —— `save_pattern` / `recall_patterns`（可复用工作流记忆）、`inspect_freecad`（运行时 API 内省）、`operation_help`（按需获取操作参考文档）。
 * **几何感知** —— `measure_geometry` / `get_topology` / `check_interference` / `get_positioning_info`：每步建模后的定量反馈。
 * **装配** —— `get_anchors` / `set_anchors` / `assemble` / `align_shapes` / `verify_assembly` 提供数据驱动的空间定位；`assembly_session` 提供基于配合的装配状态机（FreeCAD 1.1 Assembly 工作台持久化关节）与声明式优先级裁剪。
 * **文档与视图** —— `create_document` / `list_documents` / `get_objects` / `get_object` / `get_view`（截图默认长边 768px 封顶，节省 token）。
+* **诊断** —— `diagnose`（跨平台故障探测，FreeCAD 未启动也能用）与 `get_addon_log`（插件的环形调试日志，GUI 卡死时仍可读）。
 
 这些工具背后的架构见[设计文档](docs/DESIGN.zh-CN.md)；可在 FreeCAD 中打开演示模型 [`examples/ModernBicycle.FCStd`](examples/ModernBicycle.FCStd) 试用。
 
