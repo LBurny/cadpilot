@@ -95,9 +95,9 @@ def test_rollback_verifies_the_undo_before_promising_native():
     )
     attrs = {n.attr for n in ast.walk(func) if isinstance(n, ast.Attribute)}
     assert "created_since" in attrs, "_rollback must compute leftovers via sj.created_since"
-    assert (
-        "objects_after_index" in attrs
-    ), "_rollback must verify the object set expected at the target step"
+    assert "objects_after_index" in attrs, (
+        "_rollback must verify the object set expected at the target step"
+    )
 
 
 def test_removal_sets_come_from_record_diffs():
