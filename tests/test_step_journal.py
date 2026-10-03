@@ -185,3 +185,19 @@ def test_plan_rollback_reports_accepted():
     recs = [sj.build_record(_step(), i, sj.STATE_DONE, OPS) for i in (1, 2, 3)]
     recs[1].accepted = True
     assert sj.plan_rollback(recs, 0)["accepted"] == [2]
+
+
+def test_invalidates_plan_only_when_objects_changed():
+    """A read-only execute_code must not destroy a pending plan.
+
+    Recording an execute_code commit used to drop the planned tail
+    unconditionally, so merely inspecting the model silently deleted the plan
+    the user was about to release.
+    """
+    recs = [sj.build_record(_step(), 1, sj.STATE_DONE, OPS)]
+    recs[0].objects_after = ["Box"]
+    recs += [sj.build_record(_step("pad"), 2, sj.STATE_PLANNED, OPS)]
+
+    assert sj.invalidates_plan(recs, ["Box"]) is False  # inspection only
+    assert sj.invalidates_plan(recs, ["Box", "Cut"]) is True  # model moved
+    assert sj.invalidates_plan([], ["Box"]) is False  # nothing to compare against

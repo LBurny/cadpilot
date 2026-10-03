@@ -295,6 +295,23 @@ def insert_steps(
     return added
 
 
+def invalidates_plan(records: list[StepRecord], objects_after: list[str]) -> bool:
+    """Whether a mutation should discard the not-yet-executed planning tail.
+
+    A cad() commit always does: the document moved under steps that were
+    authored against the old state. An execute_code call is recorded here
+    too, but it is very often a read — inspecting the model must not silently
+    delete a plan — so it only invalidates the tail when the object set
+    actually changed, compared against the last committed step's fingerprint.
+    With nothing to compare against, keep the plan.
+    """
+    previous = next(
+        (r.objects_after for r in reversed(records) if r.state == STATE_DONE and r.objects_after),
+        [],
+    )
+    return bool(previous) and list(objects_after) != list(previous)
+
+
 def last_atomic_done(records: list[StepRecord]) -> StepRecord | None:
     """The most recent completed step that owns an undo transaction.
 

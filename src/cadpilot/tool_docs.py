@@ -250,7 +250,7 @@ The plan lands in the document's journal as `planned` steps and shows up in
 the CADPilot Steps panel; `description` becomes the panel's plan title, and a
 per-step `description` becomes its row label — write both for the human
 watching the panel. Nothing touches the model until a step is released — by
-the user clicking ▶ in the panel, or via step_control. A new cad() call
+the user clicking Next in the panel, or via step_control. A new cad() call
 discards whatever part of the plan has not run yet, because it was planned
 against a document state that no longer exists.
 
@@ -266,7 +266,7 @@ Execution:
   replay        roll back to `index` (default 0) and re-run everything —
                 rebuilds the model from the journal after manual edits
 
-Review loop (the point of the panel: plan → release → review → fix):
+Review loop (the point of the panel: plan, release, review, fix):
   accept        mark done step `index` as reviewed; accepted steps are a soft
                 lock — rollback_to / reexecute / replay across them need
                 force=true (params.on=false un-accepts)

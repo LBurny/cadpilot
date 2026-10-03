@@ -84,8 +84,10 @@ class StepPanel(QtWidgets.QDockWidget):
     def _std_icon(self, name: str) -> QtGui.QIcon:
         return self.style().standardIcon(getattr(QtWidgets.QStyle, name))
 
-    def _action(self, text, tip, slot, icon) -> QtGui.QAction:
-        action = QtGui.QAction(self._std_icon(icon), text, self)
+    def _action(self, text, tip, slot, icon=None) -> QtGui.QAction:
+        # icon=None keeps the action text-only: FreeCAD's own chrome uses no
+        # tick/cross glyphs, and neither does this panel.
+        action = QtGui.QAction(self._std_icon(icon) if icon else QtGui.QIcon(), text, self)
         action.setToolTip(tip)
         action.triggered.connect(slot)
         return action
@@ -101,6 +103,15 @@ class StepPanel(QtWidgets.QDockWidget):
         layout.addWidget(self.header)
 
         self.progress = QtWidgets.QProgressBar(box)
+        self.progress.setMaximumHeight(14)
+        # The default chunk is the platform accent — a heavy saturated blue in
+        # FreeCAD's dark theme. Re-tint it to the "done" green so the bar reads
+        # as part of the steps language, not as a foreign banner.
+        self.progress.setStyleSheet(
+            "QProgressBar { border: 1px solid palette(mid); border-radius: 3px;"
+            " text-align: center; background: palette(base); }"
+            f"QProgressBar::chunk {{ background-color: {_STATE_COLORS[sj.STATE_DONE].name()}; }}"
+        )
         layout.addWidget(self.progress)
 
         self.tree = QtWidgets.QTreeWidget(box)
@@ -125,6 +136,7 @@ class StepPanel(QtWidgets.QDockWidget):
 
         self.toolbar = QtWidgets.QToolBar(box)
         self.toolbar.setIconSize(QtCore.QSize(16, 16))
+        self.toolbar.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
         self.act_next = self._action(
             "Next", "Run the next planned step", self._run_next, "SP_MediaPlay"
         )
@@ -144,13 +156,12 @@ class StepPanel(QtWidgets.QDockWidget):
             "Accept",
             "Mark the selected done step as reviewed (soft-lock; unaccept if it already is)",
             self._accept,
-            "SP_DialogApplyButton",
         )
         self.act_reject = self._action(
             "Reject",
             "Undo the selected step and forget everything from it onward",
             self._reject,
-            "SP_DialogCancelButton",
+            "SP_TrashIcon",
         )
         self.act_replay = self._action(
             "Replay",
@@ -264,7 +275,7 @@ class StepPanel(QtWidgets.QDockWidget):
         # completed record outright would hide a manual undo here too.
         last = sj.last_atomic_done(records)
         if last and last.transaction not in names:
-            text += "\n⚠ Out of sync with FreeCAD's undo stack (undone manually?)"
+            text += "\nOut of sync with FreeCAD's undo stack (undone manually?)"
         return text
 
     def _render(self, records, header: str, note: str) -> None:
@@ -280,7 +291,7 @@ class StepPanel(QtWidgets.QDockWidget):
         self.tree.blockSignals(True)
         self.tree.clear()
         for rec in records:
-            label = rec.label + (f"  ⚠ {rec.error}" if rec.error else "")
+            label = rec.label + (f"  — {rec.error}" if rec.error else "")
             item = QtWidgets.QTreeWidgetItem([str(rec.index), label, rec.operation])
             item.setIcon(0, _state_icon(rec))
             if rec.accepted:
@@ -296,6 +307,15 @@ class StepPanel(QtWidgets.QDockWidget):
             if rec.index == selected:
                 self.tree.setCurrentItem(item)
         self.tree.blockSignals(False)
+        # Fit the list to its content instead of letting it stretch: a short
+        # plan would otherwise sit above a large dead grey area, and the space
+        # is worth more to the parameter editor below.
+        rows = self.tree.topLevelItemCount()
+        row_h = self.tree.sizeHintForRow(0) if rows else 0
+        self.tree.setMaximumHeight(
+            min(max(self.tree.header().height() + rows * row_h + 6, 72), 340)
+        )
+        self.status.setStyleSheet("")
         self.status.setText(note)
         self._update_details()
         self._update_actions()
@@ -331,7 +351,7 @@ class StepPanel(QtWidgets.QDockWidget):
             return
         parts = [f"Step {rec.index}", rec.operation, _STATE_LABEL.get(rec.state, rec.state)]
         if rec.accepted:
-            parts.append("✓ accepted")
+            parts.append("accepted")
         if rec.timestamp:
             parts.append(rec.timestamp)
         if rec.duration_ms:
@@ -340,7 +360,7 @@ class StepPanel(QtWidgets.QDockWidget):
         if rec.state == sj.STATE_DONE and gained:
             parts.append(f"{gained:+d} object(s)")
         self.detail_meta.setText(" · ".join(parts))
-        self.detail_error.setText(f"⚠ {rec.error}" if rec.error else "")
+        self.detail_error.setText(rec.error or "")
         self.detail_error.setVisible(bool(rec.error))
         # Do not clobber a half-edited JSON on every 1s refresh: only refill
         # when the selection moved or the editor is untouched.
@@ -535,7 +555,9 @@ class StepPanel(QtWidgets.QDockWidget):
     # --- helpers ---------------------------------------------------------
 
     def _warn(self, text: str) -> None:
-        self.status.setText("⚠ " + text)
+        # No symbol prefixes: warnings stand out by color, like the Report view.
+        self.status.setStyleSheet(f"color: {_RED.name()};")
+        self.status.setText(text)
 
     def _confirm(self, text: str) -> bool:
         answer = QtWidgets.QMessageBox.question(

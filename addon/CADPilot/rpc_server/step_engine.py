@@ -175,17 +175,24 @@ def append_non_atomic(doc, *, label: str) -> None:
     """Record an execute_code step: no transaction, so rollback past it is unsafe."""
     try:
         records = read_journal(doc)
-        del records[sj.planned_tail_start(records) :]
+        after = _object_names(doc)
+        # A read-only execute_code — inspecting the model, the common case —
+        # must NOT destroy a pending plan; only a call that actually moved the
+        # object set invalidates the tail (see sj.invalidates_plan).
+        if sj.invalidates_plan(records, after):
+            del records[sj.planned_tail_start(records) :]
         records.append(
             sj.StepRecord(
                 index=len(records) + 1,
                 state=sj.STATE_DONE,
                 operation="execute_code",
-                label=label,
+                # A snippet is multi-line; the panel shows one row per step, so
+                # collapse the whitespace before it becomes the row label.
+                label=" ".join(str(label).split())[:80],
                 params={},
                 atomic=False,
                 executable=False,
-                objects_after=_object_names(doc),
+                objects_after=after,
                 timestamp=sj.stamp(),
             )
         )
