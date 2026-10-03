@@ -135,7 +135,7 @@ class ConfigureAllowedIPsCommand:
                     None,
                     "Invalid IP Configuration",
                     "The following errors were found:\n\n"
-                    + "\n".join(f"• {e}" for e in errors)
+                    + "\n".join(f"- {e}" for e in errors)
                     + (
                         "\n\nOnly valid entries will be saved."
                         if valid

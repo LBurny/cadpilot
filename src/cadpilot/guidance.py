@@ -66,7 +66,7 @@ def suggest_next_steps(
                     "tool": "assembly_session",
                     "operation": "start",
                     "reason": "Multiple parts in the document — assembly mode mates them "
-                    "with persistent joints (start → add_component → mate → solve)",
+                    "with persistent joints (start, add_component, mate, solve)",
                 }
             )
 
@@ -161,7 +161,7 @@ def detect_risks(
                 "level": "info",
                 "type": "primitive_without_sketch",
                 "message": f"{len(primitive)} raw Part:: primitives created and no sketch "
-                "used — sketch mode (constrained sketch → pad/revolution/hull) "
+                "used — sketch mode (a constrained sketch, then pad/revolution/hull) "
                 "gives parametric, editable parts.",
             }
         )

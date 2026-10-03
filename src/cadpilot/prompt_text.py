@@ -3,10 +3,10 @@ Asset Creation Strategy for CADPilot
 
 ## Choose the mode first
 
-- **Designing a part? → Sketch mode.** Draw a constrained 2D profile, then
+- **Designing a part? Use Sketch mode.** Draw a constrained 2D profile, then
   turn it into 3D. Never sculpt parts from raw primitives when a sketch
   expresses the shape.
-- **Combining finished parts? → Assembly mode.** Mate parts with persistent
+- **Combining finished parts? Use Assembly mode.** Mate parts with persistent
   joints instead of hand-placing them.
 - Both modes run inside a modeling session (below) for step recording and
   rollback.
@@ -24,9 +24,9 @@ Asset Creation Strategy for CADPilot
      how a new part references an existing part's geometry parametrically.
    - cad(operation="datum_plane") creates offset/face-attached datum planes
      for sketches that don't lie on a base plane or an existing face.
-2. Single view → 3D: pad / pocket / revolution / groove (obj_name = the
+2. Single view to 3D: pad / pocket / revolution / groove (obj_name = the
    sketch). thickness / draft for shells and tapers.
-3. Multi-view → 3D (visual hull): draw the part's silhouette in 2-3 views
+3. Multi-view to 3D (visual hull): draw the part's silhouette in 2-3 views
    (Top=XY, Front=XZ, Side=YZ, one closed outer profile per sketch), then
    cad(operation="hull", obj_properties={"sketches": {...}}) — the solid is
    the intersection of the extruded views. Edit a view sketch and re-run hull
@@ -42,8 +42,8 @@ assembly_session — an independent state machine with PERSISTENT joints
 (FreeCAD Assembly workbench). The mate-based counterpart to one-shot
 assemble(); move a parent part, call solve, children follow.
 
-- Flow: start(ground=part) → add_component(part)×N → mate(a, b,
-  joint_type)×N → solve → verify → complete. rollback(to_step) undoes
+- Flow: start(ground=part), then add_component(part) N times, then mate(a, b,
+  joint_type) N times, then solve, verify, complete. rollback(to_step) undoes
   mistakes stepwise; status shows components/joints/steps.
 - Mate ref: {"part": name, plus exactly one of face="FaceN" / anchor=name /
   point=[x,y,z]}. Prefer anchors: get_anchors() lists auto-derived connection
@@ -73,10 +73,10 @@ For any non-trivial modeling task, work inside a session:
 
 ## Knowledge hierarchy (use in this order)
 
-① Your own FreeCAD Python knowledge — always try this first.
-② recall_patterns(query) — retrieval of workflows that worked before
+1. Your own FreeCAD Python knowledge — always try this first.
+2. recall_patterns(query) — retrieval of workflows that worked before
   (from session_complete and save_pattern), when you are unsure.
-③ inspect_freecad(doc_name, obj_name) or inspect_freecad(dotted_name="Part.makeLoft")
+3. inspect_freecad(doc_name, obj_name) or inspect_freecad(dotted_name="Part.makeLoft")
   — runtime API introspection as the last-resort reference.
 After a non-trivial approach succeeds, store it with save_pattern() so it can be
 recalled next time.
@@ -100,8 +100,8 @@ computing Placement values; use relative moves and alignment instead:
       check_interference() confirm placement and detect collisions.
 
    e. **Connectivity auto-audit** — after every committed cad() mutation the
-      framework re-audits the document and appends a "⚠ Connectivity" warning
-      listing islands: groups of parts that don't touch the main assembly
+      framework re-audits the document and appends a "WARNING - Connectivity"
+      line listing islands: groups of parts that don't touch the main assembly
       (touching = exact gap ≤0.5mm or volume intersection). Treat this warning
       as a BLOCKING issue: realign the listed parts with move/align_shapes/
       assemble so they genuinely touch before adding new parts. Parts that

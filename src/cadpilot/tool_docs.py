@@ -179,7 +179,7 @@ origin) or {"face": ["ObjName", "FaceN"]} (attached to an existing face).
 Optional: offset (mm along the plane normal), body.
 Sketch on it with plane={"datum": name}.""",
     "hull": """\
-hull — multi-view 2D→3D visual hull (obj_name = result name, default "Hull",
+hull — multi-view 2D-to-3D visual hull (obj_name = result name, default "Hull",
 may be omitted).
 Required in obj_properties: sketches — a list of 2-3 view-profile sketch
 names or {"top": .., "front": .., "side": ..} (convention: Top=XY, Front=XZ,

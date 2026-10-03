@@ -65,7 +65,7 @@ def test_disconnected_islands_risk():
     sess.add_step(
         "create_object",
         "create Box",
-        result_summary="Object 'Box' created successfully\n⚠ Connectivity: 2 disconnected island(s) not touching the main assembly:\n  - [Spoke_0]",
+        result_summary="Object 'Box' created successfully\nWARNING - Connectivity: 2 disconnected island(s) not touching the main assembly:\n  - [Spoke_0]",
         objects_after=["Box"],
         atomic=True,
     )

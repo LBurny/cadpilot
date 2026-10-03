@@ -332,7 +332,9 @@ def _format_connectivity_warning(audit: dict[str, Any]) -> str:
     if not islands:
         return ""
     count = int(audit.get("summary", {}).get("island_count", len(islands)))
-    lines = [f"⚠ Connectivity: {count} disconnected island(s) not touching the main assembly:"]
+    lines = [
+        f"WARNING - Connectivity: {count} disconnected island(s) not touching the main assembly:"
+    ]
     for isl in islands[:5]:
         objs = isl.get("objects", [])
         preview = ", ".join(objs[:_ISLAND_OBJECTS_PREVIEW])
@@ -595,19 +597,19 @@ def session_status_operation(freecad: FreeCADConnection) -> ToolResponse:
             )
 
     lines = [
-        f"📊 **{sess.name}** (doc `{sess.doc_name}`, {sess.step_count} steps, {sess.status})",
+        f"**{sess.name}** (doc `{sess.doc_name}`, {sess.step_count} steps, {sess.status})",
     ]
     if journal:
         lines.append(
-            f"🗂 Addon journal: {journal.get('done', 0)} done, "
+            f"Addon journal: {journal.get('done', 0)} done, "
             f"{journal.get('planned', 0)} planned"
-            + (" — ⚠ drift from the undo stack" if journal.get("drift") else "")
+            + (" - drift from the undo stack (WARNING)" if journal.get("drift") else "")
         )
     if suggestions:
-        lines.append("\n💡 **Next steps:**")
+        lines.append("\n**Next steps:**")
         lines.extend(f"- `{s['tool']}` {s['operation']}: {s['reason']}" for s in suggestions)
     if risks or journal_risks:
-        lines.append("\n⚠️ **Risks:**")
+        lines.append("\n**Risks:**")
         lines.extend(f"- {r['message']}" for r in risks)
         lines.extend(f"- {msg}" for msg in journal_risks)
     return json_response(
@@ -714,9 +716,9 @@ def session_rollback_operation(
             "objects": res.get("objects", []),
             "warnings": warnings,
             "display_text": (
-                f"⏪ Rolled back {undone} step(s) to step {sess.step_count}. "
+                f"Rolled back {undone} step(s) to step {sess.step_count}. "
                 f"Removed: {[s.step_number for s in removed]}."
-                + (" ⚠️ " + " ".join(warnings) if warnings else "")
+                + (" WARNING: " + " ".join(warnings) if warnings else "")
             ),
         }
     )

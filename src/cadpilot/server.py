@@ -642,8 +642,8 @@ def save_pattern(
     """Store a reusable modeling pattern (code snippet or workflow) into the
     pattern memory. Call this after a non-trivial approach worked.
 
-    Knowledge hierarchy: ① your own knowledge first → ② recall_patterns when
-    unsure → ③ inspect_freecad for API details. Successful new approaches
+    Knowledge hierarchy: 1) your own knowledge first, 2) recall_patterns when
+    unsure, 3) inspect_freecad for API details. Successful new approaches
     should be stored back here.
 
     Args:
@@ -701,9 +701,9 @@ def inspect_freecad(
     when both your knowledge and recall_patterns are insufficient).
 
     Two modes:
-    - Object mode: pass doc_name + obj_name → the object's TypeId, settable
+    - Object mode: pass doc_name + obj_name for the object's TypeId, settable
       properties (with types), public methods, and docstring.
-    - API mode: pass dotted_name (e.g. "Part.makeLoft") → its docstring, or
+    - API mode: pass dotted_name (e.g. "Part.makeLoft") for its docstring, or
       the member list of a module/class.
 
     Returns:
