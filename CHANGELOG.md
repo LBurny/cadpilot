@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.5.2 (2026-10-04)
+
+### Fixed
+
+- **`execute_code` is now rollback-able** (`rpc_server.py`, `step_engine.py`):
+  a bare document change in FreeCAD creates no undo entry, so an AI that models
+  through `execute_code` — the common case — produced journal steps that
+  `rollback` could not undo, and every rollback demanded `force`. The snippet is
+  now wrapped in a transaction and the result reports `changed`:
+  - a **mutating** run becomes an ATOMIC step that owns one undo entry, is
+    re-runnable (the code is stored and re-executed through the shared
+    `exec_snippet`), so `rollback_to` / `reexecute` / **`replay` rebuilds an
+    execute_code-built model**;
+  - a **read-only** run records a step that neither blocks a rollback nor is
+    re-run (`mutated=False`), so trailing inspections no longer force `force`;
+    the MCP session does not record it at all, keeping the log's
+    one-transaction-per-step invariant.
+- **A failing `execute_code` no longer leaves half-applied mutations**: the
+  wrapper transaction is aborted when the snippet raises.
+- AST regression tests pin both contracts
+  (`tests/test_execute_code_atomic.py`), verified to fail against the previous
+  source. Live-verified on FreeCAD 1.1.4: mutating snippet → atomic journal step
+  → `rollback_to 0` with no force → `replay` restored the exact geometry.
+
 ## v0.5.1 (2026-10-04)
 
 ### Fixed
