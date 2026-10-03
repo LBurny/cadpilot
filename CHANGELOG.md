@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.5.1 (2026-10-04)
+
+### Fixed
+
+- **Batch sub-ops keyed `operation` now run on initial execution, not just on
+  replay** (`rpc_server.py`): `_run_one_operation` read only the RPC schema's
+  `action` key, so a batch written in the journal-native `operation` style
+  failed every sub-op with the cryptic `unknown action: None` while the same
+  journal replayed fine. Both sides of the journal boundary now accept both
+  keys, and a sub-op missing both gets an explicit "no 'action' (or
+  'operation') key" error.
+- **`run_all`/`replay` no longer die on non-executable journal records**
+  (`step_engine.py`): an `execute_code` inspection is a normal journal citizen,
+  but re-running the plan stopped hard at it ("operation 'execute_code' is not
+  re-executable"), making replay unusable after any inspection. Such records
+  are now marked done and skipped, reported in the result's `skipped` list.
+- AST regression tests pin both contracts (`tests/test_step_journal.py`,
+  `tests/test_step_engine_ops.py`); the AGENTS.md hot-reload module list now
+  includes `step_journal`/`step_engine`.
+
 ## v0.5.0 (2026-10-04)
 
 ### New features
