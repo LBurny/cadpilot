@@ -51,6 +51,10 @@ jobs:
         run: uv build
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # Idempotent re-runs: a version uploaded already (a retried job, or
+          # a manual upload that raced this workflow) is skipped, not an error.
+          skip-existing: true
 
   release:
     needs: publish
