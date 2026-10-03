@@ -1,5 +1,50 @@
 # Changelog
 
+## v0.5.3 (2026-10-04)
+
+Found by stress-testing a parametric PartDesign model (variables → constrained
+sketch → pad → pocket → 6-hole bolt ring). All three used to fail SILENTLY —
+the tool reported success while the geometry was wrong.
+
+### Fixed
+
+- **`pattern` was wrong for every PartDesign feature** (`feature_ops.py`): it
+  used Draft's array, which copies the base object's whole Shape — for a
+  PartDesign feature that Shape is the entire body, so "pattern this hole"
+  produced N overlapping copies of the whole part. It now creates a
+  PartDesign::PolarPattern / LinearPattern inside the Feature's Body with
+  `Originals=[feature]`. FreeCAD 1.1 still cannot be driven reliably that way
+  (occurrences can come out coincident), so when the transform has no effect the
+  op now **refuses with a clear error and an actionable workaround** instead of
+  returning a part with one hole where six were asked for. Part-level bases keep
+  using the Draft array.
+- **Sketch face attachment can now be a direction** (`sketcher_ops.py`):
+  `plane={"face": [obj, "+Z"]}` (also -Z, ±X, ±Y, top/bottom/left/right/
+  front/back) resolves to the planar face facing that way. Face names (Face1,
+  Face2, …) are re-derived after every feature, so a name read off one feature
+  can silently mean a different face on the next one — the sketch then attaches
+  to the wrong plane, its pocket cuts air, and everything still reports success.
+- **A cut that removed nothing is now reported** (`feature_ops.py`):
+  `describe_feature` compares a pocket/groove against its predecessor
+  (`BaseFeature`) and returns a `warnings` entry naming the likely cause
+  (profile outside the solid, or a stale face attachment).
+- **The Steps panel detail pane shows the snippet** (`step_panel.py`,
+  `step_engine.py`): an execute_code row rendered as an opaque `{}`; the code is
+  now always kept in `params` and shown as editable, colourised-free source
+  (edit it and press Re-run to iterate). Step rows also say what the snippet DID
+  (`execute_code: +6 object(s): Hole1, …` / `read-only`).
+- **Force prompts name the real step kind**: `blocking_text` no longer blames
+  "execute_code" for a snapshot marker that is doing the blocking.
+
+### Changed
+
+- `ensure_panel()` rebuilds a Steps dock left over from an older class, so a hot
+  reload picks up panel changes without restarting FreeCAD (verified: the
+  detail pane switched from escaped JSON to multi-line source).
+- `reexecute` merges params at the TOP level; a step's operation parameters live
+  under `obj_properties` (a `variables` update must be sent as
+  `{"obj_properties": {"cells": …}}`) — documented in `operation_help`.
+
 ## v0.5.2 (2026-10-04)
 
 ### Fixed
