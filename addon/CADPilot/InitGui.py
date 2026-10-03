@@ -42,6 +42,12 @@ with contextlib.suppress(NameError):
 
 
 def _bootstrap():
+    # Imports made here are CLOSURES for the nested helpers below; a name
+    # imported at module level is NOT. FreeCAD execs this file into a
+    # namespace separate from the __globals__ of the functions it defines,
+    # so a module-level `import contextlib` left find_addon_dir() raising
+    # NameError and the whole addon silently unloaded (seen live, 1.1.4).
+    import contextlib
     import os
     import sys
     import time
@@ -330,11 +336,31 @@ except BaseException:
     # Last-resort diagnostics: builtins only, no module-level names.
     try:
         import os as _o
+        import sys as _s
         import time as _t
         import traceback as _tb
 
-        _p = _ADDON_HINT or "."
-        with open(_o.path.join(_p, "initgui_debug.log"), "a", encoding="utf-8") as _f:
-            _f.write(f"=== {_t.strftime('%H:%M:%S')} bootstrap crashed\n{_tb.format_exc()}\n")
+        _text = f"=== {_t.strftime('%H:%M:%S')} bootstrap crashed\n{_tb.format_exc()}\n"
+        # Report View first: it needs no working directory and no writable
+        # addon dir, and it is where a human looks after "the addon is gone".
+        with contextlib.suppress(BaseException):
+            _s.stderr.write("[CADPilot] InitGui bootstrap crashed:\n" + _text)
+        # __file__ is absent under bare exec(), so _ADDON_HINT is often None;
+        # fall back to the user's Mod path before the (exe dir) cwd.
+        _cands = [_ADDON_HINT]
+        with contextlib.suppress(BaseException):
+            import FreeCAD as _fc
+
+            _cands.append(_o.path.join(_fc.getUserAppDataDir(), "Mod", "CADPilot"))
+        _cands.append(".")
+        for _p in _cands:
+            if not _p:
+                continue
+            try:
+                with open(_o.path.join(_p, "initgui_debug.log"), "a", encoding="utf-8") as _f:
+                    _f.write(_text)
+                break
+            except BaseException:
+                continue
     except BaseException:
         pass

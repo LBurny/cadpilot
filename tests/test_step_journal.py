@@ -16,6 +16,16 @@ def _step(op="create_object", name="Box", **extra):
     return {"operation": op, "obj_name": name, **extra}
 
 
+def test_sub_operation_tolerates_action_keyed_batch_ops():
+    """cad() batches journal sub-ops verbatim as {"action": ...} (the RPC
+    schema); re-running such a step must still resolve the op name — the
+    flange-rollback bug was "" -> "operation '' is not re-executable"."""
+    assert sj.sub_operation({"operation": "fillet"}) == "fillet"
+    assert sj.sub_operation({"action": "create_object"}) == "create_object"
+    assert sj.sub_operation({"operation": "pad", "action": "ignored"}) == "pad"
+    assert sj.sub_operation({}) == ""
+
+
 def test_roundtrip_preserves_records():
     recs = [sj.build_record(_step(), 1, sj.STATE_DONE, OPS)]
     assert sj.from_json(sj.to_json(recs)) == recs

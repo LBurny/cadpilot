@@ -252,11 +252,12 @@ def execute_record(doc, rec: sj.StepRecord) -> dict[str, Any]:
         if not ops:
             return {"success": False, "error": "batch step has no ops"}
         for i, sub in enumerate(ops, start=1):
-            res = _execute_one(doc, str(sub.get("operation") or ""), sj.params_for(sub))
+            op_name = sj.sub_operation(sub)
+            res = _execute_one(doc, op_name, sj.params_for(sub))
             if not res.get("success"):
                 return {
                     "success": False,
-                    "error": f"batch op {i} ({sub.get('operation')}): {res.get('error')}",
+                    "error": f"batch op {i} ({op_name}): {res.get('error')}",
                 }
         return {"success": True}
     return _execute_one(doc, rec.operation, rec.params or {})

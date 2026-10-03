@@ -144,6 +144,17 @@ def params_for(step: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def sub_operation(sub: dict[str, Any]) -> str:
+    """A batch sub-op's operation name, tolerating both key conventions.
+
+    cad() batch ops arrive as {"action": ...} (the RPC batch schema) and are
+    journaled verbatim, while journal-native steps use {"operation": ...} —
+    without this, re-running a recorded batch step resolves "" and dies with
+    "operation '' is not re-executable".
+    """
+    return str(sub.get("operation") or sub.get("action") or "")
+
+
 def build_record(
     step: dict[str, Any],
     index: int,
