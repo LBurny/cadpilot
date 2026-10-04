@@ -214,7 +214,7 @@ def test_assembly_ops_are_executable_and_recorded_with_payloads():
         for n in ast.walk(assign.value)
         if isinstance(n, ast.Constant) and isinstance(n.value, str)
     }
-    assert ASSEMBLY_JOURNAL_OPS <= ops
+    assert ops >= ASSEMBLY_JOURNAL_OPS
     func = next(
         n for n in ast.walk(_ENGINE) if isinstance(n, ast.FunctionDef) and n.name == "_execute_one"
     )
@@ -225,7 +225,7 @@ def test_assembly_ops_are_executable_and_recorded_with_payloads():
         for n in [cmp.left, *cmp.comparators]
         if isinstance(n, ast.Constant) and isinstance(n.value, str)
     }
-    assert ASSEMBLY_JOURNAL_OPS <= handled
+    assert handled >= ASSEMBLY_JOURNAL_OPS
     # RPC side: every one of the four handlers journals a NON-EMPTY params dict
     for handler in ("assemble", "align_shapes", "set_anchors", "assembly_op"):
         func = next(

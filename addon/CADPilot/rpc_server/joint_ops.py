@@ -242,12 +242,13 @@ def _settle_shapes(doc, asm) -> None:
     caches here charges the rebuild to the op that actually caused it; the
     reads cost nothing when the cache is already valid.
     """
+    # The read IS the effect; assigning it says so to a reader (and to B018).
     with contextlib.suppress(Exception):
-        asm.Shape
+        _ = asm.Shape
     for obj in doc.Objects:
         if obj.TypeId == "App::Link":
             with contextlib.suppress(Exception):
-                obj.Shape
+                _ = obj.Shape
 
 
 # ---------------------------------------------------------------- operations
