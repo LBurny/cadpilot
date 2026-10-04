@@ -8,9 +8,11 @@
 
 Models built by the AI through CADPilot — demo files live in [`examples/`](examples/):
 
-| Modern Bicycle (uncolored) | Sports Car (colored) |
+| Backpack | Desk Fan |
 | :---: | :---: |
-| [![Modern bicycle modeled by CADPilot](examples/ModernBicycle.png)](examples/ModernBicycle.FCStd) | [![Sports car modeled by CADPilot](examples/SportsCar2.png)](examples/SportsCar.FCStd) |
+| [![Backpack modeled by CADPilot](examples/Backpack.png)](examples/Backpack.FCStd) | [![Desk fan modeled by CADPilot](examples/DeskFan.png)](examples/DeskFan.FCStd) |
+| **Violin** | **Leaf** |
+| [![Violin modeled by CADPilot](examples/Violin.png)](examples/Violin.FCStd) | [![Leaf modeled by CADPilot](examples/Leaf.png)](examples/Leaf.FCStd) |
 
 ## Features
 
@@ -157,7 +159,7 @@ Something not talking? Ask the AI to run the **`diagnose`** tool — it checks t
 * **Documents & views** — `create_document` / `list_documents` / `get_objects` / `get_object` / `get_view` (screenshots capped at 512 px on the long edge by default).
 * **Diagnostics** — `diagnose` (cross-platform fault probing that works with FreeCAD down) and `get_addon_log` (the addon's ring-buffer debug log, readable while the GUI is wedged).
 
-See the [design document](docs/DESIGN.md) for the architecture behind these tools, and try the demo model [`examples/ModernBicycle.FCStd`](examples/ModernBicycle.FCStd) in FreeCAD.
+See the [design document](docs/DESIGN.md) for the architecture behind these tools, and try the demo model [`examples/Backpack.FCStd`](examples/Backpack.FCStd) in FreeCAD.
 
 ## Documentation
 

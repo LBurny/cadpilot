@@ -33,8 +33,11 @@ Thumbs.db
 # Local secrets
 .env
 
-# Allow the demo model in examples/
-!examples/ModernBicycle.FCStd
+# Allow the demo models in examples/
+!examples/Backpack.FCStd
+!examples/DeskFan.FCStd
+!examples/Leaf.FCStd
+!examples/Violin.FCStd
 
 # Local blog drafts (not for publication)
 docs/blog*.md

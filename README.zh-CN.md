@@ -8,9 +8,11 @@
 
 AI 通过 CADPilot 构建的模型 —— 演示文件位于 [`examples/`](examples/)：
 
-| 现代自行车（未上色） | 跑车（已上色） |
+| 双肩包 | 台式风扇 |
 | :---: | :---: |
-| [![CADPilot 建模的现代自行车](examples/ModernBicycle.png)](examples/ModernBicycle.FCStd) | [![CADPilot 建模的跑车](examples/SportsCar2.png)](examples/SportsCar.FCStd) |
+| [![CADPilot 建模的双肩包](examples/Backpack.png)](examples/Backpack.FCStd) | [![CADPilot 建模的台式风扇](examples/DeskFan.png)](examples/DeskFan.FCStd) |
+| **小提琴** | **树叶** |
+| [![CADPilot 建模的小提琴](examples/Violin.png)](examples/Violin.FCStd) | [![CADPilot 建模的树叶](examples/Leaf.png)](examples/Leaf.FCStd) |
 
 ## 特点
 
@@ -157,7 +159,7 @@ RPC 服务器默认只监听 `localhost`。要从局域网内另一台机器控�
 * **文档与视图** —— `create_document` / `list_documents` / `get_objects` / `get_object` / `get_view`（截图默认长边 512px 封顶，节省 token）。
 * **诊断** —— `diagnose`（跨平台故障探测，FreeCAD 未启动也能用）与 `get_addon_log`（插件的环形调试日志，GUI 卡死时仍可读）。
 
-这些工具背后的架构见[设计文档](docs/DESIGN.zh-CN.md)；可在 FreeCAD 中打开演示模型 [`examples/ModernBicycle.FCStd`](examples/ModernBicycle.FCStd) 试用。
+这些工具背后的架构见[设计文档](docs/DESIGN.zh-CN.md)；可在 FreeCAD 中打开演示模型 [`examples/Backpack.FCStd`](examples/Backpack.FCStd) 试用。
 
 ## 文档
 
