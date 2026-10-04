@@ -1,6 +1,7 @@
 """Step journal model/arithmetic — pure logic, no FreeCAD needed."""
 
 import ast
+import math
 import sys
 from pathlib import Path
 
@@ -382,3 +383,141 @@ def test_invalidates_plan_only_when_objects_changed():
     assert sj.invalidates_plan(recs, ["Box"]) is False  # inspection only
     assert sj.invalidates_plan(recs, ["Box", "Cut"]) is True  # model moved
     assert sj.invalidates_plan([], ["Box"]) is False  # nothing to compare against
+
+
+# --- manual-edit sync (pure half) -------------------------------------------
+
+
+def _rec(op, index, name="Obj", props=None, before=None, after=None, state=sj.STATE_DONE):
+    return sj.StepRecord(
+        index=index,
+        state=state,
+        operation=op,
+        params={"obj_name": name, "obj_properties": dict(props or {})},
+        objects_before=list(before or []),
+        objects_after=list(after or []),
+    )
+
+
+def test_tracked_objects_create_claims_scalars_and_placement():
+    recs = [_rec("create_object", 1, "Box", {"Length": 10, "Shape": {"nested": 1}}, after=["Box"])]
+    entry = sj.tracked_objects(recs)["Box"]
+    # only scalar spec keys are claimable; non-scalar structure is never invented
+    assert entry["props"]["Length"] == (1, "Length")
+    assert "Shape" not in entry["props"]
+    assert entry["props"]["Placement"] == (1, "Placement")
+    assert entry["move"] is None and entry["sheet"] is None and entry["sketch"] is None
+
+
+def test_tracked_objects_later_done_step_wins_per_property():
+    recs = [
+        _rec("create_object", 1, "Box", {"Length": 10}, after=["Box"]),
+        _rec("edit_object", 2, "Box", {"Length": 20}),
+    ]
+    assert sj.tracked_objects(recs)["Box"]["props"]["Length"] == (2, "Length")
+
+
+def test_tracked_objects_ignores_planned_steps():
+    recs = [_rec("create_object", 1, "Box", {"Length": 10}, after=["Box"], state=sj.STATE_PLANNED)]
+    assert sj.tracked_objects(recs) == {}
+
+
+def test_tracked_objects_move_owns_the_final_pose():
+    """A move is relative: the create step's absolute Placement must NOT claim
+    the object (a re-run would double-apply), and the LAST move step is where a
+    manual drag folds in."""
+    recs = [
+        _rec("create_object", 1, "Box", {"Length": 10}, after=["Box"]),
+        _rec("move", 2, "Box", {"translate": {"x": 5, "y": 0, "z": 0}}),
+        _rec("pad", 3, "Sketch", {"length": 8}, before=["Box"], after=["Box", "Pad"]),
+        _rec("move", 4, "Box", {"translate": {"x": 0, "y": 5, "z": 0}}),
+    ]
+    entry = sj.tracked_objects(recs)["Box"]
+    assert "Placement" not in entry["props"]
+    assert entry["move"] == 4  # the LAST move step
+
+
+def test_tracked_objects_feature_claims_builder_keys_even_when_unpassed():
+    """A pad built with the default length has no 'length' in params, but a GUI
+    Length edit must still sync — the claim map is the builder's key set, not
+    the caller's."""
+    recs = [_rec("pad", 1, "Sketch", {}, before=["Sketch"], after=["Sketch", "Pad"])]
+    props = sj.tracked_objects(recs)["Pad"]["props"]
+    assert props["Length"] == (1, "length")
+    assert props["Reversed"] == (1, "reversed")
+    assert props["Midplane"] == (1, "midplane")
+
+
+def test_tracked_objects_variables_claims_the_sheet_even_when_idempotent():
+    """A variables re-run on an existing sheet creates nothing, so the
+    before/after diff is empty — the sheet must be tracked by obj_name or its
+    cells would never sync."""
+    recs = [_rec("variables", 1, "Vars", {"cells": {"A1": ["w", 10]}}, before=["Vars"], after=["Vars"])]
+    entry = sj.tracked_objects(recs)["Vars"]
+    assert entry["sheet"] == 1
+    # the Body a sketch op created incidentally must NOT claim the sketch handlers
+    recs = [_rec("sketch", 1, "Sketch", {"geometry": [], "constraints": []}, before=[], after=["Body", "Sketch"])]
+    tracked = sj.tracked_objects(recs)
+    assert tracked["Sketch"]["sketch"] == 1
+    assert tracked["Body"]["sketch"] is None
+
+
+def test_tracked_objects_sketch_and_datum_claim_attachment_offset():
+    recs = [
+        _rec("sketch", 1, "Sketch", {"constraints": []}, after=["Sketch"]),
+        _rec("datum_plane", 2, "DP", {"plane": "XY"}, before=["Sketch"], after=["Sketch", "DP"]),
+    ]
+    tracked = sj.tracked_objects(recs)
+    assert tracked["Sketch"]["props"]["AttachmentOffset"] == (1, "offset")
+    assert tracked["DP"]["props"]["AttachmentOffset"] == (2, "offset")
+
+
+def test_map_cell_value_number_text_formula():
+    # numeric cell: bare numeric content
+    assert sj.map_cell_value(10, "25") == 25
+    assert sj.map_cell_value(10, "7.5") == 7.5
+    # text cell: a LEADING apostrophe marks text (trailing one optional), and
+    # the builder's quoting persists in the cell text — strip both layers.
+    # (live-measured on 1.1.4 by ordinals: getContents(text) = '"plate" with
+    # a leading ' and NO trailing one.)
+    assert sj.map_cell_value("hello", "'hello") == "hello"
+    no_trailing = "'" + '"plate"'
+    with_trailing = "'" + '"plate"' + "'"
+    assert sj.map_cell_value("plate", no_trailing) == "plate"
+    assert sj.map_cell_value("plate", with_trailing) == "plate"
+    # user typed a number over a text cell, or text over a number cell
+    assert sj.map_cell_value("hello", "25") == 25
+    assert sj.map_cell_value(10, "'abc") == "abc"
+    # formula: whitespace-normalised so FreeCAD's pretty-print compares equal
+    assert sj.map_cell_value("=A1*2", "=A1 * 2") == "=A1*2"
+    assert sj.map_cell_value("=A1*2", "25") == 25
+    assert sj.map_cell_value(10, "=A1 * 2") == "=A1*2"
+    # a cleared cell has no spec representation
+    assert sj.map_cell_value(10, "") is sj.UNREADABLE
+    assert sj.map_cell_value(10, None) is sj.UNREADABLE
+
+
+def test_map_constraint_value_units_and_expressions():
+    assert sj.map_constraint_value("distance", 10, 25.0, None) == 25
+    # live angles read back in RADIANS; the spec takes degrees
+    assert sj.map_constraint_value("angle", 45, math.pi / 2, None) == 90
+    # a live expression binding wins over the literal, normalised
+    assert sj.map_constraint_value("distance", 10, 25.0, "width / 2") == "=width/2"
+    # unbound in the GUI: the datum number comes back
+    assert sj.map_constraint_value("distance", "=width", 25.0, None) == 25
+    assert sj.map_constraint_value("distance", 10, None, None) is sj.UNREADABLE
+
+
+def test_params_for_passes_assembly_payloads_through():
+    """Whitelisting keys used to strip an assemble step's mates, so a planned
+    assemble could never run; everything but routing/presentation passes."""
+    step = {
+        "operation": "assemble",
+        "description": "snap the plate on",
+        "mates": [{"obj": "A", "anchor": "com", "target": "B", "target_anchor": "com"}],
+        "tolerance": 0.2,
+    }
+    params = sj.params_for(step)
+    assert params["mates"] == step["mates"]
+    assert params["tolerance"] == 0.2
+    assert "operation" not in params and "description" not in params

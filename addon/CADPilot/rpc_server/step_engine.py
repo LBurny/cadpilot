@@ -41,7 +41,19 @@ from rpc_server.property_mapper import Object
 
 logger = dbglog.get_logger("journal")
 
-EXECUTABLE_OPS = {"create_object", "edit_object", "delete_object", "batch"} | set(FEATURE_TYPES)
+EXECUTABLE_OPS = {"create_object", "edit_object", "delete_object", "batch"} | set(
+    FEATURE_TYPES
+) | {
+    # The assembly toolchain used to journal with params={} and
+    # executable=False: rollback undid them (they own transactions), but a
+    # replay/rebuild SKIPPED them and the model came back unassembled, and
+    # their unrecoverable flag degraded every rebuild across them to
+    # "partial". They carry their full payload now and re-run for real.
+    "assemble",
+    "align_shapes",
+    "set_anchors",
+    "assembly",
+}
 
 
 # --- document property -------------------------------------------------------
@@ -120,6 +132,18 @@ class _EngineQuiet:
         global _ENGINE_ACTIVE
         _ENGINE_ACTIVE -= 1
         return False
+
+
+def engine_quiet() -> _EngineQuiet:
+    """Mute the manual-edit observer for machine-driven document writes.
+
+    The RPC layer wraps every mutation in this: a tool-driven change is
+    recorded as its OWN step, and letting it also bleed into an earlier step's
+    params through the observer made reject/replay inconsistent (reject the
+    edit step and the earlier step still carries its value). Only human edits
+    — the property panel, the sketcher, FreeCAD's Python console — may sync.
+    """
+    return _EngineQuiet()
 
 
 def undo_n(doc, n: int) -> dict[str, Any]:
@@ -264,6 +288,40 @@ def append_execute_code(
 # --- executing a record ------------------------------------------------------
 
 
+def downgrade_if_no_undo(doc, rec: sj.StepRecord | None, undo_before: int) -> bool:
+    """Reconcile a just-committed step with the undo stack.
+
+    An empty commit adds no undo entry — the op changed nothing (a read-only
+    assembly ``verify``, an edit that set the values the object already had).
+    A record that claims a transaction the stack does not have makes
+    ``plan_rollback`` pop an EARLIER step's transaction, so the record is
+    downgraded to read-only: no transaction, no mutation, no re-execution.
+    """
+    if rec is None:
+        return False
+    produced = True
+    with contextlib.suppress(Exception):
+        produced = doc.UndoCount > undo_before
+    if produced:
+        return False
+    records = read_journal(doc)
+    target = next((r for r in records if r.index == rec.index), None)
+    if target is None:
+        return False
+    target.atomic = False
+    target.mutated = False
+    target.executable = False
+    target.transaction = ""
+    with contextlib.suppress(Exception):
+        write_journal(doc, records)
+    logger.info(
+        "step %d (%s): commit produced no undo entry, marked read-only",
+        target.index,
+        target.operation,
+    )
+    return True
+
+
 def _normalize(res) -> dict[str, Any]:
     if res is True:
         return {"success": True}
@@ -299,6 +357,69 @@ def _execute_one(doc, operation: str, params: dict[str, Any]) -> dict[str, Any]:
         spec = {"type": operation, "base": params.get("obj_name"), **props}
         try:
             return {"success": True, "object_name": create_feature_gui(doc, spec).Name}
+        except Exception as e:
+            return {"success": False, "error": f"{type(e).__name__}: {e}"}
+    if operation == "set_anchors":
+        from rpc_server.assembly_ops import set_anchors
+
+        return _normalize(
+            set_anchors(
+                doc.Name,
+                str(params.get("obj_name") or ""),
+                params.get("anchors") or {},
+                bool(params.get("replace", False)),
+                str(params.get("coord_frame") or "local"),
+            )
+        )
+    if operation == "align_shapes":
+        from rpc_server.geometry_query import align_shapes
+
+        return _normalize(
+            align_shapes(
+                doc.Name,
+                params.get("obj_name"),
+                params.get("element"),
+                params.get("element_index"),
+                params.get("target_obj_name"),
+                params.get("target_element"),
+                params.get("target_element_index"),
+                params.get("mode", "touch"),
+                params.get("offset", 0.0),
+            )
+        )
+    if operation == "assemble":
+        from rpc_server.assembly_ops import assemble
+
+        # Strict on re-run: the original call may have committed a PARTIAL
+        # mate set (commit_if=passed>0), but replay must reproduce all of it —
+        # a silently half-assembled rebuild is worse than a failed step.
+        res = assemble(
+            doc.Name,
+            params.get("mates") or [],
+            float(params.get("tolerance", 0.1)),
+            bool(params.get("stop_on_error", True)),
+        )
+        if isinstance(res, dict) and res.get("success"):
+            return {"success": True}
+        return {
+            "success": False,
+            "error": (res.get("error") if isinstance(res, dict) else str(res))
+            or "assemble failed",
+        }
+    if operation == "assembly":
+        spec = params.get("spec") or {}
+        if not spec.get("operation"):
+            return {"success": False, "error": "assembly step has no recorded spec"}
+        from rpc_server.joint_ops import assembly_op
+
+        try:
+            res = assembly_op(doc, spec)
+            return {
+                "success": True,
+                "object_name": str(
+                    res.get("joint") or res.get("link") or res.get("assembly") or ""
+                ),
+            }
         except Exception as e:
             return {"success": False, "error": f"{type(e).__name__}: {e}"}
     if operation == "execute_code":
@@ -383,23 +504,24 @@ def run_record(doc, records: list[sj.StepRecord], rec: sj.StepRecord) -> dict[st
     doc.commitTransaction()
     with _EngineQuiet(), contextlib.suppress(Exception):
         doc.recompute()
-    # Self-correction for a re-run execute_code whose edited snippet stopped
-    # mutating: the commit produced no undo entry, so the record must stop
-    # claiming one — otherwise a later rollback would undo an EARLIER step's
-    # transaction off the plain stack. (A read-only run is never re-executable,
-    # so there is no path that upgrades in the other direction.)
-    if rec.operation == "execute_code":
-        produced = True
+    # Self-correction for a re-run whose op ended up changing nothing (an
+    # edited execute_code snippet, an edit that re-applied the same values):
+    # the commit produced no undo entry, so the record must stop claiming one —
+    # otherwise a later rollback would pop an EARLIER step's transaction off
+    # the plain stack. (There is no path that upgrades in the other direction.)
+    produced = True
+    with contextlib.suppress(Exception):
+        produced = doc.UndoCount > undo_before
+    if not produced and (rec.atomic or rec.transaction):
+        rec.atomic = False
+        rec.mutated = False
+        rec.executable = False
+        rec.transaction = ""
+        logger.info(
+            "step %d (%s): re-run changed nothing, downgraded", rec.index, rec.operation
+        )
         with contextlib.suppress(Exception):
-            produced = doc.UndoCount > undo_before
-        if not produced and (rec.atomic or rec.transaction):
-            rec.atomic = False
-            rec.mutated = False
-            rec.executable = False
-            rec.transaction = ""
-            logger.info("step %d (execute_code): re-run changed nothing, downgraded", rec.index)
-            with contextlib.suppress(Exception):
-                write_journal(doc, records)
+            write_journal(doc, records)
     return res
 
 
@@ -996,18 +1118,20 @@ def _reexecute(
 # --- manual-edit sync ----------------------------------------------------------
 #
 # Human/machine collaboration needs the journal to tell the truth about the
-# model: when the user corrects a dimension (or moves/rotates a part) in
-# FreeCAD's property panel, a later reexecute/replay must not silently revert
-# that correction. This observer mirrors GUI edits on objects a done step
-# produced back into that step's ``params["obj_properties"]``. Scope is
-# deliberately narrow: only scalar properties ALREADY present in the params
-# are synced (the spec's structure is never invented), plus the Placement of
-# create_object/edit_object steps (a reexecute re-applies obj_properties and
-# would otherwise teleport the part back to the origin). Engine-driven
-# changes are ignored: re-creation writes the same values the params already
-# hold (the diff check swallows them), while undo/redo/abort write RESTORED
-# values that must never be mirrored back (see _EngineQuiet above) — that
-# echo was how a rollback/reexecute silently reverted a manual correction.
+# model: when the user corrects a dimension (or moves a part, edits a
+# spreadsheet cell, rebinds an expression) in FreeCAD's GUI, a later
+# reexecute/replay must not silently revert that correction. This observer
+# mirrors GUI edits on objects a done step produced back into that step's
+# params. What syncs: scalars the spec already carries (create/edit_object),
+# the builder-known keys of every feature op (sj.FEATURE_SYNC — including
+# ones left at default, or replay reverts the edit), spreadsheet cells and
+# aliases (variables), dimensional constraint values and their expression
+# bindings (sketch), datum/sketch attachment offsets, the Placement of
+# create/edit steps, and the final pose of move-targeted objects (folded into
+# the last move step as an absolute placement). Machine-driven writes never
+# sync: engine windows (undo/redo/re-run) and every RPC-layer mutation run
+# under _EngineQuiet — a tool's change is its own step, and echoing it into
+# an earlier step's params made reject/replay inconsistent.
 
 _SYNC_EVENTS: list[dict[str, Any]] = []
 
@@ -1045,22 +1169,9 @@ def _same_scalar(a, b) -> bool:
     return a == b
 
 
-# Feature ops whose spec keys map onto a feature-object property (verified
-# against the builders in feature_ops.py): object property ->
-# params["obj_properties"] key. Richer values (edge selectors, links,
-# boolean tool compounds) are intentionally not synced. FreeCAD >= 1.1 moved
-# fillet/chamfer sizes off the scalar Radius/Size property into per-edge
-# Edges tuples, so both names are claimed (only the one that exists fires).
-_FEATURE_SYNC: dict[str, dict[str, str]] = {
-    "fillet": {"Radius": "radius", "Edges": "radius"},
-    "chamfer": {"Size": "size", "Edges": "size"},
-    "pad": {"Length": "length"},
-    "pocket": {"Length": "length"},
-    "revolution": {"Angle": "angle"},
-    "groove": {"Angle": "angle"},
-    "thickness": {"Value": "value"},
-    "draft": {"Angle": "angle"},
-}
+# Feature-op property -> spec-key mapping lives in step_journal (pure,
+# unit-tested): sj.FEATURE_SYNC, sj.tracked_objects, sj.map_cell_value,
+# sj.map_constraint_value. The engine keeps only the FreeCAD reads.
 
 
 def _uniform_edge_size(edges) -> int | float | None:
@@ -1128,45 +1239,6 @@ def _placement_brief(d) -> str:
     return f"pos({pos}) rot {_num(rot.get('Angle', 0))}deg@({ax})"
 
 
-def _tracked_objects(records) -> dict[str, dict[str, tuple[int, str]]]:
-    """object name -> {object property -> (step index, params key)}.
-
-    Later done steps win per property, so a sync lands on the step that last
-    decided that property. Placement is claimed by create_object/edit_object
-    unless a ``move`` step targets the object: a move is a RELATIVE change,
-    so it must keep owning the final pose (an absolute create-time Placement
-    plus the relative move would double-apply on reexecute).
-    """
-    moved = {str(r.params.get("obj_name") or "") for r in records if r.operation == "move"}
-    tracked: dict[str, dict[str, tuple[int, str]]] = {}
-    for rec in records:
-        if rec.state != sj.STATE_DONE:
-            continue
-        props = rec.params.get("obj_properties") or {}
-        if rec.operation in ("create_object", "edit_object"):
-            claims = {k: k for k, v in props.items() if isinstance(v, (int, float, str, bool))}
-            if rec.operation == "create_object":
-                names = set(rec.objects_after) - set(rec.objects_before)
-            else:
-                names = {str(rec.params.get("obj_name") or "")}
-        else:
-            claims = {
-                prop: key
-                for prop, key in _FEATURE_SYNC.get(rec.operation, {}).items()
-                if key in props
-            }
-            names = set(rec.objects_after) - set(rec.objects_before)
-        for name in names:
-            if not name:
-                continue
-            entry = tracked.setdefault(name, {})
-            for prop, key in claims.items():
-                entry[prop] = (rec.index, key)
-            if rec.operation in ("create_object", "edit_object") and name not in moved:
-                entry["Placement"] = (rec.index, "Placement")
-    return tracked
-
-
 class _JournalSyncObserver:
     def __init__(self):
         self._cache: dict[str, tuple[str, dict]] = {}
@@ -1174,8 +1246,9 @@ class _JournalSyncObserver:
 
     def slotChangedObject(self, obj, prop):
         # _writing guards the observer's own journal write; _ENGINE_ACTIVE
-        # mutes engine-driven windows (undo/redo/re-run), whose property
-        # writes are restored or already-recorded values, not manual edits.
+        # mutes machine-driven windows (engine undo/redo/re-run, and every
+        # RPC-layer mutation — a tool's change is its own step, and letting it
+        # bleed into an earlier step's params made reject/replay inconsistent).
         if self._writing or _ENGINE_ACTIVE:
             return
         # An observer must never break the host's edit.
@@ -1191,51 +1264,183 @@ class _JournalSyncObserver:
             return
         cached = self._cache.get(doc.Name)
         if cached is None or cached[0] != text:
-            cached = (text, _tracked_objects(sj.from_json(text)))
+            cached = (text, sj.tracked_objects(sj.from_json(text)))
             self._cache[doc.Name] = cached
-        hit = cached[1].get(getattr(obj, "Name", ""), {}).get(prop)
+        entry = cached[1].get(getattr(obj, "Name", ""))
+        if entry is None:
+            return
+        # The value compare inside each handler makes repeat firings (a cell
+        # edit fires both 'cells' and the address) no-ops, so trigger wide.
+        if entry.get("sheet") is not None:
+            self._sync_cells(obj, doc, sj.from_json(text), entry["sheet"])
+            return
+        if entry.get("sketch") is not None and prop == "Constraints":
+            self._sync_constraints(obj, doc, sj.from_json(text), entry["sketch"])
+            return
+        hit = entry["props"].get(prop)
         if hit is None:
+            # A move-owned object's pose belongs to its LAST move step.
+            if prop == "Placement" and entry.get("move") is not None:
+                self._sync_move_fold(obj, doc, sj.from_json(text), entry["move"])
+            return
+        records = sj.from_json(text)
+        rec = next((r for r in records if r.index == hit[0]), None)
+        if rec is None:
             return
         if prop == "Placement":
-            value, same, brief = _placement_json(obj.Placement), _same_placement, _placement_brief
+            value, same, brief = (
+                _placement_json(obj.Placement),
+                _same_placement,
+                _placement_brief,
+            )
         elif prop == "Edges":
             value = _uniform_edge_size(getattr(obj, prop, None))
             if value is None:
                 return
             same, brief = _same_scalar, repr
-        else:
-            value = _json_scalar(getattr(obj, prop, None))
-            if value is None:
+        elif prop == "AttachmentOffset":
+            # Only a pure-z translation maps onto the spec's scalar offset; a
+            # rotated/shifted attachment has no spec representation.
+            pl = getattr(obj, prop, None)
+            base, rot = getattr(pl, "Base", None), getattr(pl, "Rotation", None)
+            if base is None or rot is None:
                 return
+            if abs(base.x) > 1e-9 or abs(base.y) > 1e-9 or abs(rot.Angle) > 1e-9:
+                return
+            value, same, brief = _num(base.z), _same_scalar, repr
+        else:
+            # An expression binding wins over the literal value, in both
+            # directions: binding in the GUI stores "=expr" (the builder
+            # re-binds it on re-run), unbinding stores the number it fell
+            # back to.
+            exprs = dict(getattr(obj, "ExpressionEngine", None) or [])
+            expr = exprs.get(prop)
+            if expr:
+                value = "=" + "".join(str(expr).split())
+            else:
+                value = _json_scalar(getattr(obj, prop, None))
+                if value is None:
+                    return
             same, brief = _same_scalar, repr
-        records = sj.from_json(text)
-        rec = next((r for r in records if r.index == hit[0]), None)
-        if rec is None:
-            return
-        current = (rec.params.get("obj_properties") or {}).get(hit[1])
+        props = rec.params.setdefault("obj_properties", {})
+        current = props.get(hit[1])
         if same(current, value):
             return
-        rec.params["obj_properties"][hit[1]] = value
+        props[hit[1]] = value
+        self._commit_sync(doc, records, rec.index, f"{obj.Name}.{prop}", brief(current), brief(value))
+
+    def _sync_cells(self, obj, doc, records, index: int) -> None:
+        """Mirror spreadsheet cell edits (values, formulas, aliases) into the
+        owning variables step's ``cells`` spec."""
+        rec = next((r for r in records if r.index == index), None)
+        if rec is None:
+            return
+        cells = (rec.params.get("obj_properties") or {}).get("cells")
+        if not isinstance(cells, dict) or not cells:
+            return
+        changed = 0
+        for cell, cell_entry in cells.items():
+            if not (isinstance(cell_entry, list) and len(cell_entry) == 2):
+                continue
+            alias, old = cell_entry
+            try:
+                live_contents = obj.getContents(cell)
+            except Exception:
+                continue  # the cell was deleted by hand — leave the spec as-is
+            new = sj.map_cell_value(old, live_contents)
+            if new is not sj.UNREADABLE and not _same_scalar(old, new):
+                cell_entry[1] = new
+                changed += 1
+            try:
+                live_alias = obj.getAlias(cell) or ""
+            except Exception:
+                live_alias = alias
+            if live_alias and live_alias != alias:
+                cell_entry[0] = live_alias
+                changed += 1
+        if not changed:
+            return
+        self._commit_sync(
+            doc, records, index, f"{obj.Name}.cells", "-", f"{changed} cell field(s)"
+        )
+
+    def _sync_constraints(self, obj, doc, records, index: int) -> None:
+        """Mirror dimensional-constraint edits into the owning sketch step.
+
+        The spec's constraint list maps to the live sketch BY INDEX, so the
+        whole sketch is skipped the moment the sequences diverge (a constraint
+        added or removed by hand shifts every later index — there is no safe
+        partial mapping).
+        """
+        rec = next((r for r in records if r.index == index), None)
+        if rec is None:
+            return
+        pcons = (rec.params.get("obj_properties") or {}).get("constraints")
+        if not isinstance(pcons, list) or not pcons:
+            return
+        live = list(getattr(obj, "Constraints", None) or [])
+        if len(live) != len(pcons):
+            return
+        exprs = dict(getattr(obj, "ExpressionEngine", None) or [])
+        updates = []
+        for i, pc in enumerate(pcons):
+            if not isinstance(pc, dict):
+                return
+            ctype = str(pc.get("type") or "")
+            if sj.CONSTRAINT_TYPE_MAP.get(ctype) != getattr(live[i], "Type", None):
+                return
+            if ctype not in sj.DIMENSIONAL_CONSTRAINTS or "value" not in pc:
+                continue
+            expr = exprs.get(f"Constraints[{i}]")
+            new = sj.map_constraint_value(
+                ctype, pc.get("value"), getattr(live[i], "Value", None), expr
+            )
+            if new is sj.UNREADABLE:
+                continue
+            if not _same_scalar(pc.get("value"), new):
+                updates.append((i, new))
+        if not updates:
+            return
+        for i, new in updates:
+            pcons[i]["value"] = new
+        self._commit_sync(
+            doc, records, index, f"{obj.Name}.Constraints", "-", f"{len(updates)} value(s)"
+        )
+
+    def _sync_move_fold(self, obj, doc, records, index: int) -> None:
+        """Fold a manual drag of a move-owned object into its last move step.
+
+        A move is RELATIVE, so the drag cannot be expressed against it — the
+        step's obj_properties become an absolute placement override instead
+        (the builder's placement wins over translate/rotate on re-run), which
+        reproduces the current pose no matter what came before the move.
+        """
+        rec = next((r for r in records if r.index == index), None)
+        if rec is None or rec.operation != "move":
+            return
+        value = _placement_json(obj.Placement)
+        current = (rec.params.get("obj_properties") or {}).get("placement")
+        if _same_placement(current, value):
+            return
+        rec.params["obj_properties"] = {"placement": value}
+        self._commit_sync(
+            doc,
+            records,
+            index,
+            f"{obj.Name}.Placement",
+            _placement_brief(current),
+            _placement_brief(value),
+        )
+
+    def _commit_sync(self, doc, records, index: int, what: str, old: str, new: str) -> None:
         self._writing = True
         try:
             write_journal(doc, records)
         finally:
             self._writing = False
-        logger.info(
-            "journal sync: step %d %s.%s = %s (manual edit)",
-            rec.index,
-            obj.Name,
-            prop,
-            brief(value),
-        )
+        logger.info("journal sync: step %d %s = %s (manual edit)", index, what, new)
         _SYNC_EVENTS.append(
-            {
-                "doc": doc.Name,
-                "index": rec.index,
-                "prop": prop,
-                "old": brief(current),
-                "new": brief(value),
-            }
+            {"doc": doc.Name, "index": index, "prop": what, "old": old, "new": new}
         )
         del _SYNC_EVENTS[:-50]
 

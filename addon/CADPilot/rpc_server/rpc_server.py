@@ -154,7 +154,11 @@ class FreeCADRPC:
         The record is written INSIDE the transaction so it commits with the
         model change — but note that it is NOT reverted by ``doc.undo()``
         (FreeCAD does not undo document-level properties); step_engine
-        reconciles the log explicitly on rollback.
+        reconciles the log explicitly on rollback. After the commit the record
+        is probed against the undo stack: an empty commit added no undo entry,
+        so the record is downgraded to read-only (a transaction claim without
+        a matching undo entry would make plan_rollback pop an EARLIER step's
+        transaction).
         """
         tmp_path = _make_tmp_png() if screenshot is not None else None
 
@@ -172,9 +176,16 @@ class FreeCADRPC:
                         in_transaction = True
                     except Exception as e:
                         FreeCAD.Console.PrintWarning(f"CADPilot: cannot open transaction: {e}\n")
+            undo_before = 0
+            if in_transaction:
+                with contextlib.suppress(Exception):
+                    undo_before = doc.UndoCount
             objects_before = sorted(o.Name for o in doc.Objects) if doc is not None else []
             try:
-                res = gui_fn()
+                # Machine-driven writes stay silent for the manual-edit sync
+                # observer: this op's change is its own journal step.
+                with step_engine.engine_quiet():
+                    res = gui_fn()
             except Exception:
                 if in_transaction:
                     doc.abortTransaction()
@@ -185,8 +196,9 @@ class FreeCADRPC:
             if in_transaction:
                 if should_commit:
                     objects = sorted(o.Name for o in doc.Objects) if doc is not None else []
+                    rec = None
                     if journal and doc is not None:
-                        step_engine.record_commit(
+                        rec = step_engine.record_commit(
                             doc,
                             operation=journal.get("operation", "unknown"),
                             label=journal.get("label", ""),
@@ -198,6 +210,7 @@ class FreeCADRPC:
                             objects_after=objects,
                         )
                     doc.commitTransaction()
+                    step_engine.downgrade_if_no_undo(doc, rec, undo_before)
                     dbglog.get_logger("tx").info("committed transaction %r", transaction)
                 else:
                     doc.abortTransaction()
@@ -353,7 +366,11 @@ class FreeCADRPC:
             journal={
                 "operation": "assembly",
                 "label": f"assembly {spec.get('operation', 'op')}",
-                "params": {},
+                # The full spec is the replay payload: start/add_component/
+                # mate/solve/unmate/rollback_step are all data-driven and
+                # re-runnable; a read-only verify is downgraded by the
+                # empty-commit probe in _run_op_with_screenshot.
+                "params": {"spec": spec},
             },
         )
 
@@ -693,7 +710,16 @@ class FreeCADRPC:
             journal={
                 "operation": "align_shapes",
                 "label": f"align '{obj_name}' -> '{target_obj_name}'",
-                "params": {},
+                "params": {
+                    "obj_name": obj_name,
+                    "element": element,
+                    "element_index": element_index,
+                    "target_obj_name": target_obj_name,
+                    "target_element": target_element,
+                    "target_element_index": target_element_index,
+                    "mode": mode,
+                    "offset": offset,
+                },
             },
         )
 
@@ -723,7 +749,12 @@ class FreeCADRPC:
             journal={
                 "operation": "set_anchors",
                 "label": f"anchors on '{obj_name}'",
-                "params": {},
+                "params": {
+                    "obj_name": obj_name,
+                    "anchors": anchors,
+                    "replace": replace,
+                    "coord_frame": coord_frame,
+                },
             },
         )
 
@@ -744,7 +775,11 @@ class FreeCADRPC:
             journal={
                 "operation": "assemble",
                 "label": f"assemble {len(mates)} mate(s)",
-                "params": {},
+                "params": {
+                    "mates": mates,
+                    "tolerance": tolerance,
+                    "stop_on_error": stop_on_error,
+                },
             },
         )
 
@@ -927,7 +962,10 @@ class FreeCADRPC:
             if wrapped:
                 doc.openTransaction("CADPilot: execute_code")
             try:
-                exec_snippet(code, output_buffer)
+                # Muted like every RPC mutation: the snippet's change is its
+                # own journal step, not a manual edit on an earlier one.
+                with step_engine.engine_quiet():
+                    exec_snippet(code, output_buffer)
             except BaseException:
                 # A failing snippet must not leave half-applied mutations.
                 if wrapped:

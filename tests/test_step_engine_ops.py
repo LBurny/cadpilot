@@ -189,3 +189,105 @@ def test_manual_edit_sync_ignores_engine_windows():
             f"{fname} must run its document writes inside _EngineQuiet, or undo echoes "
             "clobber the synced params"
         )
+
+
+_RPC = ast.parse((_ADDON / "rpc_server" / "rpc_server.py").read_text(encoding="utf-8"))
+
+ASSEMBLY_JOURNAL_OPS = {"assemble", "align_shapes", "set_anchors", "assembly"}
+
+
+def test_assembly_ops_are_executable_and_recorded_with_payloads():
+    """Assemble/align/anchors/assembly steps used to journal with params={} and
+    executable=False: rollback undid them (they own transactions) but a
+    replay/rebuild SKIPPED them and the model came back unassembled, and their
+    unrecoverable flag degraded every rebuild across them to "partial". They
+    must be executable and carry their full payload."""
+    # engine side: executable + an executor branch each
+    assign = next(
+        n
+        for n in ast.walk(_ENGINE)
+        if isinstance(n, ast.Assign)
+        and any(getattr(t, "id", "") == "EXECUTABLE_OPS" for t in n.targets)
+    )
+    ops = {
+        n.value
+        for n in ast.walk(assign.value)
+        if isinstance(n, ast.Constant) and isinstance(n.value, str)
+    }
+    assert ASSEMBLY_JOURNAL_OPS <= ops
+    func = next(
+        n
+        for n in ast.walk(_ENGINE)
+        if isinstance(n, ast.FunctionDef) and n.name == "_execute_one"
+    )
+    handled = {
+        n.value
+        for cmp in ast.walk(func)
+        if isinstance(cmp, ast.Compare)
+        for n in [cmp.left, *cmp.comparators]
+        if isinstance(n, ast.Constant) and isinstance(n.value, str)
+    }
+    assert ASSEMBLY_JOURNAL_OPS <= handled
+    # RPC side: every one of the four handlers journals a NON-EMPTY params dict
+    for handler in ("assemble", "align_shapes", "set_anchors", "assembly_op"):
+        func = next(
+            (n
+             for n in ast.walk(_RPC)
+             if isinstance(n, ast.FunctionDef) and n.name == handler),
+            None,
+        )
+        assert func is not None, f"no RPC handler {handler}"
+        empties = [
+            d
+            for f in (func,)
+            for d in ast.walk(f)
+            if isinstance(d, ast.Dict)
+            and any(
+                isinstance(k, ast.Constant) and k.value == "params" for k in d.keys
+            )
+            and any(
+                isinstance(v, ast.Dict) and not v.keys for v in d.values
+            )
+        ]
+        assert not empties, f"{handler} still journals params={{}} (not replayable)"
+
+
+def test_empty_commit_is_downgraded_to_read_only():
+    """A committed op that produced no undo entry (a read-only assembly verify,
+    an edit that set the values the object already had) must not keep claiming
+    a transaction — plan_rollback counts r.transaction, and a phantom claim
+    pops an EARLIER step's transaction off the plain undo stack."""
+    func = next(
+        n
+        for n in ast.walk(_RPC)
+        if isinstance(n, ast.FunctionDef) and n.name == "_run_op_with_screenshot"
+    )
+    attrs = {n.attr for n in ast.walk(func) if isinstance(n, ast.Attribute)}
+    assert "downgrade_if_no_undo" in attrs
+    assert "UndoCount" in attrs, "the probe compares the undo count around the commit"
+
+
+def test_rpc_mutations_are_muted_from_the_sync_observer():
+    """Machine-driven writes must not echo into earlier steps' params: the
+    observer mirrors them and a later reject/replay then disagrees with
+    history. Only human GUI edits sync."""
+    run_op = next(
+        n
+        for n in ast.walk(_RPC)
+        if isinstance(n, ast.FunctionDef) and n.name == "_run_op_with_screenshot"
+    )
+    assert any(
+        isinstance(n, ast.With)
+        and any("engine_quiet" in ast.unparse(i.context_expr) for i in n.items)
+        for n in ast.walk(run_op)
+    ), "_run_op_with_screenshot must run gui_fn inside engine_quiet()"
+    execute_code = next(
+        n
+        for n in ast.walk(_RPC)
+        if isinstance(n, ast.FunctionDef) and n.name == "execute_code"
+    )
+    assert any(
+        isinstance(n, ast.With)
+        and any("engine_quiet" in ast.unparse(i.context_expr) for i in n.items)
+        for n in ast.walk(execute_code)
+    ), "execute_code must run the snippet inside engine_quiet()"

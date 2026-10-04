@@ -226,6 +226,26 @@ def _solve_converged(doc, asm) -> None:
     doc.recompute()
 
 
+def _settle_shapes(doc, asm) -> None:
+    """Re-derive lazy shape caches INSIDE the current transaction.
+
+    AssemblyObject.Shape (and the App::Link composites) rebuild lazily on
+    first access, not on recompute — after a mate/solve moved links, the next
+    transaction to READ that Shape (typically a read-only ``verify``/audit)
+    absorbs the rebuild write and earns a phantom undo entry, making a
+    read-only step claim a transaction (live-verified: verify right after a
+    mate produced UndoCount +1; the second verify did not). Reading the
+    caches here charges the rebuild to the op that actually caused it; the
+    reads cost nothing when the cache is already valid.
+    """
+    with contextlib.suppress(Exception):
+        asm.Shape
+    for obj in doc.Objects:
+        if obj.TypeId == "App::Link":
+            with contextlib.suppress(Exception):
+                obj.Shape
+
+
 # ---------------------------------------------------------------- operations
 
 
@@ -241,6 +261,7 @@ def _op_start(doc, spec: dict) -> dict:
     JointObject.GroundedJoint(ground, link)
     JointObject.ViewProviderGroundedJoint(ground.ViewObject)
     doc.recompute()
+    _settle_shapes(doc, asm)
     return {"assembly": asm.Name, "joint_group": jg.Name, "ground_link": link.Name}
 
 
@@ -248,6 +269,7 @@ def _op_add_component(doc, spec: dict) -> dict:
     asm = _get_assembly(doc)
     link = _wrap_link(doc, asm, spec["part"])
     doc.recompute()
+    _settle_shapes(doc, asm)
     return {"link": link.Name, "placement": _placement_to_dict(link.Placement)}
 
 
@@ -359,12 +381,14 @@ def _op_mate(doc, spec: dict) -> dict:
             res["warnings"] = res["warnings"] + [
                 f"trim requested but '{inserted}' and '{base}' overlap by less than 1 mm³ — nothing trimmed"
             ]
+    _settle_shapes(doc, asm)
     return res
 
 
 def _op_solve(doc, _spec: dict) -> dict:
     asm = _get_assembly(doc)
     _solve_converged(doc, asm)
+    _settle_shapes(doc, asm)
     return {
         "joints": [
             {
@@ -379,17 +403,18 @@ def _op_solve(doc, _spec: dict) -> dict:
 
 
 def _op_unmate(doc, spec: dict) -> dict:
-    _get_assembly(doc)
+    asm = _get_assembly(doc)
     j = doc.getObject(spec["joint"])
     if j is None:
         raise ValueError(f"joint {spec['joint']!r} not found")
     doc.removeObject(j.Name)
     doc.recompute()
+    _settle_shapes(doc, asm)
     return {"deleted": spec["joint"]}
 
 
 def _op_rollback_step(doc, spec: dict) -> dict:
-    _get_assembly(doc)
+    asm = _get_assembly(doc)
     for name in spec.get("joints_to_delete", []):
         obj = doc.getObject(name)
         if obj is not None:
@@ -422,6 +447,7 @@ def _op_rollback_step(doc, spec: dict) -> dict:
                     part.ViewObject.Visibility = True
             doc.removeObject(link_name)
     doc.recompute()
+    _settle_shapes(doc, asm)
     return {"done": True}
 
 

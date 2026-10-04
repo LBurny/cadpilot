@@ -8,11 +8,16 @@ Why a journal at all: the MCP-side modeling session (``session_state.py``)
 logs steps for the LLM, but it lives in the MCP process and only exists while
 a session is active. The panel must work in FreeCAD's own process, with the
 RPC server stopped, so the addon keeps its own copy on the document.
+
+Manual-edit sync lives half here, half in the engine: this module owns the
+pure mapping decisions (which object/step owns a property, what a live value
+maps back to), the engine's document observer owns the FreeCAD reads.
 """
 
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any
@@ -141,12 +146,18 @@ def describe_step(step: dict[str, Any]) -> str:
 
 
 def params_for(step: dict[str, Any]) -> dict[str, Any]:
-    """The exact payload ``step_engine.execute_record`` needs to re-run a step."""
+    """The exact payload ``step_engine.execute_record`` needs to re-run a step.
+
+    Everything except routing/presentation keys passes through: create/edit use
+    ``obj_name``/``obj_type``/``obj_properties``, batches use ``ops``, and the
+    assembly ops carry their own payloads (``mates``, ``anchors``, ``spec``, …).
+    Whitelisting keys here used to silently strip an assemble step's mates, so
+    a planned assemble could never run.
+    """
     return {
-        "obj_name": step.get("obj_name"),
-        "obj_type": step.get("obj_type"),
-        "obj_properties": step.get("obj_properties") or {},
-        "ops": step.get("ops") or [],
+        k: v
+        for k, v in step.items()
+        if k not in ("operation", "action", "description", "label")
     }
 
 
@@ -458,3 +469,197 @@ def rewind(records: list[StepRecord], count: int) -> list[StepRecord]:
         rec.transaction = ""
         rec.error = ""
     return back
+
+
+# --- manual-edit sync (pure half) ---------------------------------------------
+#
+# The engine's document observer mirrors GUI edits on objects a done step
+# produced back into that step's params, so a later reexecute/replay does not
+# silently revert a human correction. Everything decidable without FreeCAD
+# lives here: which object/step owns which property (tracked_objects), and
+# what a live value maps back to (map_cell_value / map_constraint_value).
+
+# Feature op -> {object property: spec key}. Only properties the builder
+# actually consumes are mapped, so a synced value is always a valid spec key —
+# including ones the caller did not pass originally (a pad built with the
+# default length must still pick up a GUI Length edit, or replay reverts it).
+# Richer values (edge selectors, links, boolean tool compounds) stay unsynced.
+# FreeCAD >= 1.1 moved Part-level fillet/chamfer sizes into per-edge Edges
+# tuples, so both names are claimed (only the one that exists fires).
+FEATURE_SYNC: dict[str, dict[str, str]] = {
+    "fillet": {"Radius": "radius", "Edges": "radius"},
+    "chamfer": {"Size": "size", "Edges": "size"},
+    "pad": {"Length": "length", "Reversed": "reversed", "Midplane": "midplane"},
+    "pocket": {"Length": "length", "Reversed": "reversed", "Midplane": "midplane"},
+    "revolution": {"Angle": "angle", "Reversed": "reversed"},
+    "groove": {"Angle": "angle", "Reversed": "reversed"},
+    "thickness": {"Value": "value", "Reversed": "reversed"},
+    "draft": {"Angle": "angle"},
+    "loft": {"Solid": "solid", "Ruled": "ruled"},
+    "sweep": {"Solid": "solid"},
+    # A datum plane / attached sketch offset is a pure-z AttachmentOffset;
+    # the engine reader refuses anything more general (rotation, x/y shift).
+    "datum_plane": {"AttachmentOffset": "offset"},
+    "sketch": {"AttachmentOffset": "offset"},
+}
+
+# Ops whose obj_name names the object they CREATE (not a base), so the object
+# is tracked by name even when the before/after diff is empty (an idempotent
+# variables re-run creates nothing, and without this its sheet never syncs).
+NEW_OBJECT_OPS = {"variables", "sketch", "datum_plane", "hull"}
+
+# Spec constraint type -> live Sketcher.Constraint.Type. Used to verify that
+# the live constraint sequence still lines up with the spec by index before
+# any value is synced (a hand-added constraint shifts indices — then nothing
+# is synced).
+CONSTRAINT_TYPE_MAP = {
+    "coincident": "Coincident",
+    "horizontal": "Horizontal",
+    "vertical": "Vertical",
+    "tangent": "Tangent",
+    "perpendicular": "Perpendicular",
+    "parallel": "Parallel",
+    "equal": "Equal",
+    "symmetric": "Symmetric",
+    "distance": "Distance",
+    "distance_x": "DistanceX",
+    "distance_y": "DistanceY",
+    "radius": "Radius",
+    "angle": "Angle",
+}
+
+DIMENSIONAL_CONSTRAINTS = ("distance", "distance_x", "distance_y", "radius", "angle")
+
+#: map_cell_value / map_constraint_value return this when the live state has
+#: no safe spec representation (the params are left untouched).
+UNREADABLE = object()
+
+
+def _num(value: float) -> int | float:
+    f = float(value)
+    return int(f) if f.is_integer() else f
+
+
+def tracked_objects(records: list[StepRecord]) -> dict[str, dict[str, Any]]:
+    """object name -> sync handlers, from done steps.
+
+    Entry keys:
+      ``props``  — {object property: (step index, params key)}. Later done
+                   steps win per property, so a sync lands on the step that
+                   last decided it. create/edit_object also claim Placement —
+                   unless a move step targets the object, because a move is
+                   relative and an absolute create-time Placement plus the
+                   move would double-apply on reexecute.
+      ``sheet``  — index of the variables step owning the spreadsheet.
+      ``sketch`` — index of the sketch step owning the sketch.
+      ``move``   — index of the LAST done move step targeting the object.
+                   A manual drag folds into it as an absolute placement
+                   override (placement wins over translate/rotate on re-run),
+                   which reproduces the pose no matter what came before it.
+    """
+    last_move: dict[str, int] = {}
+    for r in records:
+        if r.state == STATE_DONE and r.operation == "move":
+            name = str((r.params or {}).get("obj_name") or "")
+            if name:
+                last_move[name] = r.index
+
+    tracked: dict[str, dict[str, Any]] = {}
+    for rec in records:
+        if rec.state != STATE_DONE:
+            continue
+        params = rec.params or {}
+        props = params.get("obj_properties") or {}
+        op = rec.operation
+        if op in ("create_object", "edit_object"):
+            claims = {k: k for k, v in props.items() if isinstance(v, (int, float, str, bool))}
+            if op == "create_object":
+                names = set(rec.objects_after) - set(rec.objects_before)
+            else:
+                names = {str(params.get("obj_name") or "")}
+        else:
+            claims = dict(FEATURE_SYNC.get(op, {}))
+            names = set(rec.objects_after) - set(rec.objects_before)
+            if op in NEW_OBJECT_OPS:
+                names |= {str(params.get("obj_name") or "")}
+        for name in names:
+            if not name:
+                continue
+            entry = tracked.setdefault(
+                name, {"props": {}, "sheet": None, "sketch": None, "move": None}
+            )
+            for prop, key in claims.items():
+                entry["props"][prop] = (rec.index, key)
+            if op in ("create_object", "edit_object") and name not in last_move:
+                entry["props"]["Placement"] = (rec.index, "Placement")
+            # The sheet/sketch handlers belong to the object the step NAMES —
+            # the diff can also hold incidental creations (a sketch's Body),
+            # which must not answer constraint/cell lookups.
+            if name == str(params.get("obj_name") or ""):
+                if op == "variables":
+                    entry["sheet"] = rec.index
+                elif op == "sketch":
+                    entry["sketch"] = rec.index
+
+    for name, idx in last_move.items():
+        entry = tracked.setdefault(name, {"props": {}, "sheet": None, "sketch": None, "move": None})
+        entry["move"] = idx
+        entry["props"].pop("Placement", None)
+    return tracked
+
+
+def map_cell_value(old: Any, live_contents: Any) -> Any:
+    """A variables-cell's synced value from the raw cell content.
+
+    ``Sheet.get(cell)`` returns the COMPUTED value, which is stale when the
+    change event fires (the recompute has not run yet) — live-verified: at
+    event time get() still held the previous value while getContents() was
+    already fresh. So only ``Sheet.getContents(cell)`` is read, whose 1.1.4
+    conventions were measured live (ordinals, not reprs):
+
+    * ``=A1 * 2``   — formula: stored whitespace-normalised (FreeCAD
+                      pretty-prints on read, and without normalising every
+                      read of a compactly written spec looks like an edit);
+    * ``'...``      — text: a LEADING apostrophe marks a text cell
+                      (Excel-style; a trailing one is optional). The builder
+                      quotes text values, and the quotes persist in the cell
+                      text, so one surrounding double-quote pair is stripped
+                      too (the spec stores the bare text);
+    * ``25``        — number.
+    Returns UNREADABLE when the content cannot be read back safely.
+    """
+    if not isinstance(live_contents, str):
+        return UNREADABLE
+    c = live_contents.strip()
+    if not c:
+        return UNREADABLE  # a cleared cell has no spec representation
+    if c.startswith("="):
+        return "=" + "".join(c[1:].split())
+    if c.startswith("'"):
+        text = c[1:].removesuffix("'")
+        if len(text) >= 2 and text.startswith('"') and text.endswith('"'):
+            text = text[1:-1]
+        return text
+    try:
+        return _num(float(c))
+    except ValueError:
+        return UNREADABLE
+
+
+def map_constraint_value(ctype: str, old: Any, live_value: Any, live_expr: str | None) -> Any:
+    """A dimensional sketch constraint's synced value.
+
+    ``live_value`` reads back in RADIANS for angle constraints (the spec takes
+    degrees — same asymmetry as FreeCAD.Rotation). A live expression binding
+    wins over the literal in both directions: binding in the GUI turns the
+    spec value into ``=expr``, unbinding turns it back into the datum number.
+    """
+    if live_expr:
+        return "=" + "".join(str(live_expr).split())
+    try:
+        value = float(live_value)
+    except (TypeError, ValueError):
+        return UNREADABLE
+    if ctype == "angle":
+        value = math.degrees(value)
+    return _num(value)
