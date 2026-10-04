@@ -32,26 +32,20 @@ def _audit_with_islands():
 
 def test_committed_mutation_appends_island_warning(fake_freecad):
     fake_freecad.result_overrides["verify_assembly"] = _audit_with_islands()
-    resp = cad_operation(
-        fake_freecad, False, "create_object", "Doc", obj_type="Part::Box", obj_name="Box"
-    )
+    resp = cad_operation(fake_freecad, "create_object", "Doc", obj_type="Part::Box", obj_name="Box")
     assert "island" in _text(resp).lower()
     assert "Spoke_0" in _text(resp)
     assert fake_freecad.called_methods() == ["create_object", "verify_assembly"]
 
 
 def test_no_islands_no_warning(fake_freecad):
-    resp = cad_operation(
-        fake_freecad, False, "create_object", "Doc", obj_type="Part::Box", obj_name="Box"
-    )
+    resp = cad_operation(fake_freecad, "create_object", "Doc", obj_type="Part::Box", obj_name="Box")
     assert "island" not in _text(resp).lower()
 
 
 def test_old_addon_without_islands_key_is_silent(fake_freecad):
     fake_freecad.result_overrides["verify_assembly"] = {"success": True, "object_count": 3}
-    resp = cad_operation(
-        fake_freecad, False, "create_object", "Doc", obj_type="Part::Box", obj_name="Box"
-    )
+    resp = cad_operation(fake_freecad, "create_object", "Doc", obj_type="Part::Box", obj_name="Box")
     assert "created successfully" in _text(resp)
     assert "island" not in _text(resp).lower()
 
@@ -59,7 +53,6 @@ def test_old_addon_without_islands_key_is_silent(fake_freecad):
 def test_auto_audit_disabled_skips_rpc(fake_freecad):
     resp = cad_operation(
         fake_freecad,
-        False,
         "create_object",
         "Doc",
         obj_type="Part::Box",
@@ -72,15 +65,13 @@ def test_auto_audit_disabled_skips_rpc(fake_freecad):
 
 def test_failed_mutation_skips_audit(fake_freecad):
     fake_freecad.result_overrides["create_object"] = {"success": False, "error": "boom"}
-    cad_operation(fake_freecad, False, "create_object", "Doc", obj_type="Part::Box", obj_name="Box")
+    cad_operation(fake_freecad, "create_object", "Doc", obj_type="Part::Box", obj_name="Box")
     assert "verify_assembly" not in fake_freecad.called_methods()
 
 
 def test_audit_error_does_not_break_mutation(fake_freecad):
     fake_freecad.errors["verify_assembly"] = RuntimeError("rpc down")
-    resp = cad_operation(
-        fake_freecad, False, "create_object", "Doc", obj_type="Part::Box", obj_name="Box"
-    )
+    resp = cad_operation(fake_freecad, "create_object", "Doc", obj_type="Part::Box", obj_name="Box")
     assert "created successfully" in _text(resp)
 
 
@@ -91,9 +82,7 @@ def test_large_document_skips_audit(fake_freecad):
         "islands": [{"objects": ["A"], "size": 1, "gap_mm": 3.0, "nearest_main": "B"}],
         "summary": {"island_count": 1},
     }
-    resp = cad_operation(
-        fake_freecad, False, "create_object", "Doc", obj_type="Part::Box", obj_name="Box"
-    )
+    resp = cad_operation(fake_freecad, "create_object", "Doc", obj_type="Part::Box", obj_name="Box")
     assert "island" not in _text(resp).lower()
 
 

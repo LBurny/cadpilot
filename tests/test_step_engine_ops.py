@@ -185,6 +185,20 @@ def test_manual_edit_sync_ignores_engine_windows():
         func = next(
             n for n in ast.walk(_ENGINE) if isinstance(n, ast.FunctionDef) and n.name == fname
         )
+        # run_record is a thin wrapper now (activate the document, then
+        # delegate); the writes live in the function it calls.
+        for stmt in func.body:
+            if not isinstance(stmt, ast.With):
+                continue
+            for sub in stmt.body:
+                if isinstance(sub, ast.Return) and isinstance(sub.value, ast.Call):
+                    callee = sub.value.func
+                    if isinstance(callee, ast.Name):
+                        func = next(
+                            n
+                            for n in ast.walk(_ENGINE)
+                            if isinstance(n, ast.FunctionDef) and n.name == callee.id
+                        )
         assert _runs_inside_engine_quiet(func), (
             f"{fname} must run its document writes inside _EngineQuiet, or undo echoes "
             "clobber the synced params"

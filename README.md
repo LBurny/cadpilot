@@ -17,13 +17,13 @@ Models built by the AI through CADPilot (demo files live in [`examples/`](exampl
 ## Features
 
 * **Parametric modeling, end to end**: spreadsheet-driven variables, fully constrained sketches, PartDesign features (pad/pocket/revolution/…), dress-up ops, and a multi-view 2D→3D visual hull, all through one unified `cad()` tool.
-* **Step journal & review loop**: every mutation is also journaled on the FreeCAD side and shown in the **Steps panel** dock: run planned steps, accept the good ones (soft lock), reject or roll back the rest, edit parameters in place, and replay the whole build from the journal. `execute_code` is a first-class citizen: a snippet that changes the model is wrapped in a transaction and becomes a rollback-able, replayable step, while a read-only inspection never blocks a rollback. Hand edits in the GUI sync back into the recorded steps; `session_rollback` remains for whole-session undo.
+* **Step journal & review loop**: every mutation is also journaled on the FreeCAD side and shown in the **Steps panel** dock: run planned steps, accept the good ones (soft lock), reject or roll back the rest, edit parameters in place, and replay the whole build from the journal. `execute_code` is a first-class citizen: a snippet that changes the model is wrapped in a transaction and becomes a rollback-able, replayable step, while a read-only inspection never blocks a rollback. Hand edits in the GUI sync back into the recorded steps; session rollback remains for whole-session undo.
 * **Persistence**: sessions, patterns, and settings survive restarts as JSON under `~/.cadpilot/`; pause a session today, resume it tomorrow.
 * **Geometry sensing**: measure volumes/areas, inspect face/edge topology, and check interference after every step; quantitative feedback replaces guesswork on complex models.
 * **Data-driven assembly**: named anchors, residual-checked mates, connectivity audits, and persistent joints (FreeCAD 1.1 Assembly workbench) with declarative priority trimming.
 * **Workflow memory**: successful modeling recipes are stored as reusable patterns and recalled on demand; the agent gets better the more you use it.
 * **Built-in troubleshooting**: the `diagnose` tool probes the RPC port, the FreeCAD process, the addon install and its logs on Windows/macOS/Linux, ends with a concrete fix, and works even while FreeCAD is down or frozen. `get_addon_log` reads the addon's debug ring buffer even when the GUI is wedged.
-* **Token-friendly**: text-first responses with opt-in screenshots (512 px cap), a tiny tool surface, and on-demand operation docs keep context usage low.
+* **Token-friendly**: text-first responses with screenshots on demand via `get_view` (384 px cap, file delivery), a tiny tool surface, and on-demand operation docs keep context usage low.
 
 ## Installation
 
@@ -114,11 +114,9 @@ All MCP clients that support stdio servers use the same configuration: **command
 
 ### Startup options
 
-Tool responses are text-only by default. Screenshots are opt-in per call (`with_screenshot=true`) or via the `get_view` tool, which keeps token usage low. Startup flags:
+Tool responses are text-only; the `get_view` tool captures a view screenshot on demand. Each capture is written under `~/.cadpilot/screenshots/` (newest 100 kept) and the response carries only its file path, so no image data enters the context; a multimodal client opens the PNG with its own file-reading tool. Startup flags:
 
-* `--with-screenshots`: attach a screenshot to every mutation/read tool response (for multimodal models)
 * `--only-text-feedback`: never return screenshots, even when requested (hard guarantee for text-only models)
-* `--screenshot-mode`: `file` (default) saves screenshots under `~/.cadpilot/screenshots/` and returns only the file path, keeping base64 out of the model's context; `image` inlines base64 image blocks (for clients without a file-reading tool)
 * `--host <ip>`: connect to a FreeCAD instance on another machine
 * `--no-auto-audit`: skip the connectivity audit after each mutation (for very large models)
 
@@ -127,7 +125,7 @@ Tool responses are text-only by default. Screenshots are opt-in per call (`with_
   "mcpServers": {
     "cadpilot": {
       "command": "uvx",
-      "args": ["cadpilot", "--with-screenshots"]
+      "args": ["cadpilot"]
     }
   }
 }
@@ -151,12 +149,12 @@ Something not talking? Ask the AI to run the **`diagnose`** tool. It checks the 
 
 * **`cad`** is the unified CAD mutation tool: `create_object` / `edit_object` / `delete_object` / `batch`, parametric feature ops (`boolean` / `fillet` / `chamfer` / `loft` / `sweep` / `mirror` / `pattern` / `move`), Sketcher/PartDesign ops (`variables` / `sketch` / `pad` / `pocket` / `revolution` / `groove` / `thickness` / `draft` / `datum_plane` / `hull`). Edge/face selectors are fed by `get_topology`; every mutation is transactional and rollback-able.
 * **`execute_code` / `execute_code_async` / `get_task_result`** run arbitrary Python in FreeCAD (GUI-thread safe), or background-safe code for long OCCT computations with polling. A run that changes the document is transactional, so it rolls back and replays like any other step; a failing snippet is rolled back cleanly.
-* **Modeling sessions**: `session_start` / `session_status` / `session_get_steps` / `session_rollback` / `session_redo` / `session_add_note` / `session_pause` / `session_resume` / `session_list` / `session_complete`: step recording with rollback via FreeCAD's native transaction undo.
+* **Modeling sessions**: `session` (actions `start` / `status` / `get_steps` / `rollback` / `redo` / `add_note` / `pause` / `resume` / `list` / `complete`): step recording with rollback via FreeCAD's native transaction undo.
 * **Step journal**: `step_control` drives the FreeCAD-side review loop shared with the Steps panel: `run_next` / `run_all` / `rollback_to` / `reexecute` / `accept` / `reject` / `update` / `insert` / `replay` / `snapshot`. The journal lives on the document itself, so the panel works even with the RPC server stopped.
 * **Knowledge hierarchy**: `save_pattern` / `recall_patterns` (reusable workflow memory), `inspect_freecad` (runtime API introspection), `operation_help` (per-operation reference docs).
 * **Geometry sensing**: `measure_geometry` / `get_topology` / `check_interference` / `get_positioning_info`: quantitative feedback after each modeling step.
 * **Assembly**: `get_anchors` / `set_anchors` / `assemble` / `align_shapes` / `verify_assembly` for data-driven spatial positioning; `assembly_session` for mate-based assembly with persistent joints (FreeCAD 1.1 Assembly workbench) and declarative priority trimming.
-* **Documents & views**: `create_document` / `list_documents` / `get_objects` / `get_object` / `get_view` (screenshots capped at 512 px on the long edge by default).
+* **Documents & views**: `create_document` / `list_documents` / `get_objects` (pass `obj_name` for one object's properties) / `get_view` (the only screenshot tool; captures capped at 384 px on the long edge by default).
 * **Diagnostics**: `diagnose` (cross-platform fault probing that works with FreeCAD down) and `get_addon_log` (the addon's ring-buffer debug log, readable while the GUI is wedged).
 
 See the [design document](docs/DESIGN.md) for the architecture behind these tools, and try the demo model [`examples/Backpack.FCStd`](examples/Backpack.FCStd) in FreeCAD.

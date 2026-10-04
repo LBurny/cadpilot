@@ -162,7 +162,7 @@ def test_mutating_snippet_on_the_session_document_is_recorded(fake_freecad, isol
         "document": "Doc",
         "message": "Python code executed successfully.",
     }
-    resp = execute_code_operation(fake_freecad, False, "doc.Box.Length = 1")
+    resp = execute_code_operation(fake_freecad, "doc.Box.Length = 1")
     assert "recorded as atomic step" in _text(resp)
     assert sess.step_count == 1
 
@@ -178,7 +178,7 @@ def test_mutating_snippet_on_a_foreign_document_is_not_recorded(fake_freecad, is
         "document": "OtherDoc",
         "message": "Python code executed successfully.",
     }
-    resp = execute_code_operation(fake_freecad, False, "doc = FreeCAD.getDocument('OtherDoc')")
+    resp = execute_code_operation(fake_freecad, "doc = FreeCAD.getDocument('OtherDoc')")
     text = _text(resp)
     assert "not part of session" in text
     assert "step_control" in text
@@ -194,7 +194,7 @@ def test_mutating_snippet_without_a_document_field_is_not_recorded(fake_freecad,
         "changed": True,
         "message": "Python code executed successfully.",
     }
-    resp = execute_code_operation(fake_freecad, False, "doc.Box.Length = 1")
+    resp = execute_code_operation(fake_freecad, "doc.Box.Length = 1")
     assert "not recorded" in _text(resp)
     assert sess.step_count == 0
 
@@ -207,6 +207,6 @@ def test_read_only_snippet_is_still_not_recorded(fake_freecad, isolated_home):
         "document": "Doc",
         "message": "Python code executed successfully.",
     }
-    resp = execute_code_operation(fake_freecad, False, "print(1)")
+    resp = execute_code_operation(fake_freecad, "print(1)")
     assert "read-only" in _text(resp)
     assert sess.step_count == 0

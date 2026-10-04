@@ -15,7 +15,15 @@ import math
 import FreeCAD
 import Part
 
-from rpc_server.geometry_query import _face_normal, _get_obj, _r, _vec
+from rpc_server.geometry_query import (
+    _face_normal,
+    _get_obj,
+    _r,
+    _vec,
+    body_owner,
+    global_placement,
+    global_shape,
+)
 
 ANCHOR_PROP = "MCP_Anchors"
 _MAX_FLOATING_REPORT = 50
@@ -41,11 +49,18 @@ def _load_explicit(obj):
 
 
 def _to_global(obj, entry):
-    """Local-coords anchor entry -> (global_pos, global_dir|None)."""
-    pos = obj.Placement.multVec(FreeCAD.Vector(*entry["pos"]))
+    """Local-coords anchor entry -> (global_pos, global_dir|None).
+
+    Uses the object's FRAME placement (a PartDesign feature's anchors are
+    stored in its body-local frame, and the Body owns the transform), not the
+    raw ``obj.Placement`` which is only correct for objects that carry the
+    placement inside their Shape.
+    """
+    placement = global_placement(obj)
+    pos = placement.multVec(FreeCAD.Vector(*entry["pos"]))
     direction = None
     if entry.get("dir"):
-        direction = obj.Placement.Rotation.multVec(FreeCAD.Vector(*entry["dir"]))
+        direction = placement.Rotation.multVec(FreeCAD.Vector(*entry["dir"]))
         if direction.Length > 1e-12:
             direction.normalize()
     return pos, direction
@@ -56,7 +71,7 @@ def _auto_anchor_map(obj):
 
     Full precision — used for alignment/residual math. Use _auto_anchors for
     rounded report output."""
-    shape = obj.Shape
+    shape = global_shape(obj)
     anchors = {}
     bb = shape.BoundBox
     anchors["bbox_center"] = (
@@ -180,7 +195,7 @@ def set_anchors(doc_name, obj_name, anchors, replace=False, coord_frame="local")
             "error": f"coord_frame must be 'local' or 'global', got {coord_frame!r}",
         }
     try:
-        inv = obj.Placement.inverse() if coord_frame == "global" else None
+        inv = global_placement(obj).inverse() if coord_frame == "global" else None
         inv_rot = inv.Rotation if inv is not None else None
         cleaned = {}
         for name, entry in anchors.items():
@@ -295,6 +310,20 @@ def assemble(doc_name, mates, tolerance=0.1, stop_on_error=True):
                 target, terr = _get_obj(doc_name, str(mate.get("target", "")))
             if err or terr:
                 entry.update(passed=False, error=f"{label}: {err or terr}")
+            elif body_owner(obj) is not None:
+                # A PartDesign feature does not own its frame: FreeCAD rewrites
+                # its Placement on the next recompute (live-verified), so a mate
+                # applied to it silently un-does itself. The Body is the object
+                # that can actually be positioned.
+                owner = body_owner(obj)
+                entry.update(
+                    passed=False,
+                    error=(
+                        f"{label}: '{obj.Name}' is a PartDesign feature inside Body "
+                        f"'{owner.Name}' — FreeCAD resets a feature's Placement on the next "
+                        "recompute, so the mate cannot hold. Mate the Body instead."
+                    ),
+                )
             else:
                 a_pos, a_dir, _, aerr = _resolve_anchor(obj, str(mate.get("anchor", "")))
                 t_pos, t_dir, _, t_err = _resolve_anchor(target, str(mate.get("target_anchor", "")))
@@ -421,6 +450,22 @@ def _is_body_member(obj) -> bool:
     return any(getattr(o, "TypeId", "") == "PartDesign::Body" for o in getattr(obj, "InList", []))
 
 
+_CONTAINER_TYPES = ("Assembly::AssemblyObject", "App::Part")
+
+
+def _is_container(obj) -> bool:
+    """True for a group object whose Shape IS its children's union.
+
+    An Assembly container (or App::Part) audits its members a second time: in
+    a live run every component came back "interfering" with the container by
+    its OWN full volume (two 20 mm blocks reported 8000 mm^3 each against
+    MCP_Assembly), and the composite boolean was unstable enough that the
+    entries appeared and vanished between identical calls. Members are audited
+    individually; the container contributes only noise.
+    """
+    return getattr(obj, "TypeId", "") in _CONTAINER_TYPES
+
+
 def verify_assembly(doc_name, checks=None, float_threshold=1.0, interference_min_volume=1.0):
     try:
         doc = FreeCAD.getDocument(doc_name)
@@ -435,6 +480,7 @@ def verify_assembly(doc_name, checks=None, float_threshold=1.0, interference_min
         shaped = []
         skipped_hidden = 0
         skipped_body_members = 0
+        skipped_containers = 0
         skipped_unmeasurable = 0
         for o in doc.Objects:
             shape = getattr(o, "Shape", None)
@@ -445,6 +491,9 @@ def verify_assembly(doc_name, checks=None, float_threshold=1.0, interference_min
                 continue
             if _is_body_member(o):
                 skipped_body_members += 1
+                continue
+            if _is_container(o):
+                skipped_containers += 1
                 continue
             shaped.append((o.Name, shape))
         float_threshold = float(float_threshold)
@@ -593,6 +642,9 @@ def verify_assembly(doc_name, checks=None, float_threshold=1.0, interference_min
                 # PartDesign features are represented by their Body (they share
                 # its Shape), so they are not audited individually.
                 "skipped_body_members": skipped_body_members,
+                # Assembly/Part containers: their Shape is the members' union,
+                # so auditing them double-counts every component.
+                "skipped_containers": skipped_containers,
                 # Pairs OCC could not measure: the audit is PARTIAL, and a
                 # caller must not read "no interference" as proof.
                 "skipped_unmeasurable": skipped_unmeasurable,

@@ -45,7 +45,6 @@ def test_cad_create_records_step_with_fingerprint(fake_freecad, isolated_home):
     fake_freecad.objects_by_doc["Doc"] = ["Box"]
     resp = cad_operation(
         fake_freecad,
-        False,
         "create_object",
         "Doc",
         obj_type="Part::Box",
@@ -69,16 +68,14 @@ def test_cad_marks_non_atomic_when_transaction_missing(fake_freecad, isolated_ho
         "transaction": False,
         "objects": ["Box"],
     }
-    cad_operation(fake_freecad, False, "create_object", "Doc", obj_type="Part::Box", obj_name="Box")
+    cad_operation(fake_freecad, "create_object", "Doc", obj_type="Part::Box", obj_name="Box")
     assert sess.steps[0].atomic is False
 
 
 def test_cad_failure_not_recorded(fake_freecad, isolated_home):
     sess = _start_session(fake_freecad)
     fake_freecad.result_overrides["create_object"] = {"success": False, "error": "boom"}
-    resp = cad_operation(
-        fake_freecad, False, "create_object", "Doc", obj_type="Part::Box", obj_name="Box"
-    )
+    resp = cad_operation(fake_freecad, "create_object", "Doc", obj_type="Part::Box", obj_name="Box")
     assert "boom" in _text(resp)
     assert sess.step_count == 0
 
@@ -86,26 +83,22 @@ def test_cad_failure_not_recorded(fake_freecad, isolated_home):
 def test_cad_other_document_not_recorded(fake_freecad, isolated_home):
     sess = _start_session(fake_freecad, doc="Doc")
     resp = cad_operation(
-        fake_freecad, False, "create_object", "OtherDoc", obj_type="Part::Box", obj_name="Box"
+        fake_freecad, "create_object", "OtherDoc", obj_type="Part::Box", obj_name="Box"
     )
     assert "not recorded" in _text(resp)
     assert sess.step_count == 0
 
 
 def test_cad_no_session_runs_untracked(fake_freecad, isolated_home):
-    resp = cad_operation(
-        fake_freecad, False, "create_object", "Doc", obj_type="Part::Box", obj_name="Box"
-    )
+    resp = cad_operation(fake_freecad, "create_object", "Doc", obj_type="Part::Box", obj_name="Box")
     assert "created successfully" in _text(resp)
     assert "step #" not in _text(resp)
 
 
 def test_cad_edit_and_delete_dispatch(fake_freecad, isolated_home):
     _start_session(fake_freecad)
-    cad_operation(
-        fake_freecad, False, "edit_object", "Doc", obj_name="Box", obj_properties={"Length": 5}
-    )
-    cad_operation(fake_freecad, False, "delete_object", "Doc", obj_name="Box")
+    cad_operation(fake_freecad, "edit_object", "Doc", obj_name="Box", obj_properties={"Length": 5})
+    cad_operation(fake_freecad, "delete_object", "Doc", obj_name="Box")
     methods = fake_freecad.called_methods()
     assert "edit_object" in methods and "delete_object" in methods
 
@@ -124,7 +117,7 @@ def test_cad_batch_partial_success_still_recorded(fake_freecad, isolated_home):
         "objects": ["Box"],
     }
     ops = [{"action": "create_object"}, {"action": "edit_object"}]
-    resp = cad_operation(fake_freecad, False, "batch", "Doc", ops=ops)
+    resp = cad_operation(fake_freecad, "batch", "Doc", ops=ops)
     data = _json(resp)
     assert "1/2" in data["summary"]
     assert sess.step_count == 1
@@ -137,33 +130,18 @@ def test_cad_batch_all_failed_not_recorded(fake_freecad, isolated_home):
         "results": [{"success": False, "action": "create_object", "error": "x"}],
         "transaction": False,
     }
-    cad_operation(fake_freecad, False, "batch", "Doc", ops=[{"action": "create_object"}])
+    cad_operation(fake_freecad, "batch", "Doc", ops=[{"action": "create_object"}])
     assert sess.step_count == 0
 
 
 def test_cad_unknown_operation(fake_freecad, isolated_home):
-    resp = cad_operation(fake_freecad, False, "fly_to_moon", "Doc")
+    resp = cad_operation(fake_freecad, "fly_to_moon", "Doc")
     assert "Unknown cad operation" in _text(resp)
 
 
 def test_cad_requires_params(fake_freecad, isolated_home):
-    resp = cad_operation(fake_freecad, False, "create_object", "Doc")
+    resp = cad_operation(fake_freecad, "create_object", "Doc")
     assert "requires obj_type" in _text(resp)
-
-
-def test_cad_screenshot_only_when_requested(fake_freecad, isolated_home):
-    resp = cad_operation(
-        fake_freecad,
-        True,
-        "create_object",
-        "Doc",
-        obj_type="Part::Box",
-        obj_name="Box",
-        screenshot_mode="image",
-    )
-    _, args, _ = fake_freecad.calls[0]
-    assert args[2] == {"view_name": "Isometric"}
-    assert any(c.type == "image" for c in resp)
 
 
 # --- execute_code step accounting ----------------------------------------------
@@ -181,7 +159,7 @@ def test_execute_code_that_changed_the_document_is_an_atomic_step(fake_freecad, 
         "changed": True,
         "document": "Doc",
     }
-    resp = execute_code_operation(fake_freecad, False, "b.Height = 10")
+    resp = execute_code_operation(fake_freecad, "b.Height = 10")
     assert "atomic step #1" in _text(resp)
     assert sess.steps[0].atomic is True
 
@@ -191,7 +169,7 @@ def test_execute_code_read_only_is_not_recorded(fake_freecad, isolated_home):
     log's one-transaction-per-step invariant and block rollback. The fake's
     default result carries no `changed`, i.e. an older addon — conservative."""
     sess = _start_session(fake_freecad)
-    resp = execute_code_operation(fake_freecad, False, "print(FreeCAD.listDocuments())")
+    resp = execute_code_operation(fake_freecad, "print(FreeCAD.listDocuments())")
     assert "read-only" in _text(resp)
     assert sess.step_count == 0
 
@@ -281,15 +259,18 @@ def test_rollback_to_zero_verifies_against_the_starting_state(fake_freecad, isol
 
 def test_rollback_to_zero_reports_objects_left_behind(fake_freecad, isolated_home):
     """The regression: a rollback whose undo came up short reported success with
-    an empty warning list, because the verification was skipped at to_step=0."""
+    an empty warning list, because the verification was skipped at to_step=0.
+    Success now means "the model reached the target state" — an object left
+    behind is a failed rollback, not a successful one with a footnote."""
     fake_freecad.objects_by_doc["Doc"] = ["Preexisting"]
     sess = _start_session(fake_freecad)
     sess.add_step("create_object", "a", objects_after=["Preexisting", "A"])
     fake_freecad.objects_by_doc["Doc"] = ["Preexisting", "A"]  # A survived the undo
     data = _json(session_rollback_operation(fake_freecad, 0))
-    assert data["success"] is True
+    assert data["success"] is False
     assert data["state_matches_log"] is False
     assert any("A" in w for w in data["warnings"])
+    assert "ROLLBACK INCOMPLETE" in data["display_text"]
 
 
 def test_rollback_to_zero_says_so_when_it_cannot_verify(fake_freecad, isolated_home):
@@ -312,6 +293,42 @@ def test_redo_restores_steps(fake_freecad, isolated_home):
     assert data["restored_steps"] == [2]
     assert sess.step_count == 2
     assert len(sess.redo_buffer) == 1
+
+
+def test_redo_with_an_empty_freecad_stack_fails_loudly(fake_freecad, isolated_home):
+    """A diverged redo stack (the session buffer says there is work, FreeCAD
+    holds none) used to answer success with restored_steps=[] and redo_remaining
+    unchanged — a silent no-op loop. It must fail and keep the buffer."""
+    sess = _three_step_session(fake_freecad)
+    session_rollback_operation(fake_freecad, 1)
+    before = len(sess.redo_buffer)
+    assert before == 2
+    fake_freecad.result_overrides["redo_transactions"] = {
+        "success": True,
+        "count": 0,
+        "objects": ["A"],
+    }
+    text = _text(session_redo_operation(fake_freecad, 1))
+    assert "restored nothing" in text
+    assert len(sess.redo_buffer) == before
+
+
+def test_rollback_surfaces_skipped_ghost_transactions(fake_freecad, isolated_home):
+    """FreeCAD shares one undo stack across documents: other documents'
+    transactions ride along as ghosts and the addon skips them without counting
+    them. The reply must say so instead of hiding a mixed stack."""
+    _three_step_session(fake_freecad)
+    fake_freecad.objects_by_doc["Doc"] = ["A", "B"]
+    fake_freecad.result_overrides["undo_transactions"] = {
+        "success": True,
+        "count": 1,
+        "ghosts_skipped": 2,
+        "objects": ["A", "B"],
+    }
+    data = _json(session_rollback_operation(fake_freecad, 2))
+    assert data["success"] is True
+    assert data["undone_transactions"] == 1
+    assert any("other documents were skipped" in w for w in data["warnings"])
 
 
 def test_redo_without_buffer(fake_freecad, isolated_home):

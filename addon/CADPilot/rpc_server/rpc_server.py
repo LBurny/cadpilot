@@ -50,7 +50,12 @@ from rpc_server.gui_dispatch import (
     request_shutdown,
 )
 from rpc_server.joint_ops import assembly_op as _assembly_op
-from rpc_server.object_factory import create_object_gui, delete_object_gui, edit_object_gui
+from rpc_server.object_factory import (
+    create_object_gui,
+    delete_object_gui,
+    edit_object_gui,
+    repair_body_tips,
+)
 from rpc_server.property_mapper import Object
 from rpc_server.request_log import LoggedXMLRPCServer
 from rpc_server.serialize import serialize_object
@@ -164,18 +169,26 @@ class FreeCADRPC:
 
         def task():
             doc = None
-            in_transaction = False
             if transaction:
-                try:
+                with contextlib.suppress(Exception):
                     doc = FreeCAD.getDocument(doc_name) if doc_name else FreeCAD.ActiveDocument
-                except Exception:
-                    doc = None
-                if doc is not None:
-                    try:
-                        doc.openTransaction(transaction)
-                        in_transaction = True
-                    except Exception as e:
-                        FreeCAD.Console.PrintWarning(f"CADPilot: cannot open transaction: {e}\n")
+            # The target must be the App-active document across the whole
+            # open/commit window: FreeCAD 1.1.4 records the undo entry on the
+            # ACTIVE document's stack, so committing here while another
+            # document was active parked a ghost entry there (and vice versa),
+            # and a later rollback popped the ghost instead of its own step —
+            # reporting success while the model never moved.
+            with step_engine.active_document(doc if transaction else None):
+                return _task_body(doc)
+
+        def _task_body(doc):
+            in_transaction = False
+            if transaction and doc is not None:
+                try:
+                    doc.openTransaction(transaction)
+                    in_transaction = True
+                except Exception as e:
+                    FreeCAD.Console.PrintWarning(f"CADPilot: cannot open transaction: {e}\n")
             token_before = None
             if in_transaction:
                 with contextlib.suppress(Exception):
@@ -426,9 +439,40 @@ class FreeCADRPC:
 
         def _run_batch():
             results = []
+            doc = None
+            with contextlib.suppress(Exception):
+                doc = FreeCAD.getDocument(doc_name)
             for op in ops:
-                results.append(self._run_one_operation(doc_name, op, is_batch=True))
-                if stop_on_error and not results[-1]["success"]:
+                before = [o.Name for o in doc.Objects] if doc is not None else []
+                res = self._run_one_operation(doc_name, op, is_batch=True)
+                if doc is not None and not res.get("success"):
+                    # A sub-op can fail AFTER creating its object (a bad
+                    # property value, a later validation step). Those
+                    # half-built objects used to commit with the batch — live,
+                    # a failed pad left a valid default-length Pad in the
+                    # document while its own per-op result said success:false.
+                    # Remove them (reverse creation order) inside the batch's
+                    # transaction, so the failure leaves no debris.
+                    before_set = set(before)
+                    debris = [o.Name for o in doc.Objects if o.Name not in before_set]
+                    for name in reversed(debris):
+                        with contextlib.suppress(Exception):
+                            doc.removeObject(name)
+                    if debris:
+                        # Removing the tip of a Body would leave it Invalid for
+                        # every later feature (live: a failed thickness took the
+                        # Tip with it and the next dress-up refused).
+                        with contextlib.suppress(Exception):
+                            if repair_body_tips(doc):
+                                doc.recompute()
+                        res["removed_debris"] = debris
+                        res.setdefault(
+                            "warning",
+                            "new object(s) created by this failed sub-op were removed; "
+                            "property writes it already applied to existing objects stay",
+                        )
+                results.append(res)
+                if stop_on_error and not res["success"]:
                     break
             # Single recompute after all ops instead of per-object
             try:
@@ -493,7 +537,16 @@ class FreeCADRPC:
                         "base": op.get("obj_name"),
                         **(op.get("obj_properties") or {}),
                     }
-                    res = {"success": True, "object_name": create_feature_gui(doc, spec).Name}
+                    feat = create_feature_gui(doc, spec)
+                    # Same payload the single-op path returns. Without dof/
+                    # warnings a batch-built sketch reported bare success while
+                    # it was under-constrained, and a pocket that cut nothing
+                    # said nothing — the batch path used to drop both.
+                    res = {
+                        "success": True,
+                        "object_name": feat.Name,
+                        **describe_feature(feat, spec),
+                    }
                 except Exception as e:
                     return {"success": False, "action": action, "error": str(e)}
             else:
@@ -533,19 +586,34 @@ class FreeCADRPC:
             except Exception:
                 stack_before = []
             # step_engine owns the loop: it never calls undo()/redo() blind past
-            # the end of the stack and reports the count that actually went.
+            # the end of the stack, skips ghost entries owned by other
+            # documents, and reports the count that actually went.
             res = step_engine.undo_n(doc, n) if undo else step_engine.redo_n(doc, n)
             try:
                 stack_after = list(getattr(doc, stack_attr, []) or [])
             except Exception:
                 stack_after = []
-            return {
+            count = res.get("count", 0)
+            out = {
                 "success": True,
-                "count": res.get("count", 0),
+                "count": count,
+                "ghosts_skipped": res.get("ghosts_skipped", 0),
                 "stack_before": stack_before,
                 "stack_after": stack_after,
                 "objects": res.get("objects", []),
             }
+            if not undo and n > 0 and count == 0:
+                # Nothing to redo means the caller's redo buffer and FreeCAD's
+                # redo stack have diverged (another actor consumed it, or a
+                # reopen emptied it). Reporting success with an empty result
+                # made session_redo a silent no-op that never drained.
+                out["success"] = False
+                out["error"] = (
+                    "nothing to redo: FreeCAD's redo stack holds no transaction for this "
+                    "document — it was consumed or cleared by other work, so the caller's "
+                    "redo history and the document are out of sync."
+                )
+            return out
 
         res = dispatch_to_gui(task)
         if isinstance(res, dict):

@@ -3,13 +3,23 @@
 All functions run on the FreeCAD GUI thread (dispatched by rpc_server) and
 never mutate the document — no transaction, no recompute.
 
-Coordinate convention: FreeCAD Shapes carry the object's Placement as their
-internal location, so ``BoundBox``, ``CenterOfMass``, ``Vertex.Point``,
-``Face.Surface`` (Axis/Center/Radius), ``Face.normalAt`` and ``Edge.Curve``
-already return values in GLOBAL (document) coordinates. Do NOT apply
-``obj.Placement`` again — that double-transforms everything.
+Coordinate convention: measure/query values are GLOBAL (document) coordinates
+— but FreeCAD hands out TWO frames, and a raw ``obj.Shape`` is only global for
+the first kind:
+
+* a Part::Feature, an App::Link and a PartDesign **Body** carry their Placement
+  inside the Shape (measured: a box at (100,0,0) has ``BoundBox.XMin == 100``);
+* a PartDesign **feature inside a Body** keeps its Shape in the BODY's local
+  frame while the Body owns the Placement (measured: a Pad reads bb 0..10 with
+  its Body at y=200).
+
+Every shape read here goes through :func:`global_shape`, so a feature of a
+moved Body no longer reports local coordinates as if they were global (live:
+move a Body, then ``check_interference`` on its Pad answered with the
+un-moved shape).
 """
 
+import contextlib
 import math
 
 import FreeCAD
@@ -27,6 +37,41 @@ def _get_obj(doc_name, obj_name):
     return obj, None
 
 
+def body_owner(obj):
+    """The PartDesign Body that owns ``obj``'s frame (None = owns its own)."""
+    for o in getattr(obj, "InList", []):
+        if getattr(o, "TypeId", "") == "PartDesign::Body":
+            return o
+    return None
+
+
+def global_placement(obj):
+    """The placement that maps ``obj.Shape`` to global coordinates.
+
+    Equals ``obj.Placement`` for objects that carry it inside the Shape; for a
+    PartDesign feature it is ``getGlobalPlacement()`` (the owning Body's frame,
+    nested containers included).
+    """
+    if body_owner(obj) is not None:
+        with contextlib.suppress(Exception):
+            return obj.getGlobalPlacement()
+    return obj.Placement
+
+
+def global_shape(obj):
+    """``obj.Shape`` transformed into GLOBAL coordinates (see module docstring)."""
+    shape = obj.Shape
+    if body_owner(obj) is not None:
+        with contextlib.suppress(Exception):
+            # transformShape mutates the RECEIVER for a rigid motion (no
+            # scaling) and a PartDesign feature's Shape is read-only — it
+            # raised "This object is immutable". Transform a copy instead.
+            placed = shape.copy()
+            placed.transformShape(global_placement(obj).toMatrix())
+            shape = placed
+    return shape
+
+
 def _get_shape(doc_name, obj_name):
     """Return (shape, None) or (None, error_message)."""
     obj, err = _get_obj(doc_name, obj_name)
@@ -35,7 +80,7 @@ def _get_shape(doc_name, obj_name):
     shape = getattr(obj, "Shape", None)
     if shape is None or shape.isNull():
         return None, f"Object '{obj_name}' has no Shape."
-    return shape, None
+    return global_shape(obj), None
 
 
 def _r(value):
@@ -77,8 +122,9 @@ def measure_geometry(doc_name, obj_name):
     if err:
         return {"success": False, "error": err}
     try:
-        # obj.Shape is already in global coordinates (see module docstring).
-        gshape = obj.Shape
+        # GLOBAL coordinates either way — see global_shape's docstring for the
+        # two frames FreeCAD uses.
+        gshape = global_shape(obj)
         if gshape is None or gshape.isNull():
             return {"success": False, "error": f"Object '{obj_name}' has no Shape."}
 
@@ -414,8 +460,8 @@ def _element_spatial(obj, element, idx):
     Shape accessors are global; local_center is mapped back through the
     inverse Placement for new-placement composition math.
     """
-    shape = obj.Shape
-    placement = obj.Placement
+    shape = global_shape(obj)
+    placement = global_placement(obj)
     inv = placement.inverse()
 
     if element == "face":

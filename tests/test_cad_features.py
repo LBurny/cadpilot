@@ -19,7 +19,6 @@ def _start_session(fake_freecad):
 def test_feature_spec_assembly(fake_freecad, isolated_home):
     resp = cad_operation(
         fake_freecad,
-        False,
         "fillet",
         "Doc",
         obj_name="Box",
@@ -33,7 +32,7 @@ def test_feature_spec_assembly(fake_freecad, isolated_home):
 
 def test_feature_requires_obj_name(fake_freecad, isolated_home):
     resp = cad_operation(
-        fake_freecad, False, "boolean", "Doc", obj_properties={"op": "fuse", "tool": "Cyl"}
+        fake_freecad, "boolean", "Doc", obj_properties={"op": "fuse", "tool": "Cyl"}
     )
     assert "requires obj_name" in _text(resp)
     assert fake_freecad.calls == []
@@ -41,7 +40,7 @@ def test_feature_requires_obj_name(fake_freecad, isolated_home):
 
 def test_loft_works_without_obj_name(fake_freecad, isolated_home):
     resp = cad_operation(
-        fake_freecad, False, "loft", "Doc", obj_properties={"profiles": ["Sketch1", "Sketch2"]}
+        fake_freecad, "loft", "Doc", obj_properties={"profiles": ["Sketch1", "Sketch2"]}
     )
     _, args, _ = fake_freecad.calls[0]
     assert args[1]["base"] is None
@@ -55,7 +54,6 @@ def test_feature_error_propagates(fake_freecad, isolated_home):
     }
     resp = cad_operation(
         fake_freecad,
-        False,
         "fillet",
         "Doc",
         obj_name="Box",
@@ -68,7 +66,6 @@ def test_feature_records_session_step(fake_freecad, isolated_home):
     sess = _start_session(fake_freecad)
     cad_operation(
         fake_freecad,
-        False,
         "boolean",
         "Doc",
         obj_name="Box",
@@ -79,7 +76,7 @@ def test_feature_records_session_step(fake_freecad, isolated_home):
 
 
 def test_unknown_operation_lists_all(fake_freecad, isolated_home):
-    resp = cad_operation(fake_freecad, False, "extrude", "Doc", obj_name="Box")
+    resp = cad_operation(fake_freecad, "extrude", "Doc", obj_name="Box")
     text = _text(resp)
     assert "fillet" in text and "batch" in text
 
@@ -90,7 +87,6 @@ def test_edit_passes_expression_strings_through(fake_freecad, isolated_home):
     property_mapper routes them to obj.setExpression."""
     cad_operation(
         fake_freecad,
-        False,
         "edit_object",
         "Doc",
         obj_name="Box",
@@ -108,7 +104,6 @@ def test_feature_rejects_reserved_spec_keys(fake_freecad, isolated_home):
     a hint at the right key."""
     resp = cad_operation(
         fake_freecad,
-        False,
         "pocket",
         "Doc",
         obj_name="Sketch",
@@ -119,7 +114,6 @@ def test_feature_rejects_reserved_spec_keys(fake_freecad, isolated_home):
 
     resp = cad_operation(
         fake_freecad,
-        False,
         "fillet",
         "Doc",
         obj_name="Box",
@@ -132,9 +126,7 @@ def test_feature_rejects_reserved_spec_keys(fake_freecad, isolated_home):
 def test_feature_internal_spec_keys_win_over_params(fake_freecad, isolated_home):
     """Regression guard for the dict-order bug: internal spec keys must be
     written AFTER user params so the operation type always reaches the addon."""
-    cad_operation(
-        fake_freecad, False, "pad", "Doc", obj_name="Sketch", obj_properties={"length": 5}
-    )
+    cad_operation(fake_freecad, "pad", "Doc", obj_name="Sketch", obj_properties={"length": 5})
     _, args, _ = fake_freecad.calls[0]
     assert args[1]["type"] == "pad"
     assert args[1]["base"] == "Sketch"
@@ -151,7 +143,7 @@ def test_pocket_warning_reaches_the_model(fake_freecad, isolated_home):
         "warnings": ["Pocket removed no material (volume unchanged at 38603.9 mm^3): ..."],
     }
     resp = cad_operation(
-        fake_freecad, False, "pocket", "Doc", obj_name="Sketch", obj_properties={"length": 10}
+        fake_freecad, "pocket", "Doc", obj_name="Sketch", obj_properties={"length": 10}
     )
     text = _text(resp)
     assert "removed no material" in text
@@ -167,7 +159,7 @@ def test_sketch_dof_reaches_the_model(fake_freecad, isolated_home):
         "fully_constrained": True,
     }
     resp = cad_operation(
-        fake_freecad, False, "sketch", "Doc", obj_name="S1", obj_properties={"geometry": []}
+        fake_freecad, "sketch", "Doc", obj_name="S1", obj_properties={"geometry": []}
     )
     payload = json.loads(_text(resp))
     assert payload["fully_constrained"] is True
@@ -177,8 +169,6 @@ def test_sketch_dof_reaches_the_model(fake_freecad, isolated_home):
 def test_op_without_extras_keeps_its_plain_summary(fake_freecad, isolated_home):
     """No behavior change where nothing was wrong: the transport bookkeeping
     (objects fingerprint, transaction flag) must not leak into the reply."""
-    resp = cad_operation(
-        fake_freecad, False, "create_object", "Doc", obj_type="Part::Box", obj_name="B"
-    )
+    resp = cad_operation(fake_freecad, "create_object", "Doc", obj_type="Part::Box", obj_name="B")
     text = _text(resp)
     assert text.strip() == "Object 'B' created successfully"

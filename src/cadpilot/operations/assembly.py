@@ -34,11 +34,15 @@ _EMPTY_UNDO: dict[str, Any] = {
     "links_restore": {},
     "links_repoint": {},
     "remove_links": [],
+    "remove_assembly": None,
 }
 
 
 def _undo(**overrides) -> dict[str, Any]:
-    undo = {k: (list(v) if isinstance(v, list) else dict(v)) for k, v in _EMPTY_UNDO.items()}
+    undo = {
+        k: (list(v) if isinstance(v, list) else dict(v) if isinstance(v, dict) else v)
+        for k, v in _EMPTY_UNDO.items()
+    }
     undo.update(overrides)
     return undo
 
@@ -93,11 +97,23 @@ def assembly_session_operation(
             return err
         session = astate.start_session(doc_name, part, name or "")
         session.assembly_name = res.get("assembly", "MCP_Assembly")
-        st = astate.record_step(session, "start", f"ground {part}", spec, undo=_undo())
-        session.components[part] = {
-            "link": res.get("ground_link", f"L_{part}"),
-            "added_step": st.step_number,
-        }
+        ground_link = res.get("ground_link", f"L_{part}")
+        ground_joint = res.get("ground_joint")
+        st = astate.record_step(
+            session,
+            "start",
+            f"ground {part}",
+            spec,
+            # Rolling back ACROSS start must tear the whole assembly down: the
+            # old empty undo left MCP_Assembly / its ground joint and ground
+            # link in the document at to_step=0 (live-verified).
+            undo=_undo(
+                remove_assembly=session.assembly_name,
+                remove_links=[ground_link],
+                joints_to_delete=[ground_joint] if ground_joint else [],
+            ),
+        )
+        session.components[part] = {"link": ground_link, "added_step": st.step_number}
         astate.save(session)
         return json_response(
             {
@@ -151,7 +167,15 @@ def assembly_session_operation(
         if (err := _rpc_error(res, "mate")) is not None:
             return err
         undo = _undo(joints_to_delete=[res["joint"]])
-        if res.get("pre_placement") and res.get("moved_link"):
+        moved = res.get("moved_links") or {}
+        if moved:
+            # Every link the solve actually moved (new addon: the solver picks
+            # the side, usually b's). Recording only ref_a's link restored a
+            # part that never moved and left the moved one displaced.
+            undo["links_restore"] = {
+                name: entry.get("pre") for name, entry in moved.items() if entry.get("pre")
+            }
+        elif res.get("pre_placement") and res.get("moved_link"):
             undo["links_restore"] = {res["moved_link"]: res["pre_placement"]}
         if trim and res.get("trim"):
             undo["cuts_to_delete"] = [res["trim"]["cut"]]

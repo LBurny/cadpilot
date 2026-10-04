@@ -104,7 +104,7 @@ def _dependents(obj) -> list[str]:
     return sorted(seen)
 
 
-def _repair_body_tips(doc) -> bool:
+def repair_body_tips(doc) -> bool:
     """Re-point a PartDesign Body's Tip after a delete removed it.
 
     ``removeObject`` leaves ``Body.Tip`` dangling when the removed object WAS
@@ -169,7 +169,7 @@ def delete_object_gui(doc_name: str, obj_name: str):
         doc.recompute()
         # A body whose Tip was just deleted is left invalid; the delete is only
         # successful if the document is still usable afterwards.
-        if _repair_body_tips(doc):
+        if repair_body_tips(doc):
             doc.recompute()
         FreeCAD.Console.PrintMessage(f"Object '{obj_name}' deleted via RPC.\n")
         return True

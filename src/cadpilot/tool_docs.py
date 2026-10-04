@@ -74,10 +74,17 @@ Required: ops (list). Optional: stop_on_error (default False).
 Each op: {"action": "create_object"|"edit_object"|"delete_object"|<feature op>,
           ...same fields as the single operation...}
 Feature actions in batch: {"action": "fillet", "obj_name": ..., "obj_properties": {...}}.
+stop_on_error=true stops at the first failed op (already-run ops stay applied —
+it does NOT roll the batch back). With either setting, objects a FAILED op had
+already created are removed again, and its per-op result says so
+("removed_debris"); feature results carry the same diagnostics (dof,
+fully_constrained, warnings) as the single-op call.
 Returns JSON with per-op results.""",
     "boolean": """\
 boolean — parametric Boolean (obj_name = base object).
 Required in obj_properties: op (fuse/cut/common), tool. Optional: name.
+Without name the result is named after the op ("Cut"/"Fuse"/"Common"), which
+FreeCAD de-duplicates — read the actual name from the response.
 tool: single object name OR a list — multiple tools are combined into one
 (hidden) Part::Compound that stays linked as the boolean's Tool.""",
     "fillet": """\
@@ -107,7 +114,8 @@ mirror — parametric mirror (obj_name = base object).
 Optional in obj_properties: plane (XY/XZ/YZ, default XY) or face (selector item), name.""",
     "pattern": """\
 pattern — repeat a feature or solid (obj_name = base object).
-Required in obj_properties: count (>= 2, or an expression, e.g. "=Vars.n_holes").
+Required in obj_properties: count (>= 2, or an expression, e.g. "=Vars.n_holes";
+an expression stays BOUND, so changing the spreadsheet updates the hole count).
 Optional: pattern_type (linear/polar, default linear), spacing, axis (X/Y/Z or
   a direction vector), angle, center, reversed, name.
 
@@ -126,7 +134,9 @@ e.g. from execute_code) or pattern a Part-level solid with boolean ops.""",
 move — relative Placement change (obj_name = object to move).
 Optional in obj_properties (vectors accept [x,y,z] or {"x":..,"y":..,"z":..}):
   translate [dx,dy,dz] — relative translation in GLOBAL coords
-  rotate {"axis": [ax,ay,az], "angle": degrees} — relative rotation
+  rotate {"axis": [ax,ay,az], "angle": degrees} — relative rotation about the
+    object's OWN origin (its Placement Base), NOT the world origin; translate
+    first if you want to orbit another point
   placement — absolute Placement override (same format as obj_properties.Placement)""",
     "variables": """\
 variables — create/update a Spreadsheet parameter table (idempotent).
@@ -146,11 +156,18 @@ Optional: plane, offset, body, construction, external, constraints.
   {"face": ["ObjName", "FaceN"], "offset": 0} to sketch on an existing solid
   face, or {"datum": "DatumPlaneName"} to sketch on a datum plane.
   PREFER A DIRECTION OVER A FACE NAME: {"face": ["ObjName", "+Z"]} (also -Z,
-  +X/-X, +Y/-Y, top/bottom/left/right/front/back) resolves to the planar face
-  facing that way. Face names (Face1, Face2, …) are re-derived after every
-  feature, so a name read off one feature can silently mean a different face on
-  the next one — the sketch then lands on the wrong plane and its pocket cuts
-  air while still reporting success.
+  +X/-X, +Y/-Y, top/bottom/left/right/front/back, MaxX/MinZ/…) resolves to the
+  planar face facing that way. Face names (Face1, Face2, …) are re-derived
+  after every feature, so a name read off one feature can silently mean a
+  different face on the next one — the sketch then lands on the wrong plane and
+  its pocket cuts air while still reporting success.
+  {"face": [...], "center": true} puts the sketch origin at the MIDDLE of the
+  face; without it the origin sits on the face's parametric origin, which is a
+  CORNER on rectangular faces (a circle meant for the middle of a 100x60 side
+  face lands at its corner and the cut is clipped by the part's edge).
+  The sketch result echoes the resolved `plane` (object, face name, center,
+  normal, centered) so a surprise pick is visible — a direction token picks the
+  FARTHEST face facing that way.
 - geometry: list of items; the list order is the GeoId used in constraints:
     {"type": "line", "from": [x,y], "to": [x,y]}
     {"type": "arc", "center": [x,y], "radius": r, "start_angle": deg, "end_angle": deg}
@@ -169,6 +186,13 @@ Optional: plane, offset, body, construction, external, constraints.
   Supported types: coincident, horizontal, vertical, tangent, perpendicular,
   parallel, equal, symmetric, distance, distance_x, distance_y, radius, angle.
   value accepts numbers or "=expressions".
+  distance_x/distance_y are SIGNED and measured FROM the first referenced point
+  TO the second, so [[0,"start"],[-1,"center"]] with +30 puts the origin at
+  (−30, ·) — swapping the two items flips the sign. Write the constraint in the
+  order you mean it.
+- Reusing an existing name does NOT overwrite: FreeCAD de-duplicates
+  ("HoleProfile" → "HoleProfile001"); the response carries the actual name,
+  so reuse it from there.
 - Sketch coordinates are 2D [x, y] in mm in the plane's local frame.
 - Result: fully constrained sketches report fully_constrained: true;
   under-constrained ones succeed with a warning; conflicting/failed sketches
@@ -205,11 +229,15 @@ Example (parametric plate: variables -> sketch -> pad):
 pad — extrude a closed sketch profile (obj_name = profile sketch).
 Optional in obj_properties: length (default 10), reversed, midplane, body, name.
 Numeric params accept "=expressions". The profile must have a closed wire.
+A NEGATIVE length is legal and extrudes the other way (the result warns).
+A profile that does not touch the base still succeeds (the Body allows
+compounds) but leaves a floating solid — the result warns about it.
 Attachment fusion: on a face-attached sketch, pad FUSES into the supporting
 solid automatically — do not pad-then-boolean.""",
     "pocket": """\
 pocket — cut a closed sketch profile out of a solid (obj_name = profile sketch).
 Optional: length (default 10), reversed, midplane, body, name.
+A NEGATIVE length is legal and cuts the other way (the result warns).
 Attachment fusion: on a face-attached sketch, pocket CUTS the supporting
 solid via attachment — no boolean needed.""",
     "revolution": """\
@@ -222,17 +250,35 @@ Same axis/angle params as revolution.""",
     "thickness": """\
 thickness — shell a solid (obj_name = base solid feature).
 Required in obj_properties: faces (selector), value. Optional: reversed, body, name.
-faces uses the selector syntax ("all" / index list / name list).""",
+faces uses the selector syntax ("all" / index list / name list) and also
+accepts DIRECTION tokens ("+Z", "top", "MaxX", …), which is the stable way to
+name a face (FaceN is re-derived after every feature). A direction picks the
+FARTHEST face facing that way, so on a stepped part check the echoed
+`resolved` (face name + center + normal) before trusting the result.
+faces='all' is refused: those are the faces to OPEN, and removing all of them
+leaves the solid unchanged.
+DIRECTION: the wall is offset along the selected face's normal; when that
+normal points OUT of the material the part grows (live: a 100x60x40 box came
+back 3 mm bigger in every axis, walls sitting on the outside). For an inward
+(hollowing) shell pass reversed=true — the result then carries a warning when
+material was added outside, so a wrong-direction shell is not silent.""",
     "draft": """\
 draft — taper faces (obj_name = base solid feature).
 Required in obj_properties: faces (selector), angle.
-Optional: neutral_plane, pull_direction ({"edge": ["ObjName", "EdgeN"]}), body, name.""",
+Optional: neutral_plane, pull_direction ({"edge": ["ObjName", "EdgeN"]}), body, name.
+faces accepts direction tokens like thickness; the result echoes the resolved
+faces (name/center/normal).""",
     "datum_plane": """\
 datum_plane — PartDesign datum plane (obj_name = plane name, default
 "DatumPlane", may be omitted).
 Required in obj_properties: plane — "XY"/"XZ"/"YZ" (attached to the body
 origin) or {"face": ["ObjName", "FaceN"]} (attached to an existing face;
-"+Z"/"top"/… direction tokens resolve like a sketch's plane.face).
+"+Z"/"top"/"MaxX"/… direction tokens resolve like a sketch's plane.face).
+Add {"face": [...], "center": true} to put the plane's origin at the MIDDLE of
+the face (the default is the face's parametric origin — a corner on
+rectangular faces; sketches attached to the datum then land there).
+The result echoes the resolved face (name/center/normal, and the datum's own
+support), so a surprise direction pick is visible.
 Optional: offset (mm along the plane normal), body.
 Sketch on it with plane={"datum": name}.""",
     "hull": """\
@@ -445,6 +491,62 @@ A listening port that does not answer ping is the one case that is not a
 setup problem: FreeCAD is up but its GUI thread is busy or wedged (modal
 dialog, long recompute, deadlock). The addon log stays readable exactly
 there — grep it with get_addon_log before restarting.""",
+    "session": """\
+session — modeling session bound to a document (step recording + rollback).
+
+With a session active, every committed cad() mutation on its document is
+recorded as a transaction-backed step, so rollback can backtrack instead of
+delete-and-rebuild. A mutating execute_code run is an atomic step too; a
+read-only run is not recorded.
+
+Actions:
+  start       bind a session to doc_name (create_document=true creates the
+              document first; name gives a human label). Returns session_id.
+              One active session per server process.
+  status      step count, document state, next-step suggestions, risks
+              (GUI-edit drift, non-atomic steps, connectivity islands)
+  get_steps   full step records + notes + redo buffer
+  rollback    undo everything after to_step (keep 1..to_step; 0 = undo all).
+              to_step is REQUIRED so a bare call cannot wipe the session.
+              force=true rolls back across non-atomic steps (risky: undo may
+              revert the wrong change). Removed steps sit in a redo buffer.
+              success=false means the model did NOT reach the target state
+              (the undo came up short or the object set does not match);
+              warnings say what was left behind.
+  redo        restore n rolled-back steps (valid until a new cad() call).
+              Fails loudly when FreeCAD's redo stack no longer holds this
+              document's transactions — the buffer and the document are then
+              out of sync, and nothing is changed.
+  add_note    attach an insight to the log (note; note_type: observation |
+              assumption | limitation | correction)
+  pause       persist and release the active session (returns session_id)
+  resume      reactivate a persisted session (session_id; see list); warns
+              when its document is no longer open
+  list        all persisted sessions, most recently updated first
+  complete    finish: store the workflow as a reusable pattern (recall it
+              with recall_patterns) and optionally save the document
+              (save=true, save_path, description, tags)
+
+Undo window: FreeCAD keeps the last 20 undo steps per document by default
+(Preferences > General > Document), so a session longer than that cannot roll
+back past the window. A rollback that comes up short says so instead of
+pretending; the FreeCAD-side step journal (step_control rollback_to) can still
+rebuild the model there.
+""",
+    "screenshots": """\
+screenshots: get_view is the only capture tool — everything else is text.
+
+get_view always captures: the PNG is written under
+$CADPILOT_HOME/screenshots/ (newest 100 kept) and the response carries only
+the file path as text ("Screenshot saved to <path> (WxH). View it with your
+file-reading tool."). No image data enters the conversation; a multimodal
+client opens the PNG with its own file tool. If saving fails, the response
+says so in text.
+
+--only-text-feedback forbids screenshots entirely (get_view then returns a
+text notice). Captures are capped at 384px on the long edge unless
+width/height are given; TechDraw and Spreadsheet views yield no screenshot
+at all.""",
 }
 
 HELP_TOPICS: dict[str, str] = {
@@ -459,6 +561,8 @@ HELP_TOPICS: dict[str, str] = {
             "step_control",
             "get_addon_log",
             "multi_agent",
+            "session",
+            "screenshots",
         )
     },
     "assembly_session": "assembly_session tool (persistent-joint assembly)",
@@ -467,6 +571,8 @@ HELP_TOPICS: dict[str, str] = {
     "step_control": "step_control tool (run / roll back / re-run steps)",
     "get_addon_log": "get_addon_log tool (read the addon's debug log)",
     "multi_agent": "running several agents against one FreeCAD without cross-talk",
+    "session": "session tool (step recording + rollback state machine)",
+    "screenshots": "get_view is the only capture tool (file path delivery)",
 }
 
 

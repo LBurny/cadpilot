@@ -42,6 +42,25 @@ def _func(tree, name):
     )
 
 
+def _writer_body(tree, name):
+    """The body that does the writing, following a thin wrapper's delegation.
+
+    ``run_record`` now only activates the document (``with active_document(doc):
+    return _run_record_locked(...)``) and the transaction lives in the inner
+    function; these guards care about the code that writes, not the name it
+    sits under.
+    """
+    func = _func(tree, name)
+    for stmt in func.body:
+        if isinstance(stmt, ast.With):
+            for sub in stmt.body:
+                if isinstance(sub, ast.Return) and isinstance(sub.value, ast.Call):
+                    callee = sub.value.func
+                    if isinstance(callee, ast.Name):
+                        return _func(tree, callee.id)
+    return func
+
+
 def _attrs(node) -> set[str]:
     """Attribute names (``x.UndoCount`` -> 'UndoCount')."""
     return {n.attr for n in ast.walk(node) if isinstance(n, ast.Attribute)}
@@ -85,7 +104,7 @@ def test_commit_probe_survives_the_undo_cap():
         (ENGINE, "downgrade_if_no_undo"),
         (ENGINE, "run_record"),
     ):
-        body = _func(tree, owner)
+        body = _writer_body(tree, owner)
         assert "undo_token" in _attrs(body) or "undo_token" in _names(body), (
             f"{owner} must probe with undo_token"
         )
@@ -188,6 +207,45 @@ def test_unresolved_count_expression_is_reported():
         "a misspelled alias leaves the probe Invalid with value 0 — it must be detected"
     )
     assert "Invalid" in _strings(helper)
+
+
+def test_ghost_stack_entries_never_consume_a_rollback_slot():
+    """FreeCAD 1.1.4 attributes an undo entry to the document that is ACTIVE at
+    commit time, so another document's transaction lands here rendered
+    "-> name". Popping a ghost is a no-op for this document: counting it made a
+    rollback report steps it never undid (live-verified), and leaving it in the
+    journal comparison degraded every reexecute to a full rebuild."""
+    stack_op = _func(ENGINE, "_stack_op")
+    assert "_is_ghost_entry" in _names(stack_op), "the undo loop must recognise ghosts"
+    assert "ghosts_skipped" in _strings(stack_op), "the skipped count must reach the caller"
+    journal_check = _func(ENGINE, "_stack_holds_journal")
+    assert "_real_undo_names" in _names(journal_check), (
+        "the journal comparison must look at the same non-ghost sequence the undo loop pops"
+    )
+
+
+def test_every_transaction_activates_its_own_document():
+    """The producer half of the ghost-entry bug: a transaction must be recorded
+    while its document is App-active, or every concurrent multi-document run
+    parks ghost entries on the other document's stack."""
+    rpc_wrapper = _func(RPC, "_run_op_with_screenshot")
+    assert "active_document" in _names(rpc_wrapper) or "active_document" in _attrs(rpc_wrapper), (
+        "_run_op_with_screenshot must activate the target across open/commit"
+    )
+    for owner in ("run_record", "_remove_objects"):
+        assert "active_document" in _names(_func(ENGINE, owner)), (
+            f"{owner} opens a transaction and must activate its document too"
+        )
+
+
+def test_redo_reports_an_empty_stack_instead_of_silent_success():
+    """session_redo's addon half: redo_transactions(0 redone) used to answer
+    success with count 0, and the session layer reported restored_steps=[] while
+    the redo buffer never drained."""
+    body = _func(RPC, "_undo_redo")
+    assert any("nothing to redo" in s for s in _strings(body))
+    src = ast.unparse(body)
+    assert "out['success'] = False" in src or 'out["success"] = False' in src
 
 
 def test_snapshot_does_not_claim_a_mutation():

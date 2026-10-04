@@ -57,7 +57,7 @@ def test_long_session_suggests_complete():
     for _ in range(10):
         sess.add_step("create_object", "s", objects_after=["Box"])
     suggestions = suggest_next_steps(sess, ["Box"])
-    assert any(s["tool"] == "session_complete" for s in suggestions)
+    assert any(s["tool"] == "session" and s["operation"] == "complete" for s in suggestions)
 
 
 def test_disconnected_islands_risk():

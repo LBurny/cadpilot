@@ -8,6 +8,7 @@ Result metadata (DoF, solver diagnostics) is stashed module-level and consumed
 by ``feature_ops.describe_feature`` — builders only return the object itself.
 """
 
+import contextlib
 import math
 
 import FreeCAD
@@ -17,6 +18,10 @@ import Sketcher
 # Result of the most recent build_sketch_gui call; read once by
 # describe_feature() via pop_last_sketch_info().
 _LAST_SKETCH_INFO: dict | None = None
+
+# Which plane/face the last _attach_sketch call resolved to (echoed in the
+# sketch result so a wrong face pick is visible).
+_LAST_ATTACHMENT: dict | None = None
 
 # spec point keyword -> Sketcher PointPos
 _POINT_POS = {"start": 1, "end": 2, "center": 3, "mid": 3}
@@ -361,6 +366,26 @@ _FACE_WORDS = {
     "left": "-X",
     "back": "+Y",
     "front": "-Y",
+    # Alternates an LLM reaches for (and that FreeCAD's own datum/frame names
+    # resemble): "MaxX" is clearly +X but used to die as an out-of-range FaceN.
+    "maxx": "+X",
+    "minx": "-X",
+    "maxy": "+Y",
+    "miny": "-Y",
+    "maxz": "+Z",
+    "minz": "-Z",
+    "xmax": "+X",
+    "xmin": "-X",
+    "ymax": "+Y",
+    "ymin": "-Y",
+    "zmax": "+Z",
+    "zmin": "-Z",
+    "x+": "+X",
+    "x-": "-X",
+    "y+": "+Y",
+    "y-": "-Y",
+    "z+": "+Z",
+    "z-": "-Z",
 }
 
 
@@ -393,7 +418,67 @@ def _resolve_semantic_face(ref, token: str) -> str:
     return best[1]
 
 
+def _face_echo(obj, face_name: str) -> dict:
+    """A small report of the face a selector resolved to (name/center/normal)."""
+    entry = {"object": obj.Name, "face": face_name}
+    with contextlib.suppress(Exception):
+        face = obj.Shape.getElement(face_name)
+        if face is not None:
+            entry["center"] = [round(float(v), 4) for v in face.CenterOfMass]
+            if face.Surface.TypeId == "Part::GeomPlane":
+                entry["normal"] = [round(float(v), 4) for v in face.normalAt(0, 0)]
+    return entry
+
+
+def _face_center_point(face) -> FreeCAD.Vector:
+    """A point ON the face, at its middle.
+
+    ``Face.CenterOfMass`` is the AREA centroid: for an annular face (the top
+    of a bushing) it sits in the hole, so it must be validated, and the
+    midpoint of the longest edge (always on the face) is the fallback.
+    """
+    point = FreeCAD.Vector(face.CenterOfMass)
+    try:
+        if face.isInside(point, 1e-5, True):
+            return point
+    except Exception:
+        return point
+    edges = list(getattr(face, "Edges", None) or [])
+    if not edges:
+        return point
+    edge = max(edges, key=lambda e: e.Length)
+    return (edge.Vertexes[0].Point + edge.Vertexes[-1].Point) * 0.5
+
+
+def center_attachment(obj, ref, face_name, doc, extra_offset: float = 0.0):
+    """Move an attached object's origin to the middle of its face.
+
+    A ``FlatFace`` attachment lands the object's origin on the face's
+    PARAMETRIC origin — for a rectangular side face that is a corner. A circle
+    meant for the middle of a 100x60 face therefore ended up at the corner and
+    the pocket cut a clipped half-hole through the wall, reported as plain
+    success (live). ``plane={"face": [...], "center": true}`` asks for the
+    middle; the delta is stored as an AttachmentOffset in the attachment's own
+    frame, so the association with the face is kept.
+    """
+    doc.recompute()
+    try:
+        n = int(str(face_name)[4:]) if str(face_name).startswith("Face") else 0
+        face = ref.Shape.Faces[n - 1]
+    except Exception:
+        return
+    target = _face_center_point(face)
+    placement = obj.Placement
+    delta = placement.Rotation.inverted().multVec(target - placement.Base)
+    if extra_offset:
+        # The caller's `offset` is along the face normal (= the attachment's Z).
+        delta = delta + FreeCAD.Vector(0, 0, extra_offset)
+    obj.AttachmentOffset = FreeCAD.Placement(delta, FreeCAD.Rotation())
+    doc.recompute()
+
+
 def _attach_sketch(sketch, doc, spec):
+    global _LAST_ATTACHMENT
     plane = spec.get("plane", "XY")
     offset = float(spec.get("offset", 0) or 0)
 
@@ -420,13 +505,27 @@ def _attach_sketch(sketch, doc, spec):
             face_name = _resolve_semantic_face(ref, face_name)
         n = int(face_name[4:]) if face_name.startswith("Face") else 0
         if n < 1 or n > len(ref.Shape.Faces):
+            if not face_name.startswith("Face"):
+                raise ValueError(
+                    f"plane.face[1] must be a face name ('FaceN', 1-"
+                    f"{len(ref.Shape.Faces)}) or a direction token ('+Z', '-X', 'top', "
+                    "'bottom', 'front', 'back', 'left', 'right', 'MaxX', ...), got "
+                    f"{face_name!r}."
+                )
             raise ValueError(
                 f"'{face_name}' out of range on '{ref.Name}' (1-{len(ref.Shape.Faces)})."
             )
         support_prop = "AttachmentSupport" if hasattr(sketch, "AttachmentSupport") else "Support"
         setattr(sketch, support_prop, [(ref, face_name)])
         sketch.MapMode = "FlatFace"
-        if offset:
+        _LAST_ATTACHMENT = _face_echo(ref, face_name)
+        _LAST_ATTACHMENT["centered"] = bool(plane.get("center"))
+        if plane.get("center"):
+            # Origin at the middle of the face instead of its parametric
+            # origin (a corner on rectangular faces); the caller's offset is
+            # along the face normal = the attachment frame's Z.
+            center_attachment(sketch, ref, face_name, doc, offset)
+        elif offset:
             sketch.AttachmentOffset = FreeCAD.Placement(
                 FreeCAD.Vector(0, 0, offset), FreeCAD.Rotation()
             )
@@ -439,6 +538,13 @@ def _attach_sketch(sketch, doc, spec):
         support_prop = "AttachmentSupport" if hasattr(sketch, "AttachmentSupport") else "Support"
         setattr(sketch, support_prop, [(ref, "")])
         sketch.MapMode = "FlatFace"
+        _LAST_ATTACHMENT = {"object": ref.Name, "type": "datum"}
+        with contextlib.suppress(Exception):
+            # Follow the datum's own support so the echo names the REAL base
+            # face the sketch hangs off.
+            support = list(getattr(ref, "AttachmentSupport", None) or [])
+            if support and support[0]:
+                _LAST_ATTACHMENT["support"] = _face_echo(support[0][0], str(support[0][1]))
         if offset:
             sketch.AttachmentOffset = FreeCAD.Placement(
                 FreeCAD.Vector(0, 0, offset), FreeCAD.Rotation()
@@ -477,8 +583,9 @@ def build_sketch_gui(doc, spec):
     Raises on any failure — the caller's transaction wrapper aborts, so the
     document stays untouched.
     """
-    global _LAST_SKETCH_INFO
+    global _LAST_SKETCH_INFO, _LAST_ATTACHMENT
     _LAST_SKETCH_INFO = None
+    _LAST_ATTACHMENT = None
 
     geometry = spec.get("geometry")
     if not isinstance(geometry, list) or not geometry:
@@ -514,4 +621,10 @@ def build_sketch_gui(doc, spec):
         "external_count": len(spec.get("external") or []),
         "diagnostics": diag or None,
     }
+    if _LAST_ATTACHMENT:
+        # Which face/plane the sketch actually landed on, with its center and
+        # normal — a direction token on a stepped part picks the FARTHEST face
+        # facing that way, and without this echo the wrong pick looked exactly
+        # like success (live: a seat-face sketch landed on a wall top 92 mm up).
+        _LAST_SKETCH_INFO["plane"] = _LAST_ATTACHMENT
     return sketch

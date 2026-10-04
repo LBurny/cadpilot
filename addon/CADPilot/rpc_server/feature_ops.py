@@ -12,6 +12,11 @@ import FreeCAD
 import Part
 
 from rpc_server import sketcher_ops, tip_policy
+from rpc_server.geometry_query import body_owner
+
+# Selector resolution of the most recent face-based build; read once by
+# describe_feature() (mirrors sketcher_ops' sketch-info mechanism).
+_LAST_FEATURE_INFO: dict | None = None
 
 FEATURE_TYPES = (
     "boolean",
@@ -51,12 +56,27 @@ def _get_obj(doc, name, role="object"):
     return obj
 
 
+def _is_direction_token(item: str) -> bool:
+    return item.startswith(("+", "-")) or item.lower() in sketcher_ops._FACE_WORDS
+
+
 def _resolve_elements(obj, selector, kind):
-    """Selector -> sub-element names. kind: 'Edge' or 'Face'."""
+    """Selector -> sub-element names. kind: 'Edge' or 'Face'.
+
+    Faces also accept the direction tokens a sketch's plane.face takes
+    ('+Z', 'top', 'MaxX', …): face names are re-derived after every feature, so
+    an LLM that knows the direction but not the generated name had to run a
+    get_topology round-trip first (live workflow feedback). 'all' and explicit
+    index/name lists work exactly as before.
+    """
     elements = getattr(obj.Shape, "Edges" if kind == "Edge" else "Faces")
     all_names = [f"{kind}{i + 1}" for i in range(len(elements))]
     if selector == "all":
         return all_names
+    if isinstance(selector, str):
+        if kind == "Face" and _is_direction_token(selector):
+            return [sketcher_ops._resolve_semantic_face(obj, selector)]
+        raise ValueError(f"selector must be 'all' or a non-empty list, got {selector!r}")
     if not isinstance(selector, list) or not selector:
         raise ValueError(f"selector must be 'all' or a non-empty list, got {selector!r}")
     names = []
@@ -66,12 +86,46 @@ def _resolve_elements(obj, selector, kind):
                 raise ValueError(f"{kind} index {item} out of range (0-{len(all_names) - 1}).")
             names.append(all_names[item])
         elif isinstance(item, str):
-            if item not in all_names:
-                raise ValueError(f"'{item}' not a valid sub-element (e.g. {all_names[0]}).")
-            names.append(item)
+            if item in all_names:
+                names.append(item)
+                continue
+            if kind == "Face" and _is_direction_token(item):
+                names.append(sketcher_ops._resolve_semantic_face(obj, item))
+                continue
+            raise ValueError(f"'{item}' not a valid sub-element (e.g. {all_names[0]}).")
         else:
             raise ValueError(f"selector items must be int or str, got {item!r}")
     return names
+
+
+def _record_resolved_faces(base, names) -> None:
+    """Echo the faces a selector resolved to, so a wrong pick is visible.
+
+    A direction token picks the FARTHEST face facing that way; on a stepped
+    part that can be a different face than the caller pictured, and without an
+    echo the result looked exactly like success (live: a circle meant for the
+    seat face landed on a wall top 92 mm above it).
+    """
+    global _LAST_FEATURE_INFO
+    info = []
+    for name in names:
+        entry = {"face": name}
+        with contextlib.suppress(Exception):
+            face = base.Shape.getElement(name)
+            if face is not None:
+                entry["center"] = [round(float(v), 4) for v in face.CenterOfMass]
+                if face.Surface.TypeId == "Part::GeomPlane":
+                    entry["normal"] = [round(float(v), 4) for v in face.normalAt(0, 0)]
+        info.append(entry)
+    _LAST_FEATURE_INFO = {"base": base.Name, "faces": info}
+
+
+def pop_last_feature_info() -> dict | None:
+    """The last selector resolution, read once by describe_feature()."""
+    global _LAST_FEATURE_INFO
+    info = _LAST_FEATURE_INFO
+    _LAST_FEATURE_INFO = None
+    return info
 
 
 def _axis_vec(value, default="Z"):
@@ -379,7 +433,33 @@ def _pattern_count(doc, raw) -> int:
                 "spreadsheet alias/object name (a misspelled alias evaluates to 0, not an error)."
             )
         return round(value)
-    return int(raw)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"pattern count must be an integer >= 2 or an expression like '=Vars.n_holes', "
+            f"got {raw!r}."
+        ) from None
+
+
+def _bind_count_expression(feat, raw, ptype: str) -> None:
+    """Keep the pattern count tied to its spreadsheet expression.
+
+    ``_pattern_count`` resolves "=Vars.n_holes" once; without the binding the
+    pattern froze at the value the spreadsheet had on creation day (live: a
+    flange stayed at 6 holes after n_holes became 8, while pad and pocket
+    followed their aliases) — valid geometry, silently the wrong model.
+    PartDesign patterns take Occurrences, Draft arrays NumberPolar/NumberX.
+    """
+    if not (isinstance(raw, str) and raw.startswith("=")):
+        return
+    props = ("NumberPolar", "NumberX") if ptype == "polar" else ("NumberX",)
+    for prop in (*props, "Occurrences"):
+        if prop not in list(getattr(feat, "PropertiesList", []) or []):
+            continue
+        with contextlib.suppress(Exception):
+            feat.setExpression(prop, raw[1:])
+        return
 
 
 def _build_pattern(doc, spec):
@@ -393,7 +473,9 @@ def _build_pattern(doc, spec):
         raise ValueError(f"pattern_type must be linear/polar, got {ptype!r}")
     body = _parent_body(base)
     if body is not None:
-        return _build_pd_pattern(doc, body, base, spec, ptype, count)
+        feat = _build_pd_pattern(doc, body, base, spec, ptype, count)
+        _bind_count_expression(feat, spec.get("count"), ptype)
+        return feat
 
     import Draft
 
@@ -414,6 +496,7 @@ def _build_pattern(doc, spec):
                 feat.Axis = _axis_vec(axis)
     if spec.get("name"):
         feat.Label = spec["name"]
+    _bind_count_expression(feat, spec.get("count"), ptype)
     return feat
 
 
@@ -453,7 +536,16 @@ def _build_variables(doc, spec):
             ss.set(cell, value if value.startswith("=") else f'"{value}"')
         else:
             raise ValueError(f"cells['{cell}']: unsupported value {value!r}.")
-        ss.setAlias(cell, str(alias))
+        try:
+            ss.setAlias(cell, str(alias))
+        except Exception as e:
+            # FreeCAD's own "Invalid alias" names neither the cell nor the
+            # alias, so the caller could not tell which entry was wrong.
+            raise ValueError(
+                f"cells['{cell}']: alias {alias!r} was rejected ({e}). Aliases must "
+                "start with a letter and contain only letters/digits/underscores "
+                "(no spaces, no leading digit, not a cell reference like 'A1')."
+            ) from None
     doc.recompute()
     return ss
 
@@ -483,6 +575,14 @@ def _build_move(doc, spec):
     """
     _require(spec, "base")
     obj = _get_obj(doc, spec["base"], "base")
+    # PartDesign features do not own their frame: FreeCAD rewrites their
+    # Placement on the next recompute (live-verified — a moved Pad returned to
+    # (0,0,0) on the next cad() call, and the boolean that followed fused the
+    # UN-MOVED shape). Moving the owning Body is the only persistent version of
+    # the same intent; describe_feature reports the redirect.
+    owner = body_owner(obj)
+    if owner is not None:
+        obj = owner
     current = obj.Placement
 
     # Absolute placement override
@@ -496,8 +596,7 @@ def _build_move(doc, spec):
             _move_vec3(axis, "placement.Rotation.Axis"),
             float(rot_data.get("Angle", 0)),
         )
-        obj.Placement = FreeCAD.Placement(new_base, new_rot)
-        return obj
+        return _assign_placement(doc, obj, new_base, new_rot)
 
     # Relative translation / rotation — at least one is required.
     translate = spec.get("translate", {})
@@ -527,8 +626,30 @@ def _build_move(doc, spec):
     elif rotate:
         new_base = current.Base
         new_rot = delta_rot.multiply(current.Rotation)
+    return _assign_placement(doc, obj, new_base, new_rot)
 
+
+def _assign_placement(doc, obj, new_base, new_rot):
+    """Write the Placement, then verify it survives a recompute.
+
+    A move that FreeCAD silently undoes (an attached sketch or datum plane
+    recomputes its Placement away) must not be reported as success — the
+    readback turns it into an honest failure that rolls the whole op back.
+    """
     obj.Placement = FreeCAD.Placement(new_base, new_rot)
+    doc.recompute()
+    back = obj.Placement
+    drift = (back.Base - new_base).Length
+    with contextlib.suppress(Exception):
+        drift += abs(back.Rotation.multiply(new_rot.inverted()).Angle) * 100.0  # deg -> ~mm
+    if drift > 1e-4:
+        raise RuntimeError(
+            f"move did not persist on '{obj.Name}': it is back at "
+            f"[{round(back.Base.x, 4)}, {round(back.Base.y, 4)}, {round(back.Base.z, 4)}] "
+            "after a recompute. Attached sketches/datum planes get their Placement from "
+            "their attachment (move the supporting face or change the offset instead), and "
+            "a PartDesign feature is positioned by its Body."
+        )
     return obj
 
 
@@ -559,6 +680,85 @@ def _profile_sketch(doc, spec, op):
 _PAD_TYPES = ("length",)  # uptoface & co. intentionally unsupported for now
 
 
+def _set_length(feat, op, value):
+    """Assign Length with the op's parameter named on parse failures.
+
+    FreeCAD's own messages for a bad quantity name nothing ("syntax error",
+    "wrong type as quantity: NoneType"), so the caller could not tell which
+    parameter was wrong. Negative values are legal in FreeCAD (the feature
+    goes the other way) and only warn via describe_feature.
+    """
+    try:
+        _set_or_bind(feat, "Length", value)
+    except Exception as e:
+        raise ValueError(
+            f"{op} length {value!r} is not a valid length: {e}. Use a number in mm "
+            "(7.5 or '10mm') or an expression like '=Vars.thickness'."
+        ) from None
+
+
+def _padlike_attachment_base(body, sketch):
+    """The solid an attached profile cuts/fuses into, seen through the chain.
+
+    PartDesign fuses a pocket/pad with the solid its sketch is DIRECTLY
+    attached to, but not through an intermediary: a sketch attached to a datum
+    plane that is itself attached to a solid gave the pocket no material at
+    all, so it extruded its profile as a floating disk and reported success
+    (live-verified: body volume 942.5 mm^3 of nothing instead of a cut). Walk
+    the attachment chain and hand the solid to the body as its BaseFeature,
+    which is what the GUI's "Base feature" tool does.
+
+    A datum plane/point has a Shape of its own (a face / a vertex) but no
+    SOLIDS, and adopting one as BaseFeature is silently refused — so only an
+    object that actually carries a solid ends the walk.
+    """
+    ref = sketch
+    for _ in range(4):
+        support = list(getattr(ref, "AttachmentSupport", None) or [])
+        if not support:
+            return None
+        obj = support[0][0] if support[0] else None
+        if obj is None:
+            return None
+        shape = getattr(obj, "Shape", None)
+        if shape is not None and not shape.isNull() and getattr(shape, "Solids", None):
+            owner = body_owner(obj)
+            if owner is not None and owner is not body:
+                # The material lives in ANOTHER body; linking it as this
+                # body's BaseFeature would span two bodies. Report no material
+                # (the cut then warns instead of pretending).
+                return None
+            return obj
+        ref = obj
+    return None
+
+
+def _ensure_material_base(doc, body, sketch, op):
+    """Give the Body a base solid when its profile's material lives outside.
+
+    No-op for a body that already has material, for a plain un-attached
+    profile, and when the resolved solid is already a member.
+    """
+    try:
+        if body is None or (body.Shape is not None and not body.Shape.isNull()):
+            return None
+        if getattr(body, "BaseFeature", None) is not None:
+            return None
+        solid = _padlike_attachment_base(body, sketch)
+        if solid is None or solid in list(getattr(body, "Group", [])):
+            return None
+        body.BaseFeature = solid
+        doc.recompute()
+        FreeCAD.Console.PrintMessage(
+            f"CADPilot: {op} profile is attached to '{solid.Name}' through a datum; "
+            f"adopted it as {body.Name}'s BaseFeature so the feature has material.\n"
+        )
+        return solid
+    except Exception as e:
+        FreeCAD.Console.PrintWarning(f"CADPilot: could not adopt a base feature: {e}\n")
+        return None
+
+
 def _build_padlike(doc, spec, fc_type, default_name):
     body = sketcher_ops._get_or_create_body(doc, spec.get("body"))
     sketch = _profile_sketch(doc, spec, fc_type)
@@ -567,9 +767,10 @@ def _build_padlike(doc, spec, fc_type, default_name):
         raise ValueError(f"pad_type must be one of {_PAD_TYPES}, got {ptype!r}")
     doc.recompute()
     _require_closed_profile(sketch, fc_type)
+    _ensure_material_base(doc, body, sketch, fc_type.split("::")[-1].lower())
     feat = body.newObject(fc_type, spec.get("name") or default_name)
     feat.Profile = sketch
-    _set_or_bind(feat, "Length", spec.get("length", 10.0))
+    _set_length(feat, fc_type.split("::")[-1].lower(), spec.get("length", 10.0))
     feat.Reversed = bool(spec.get("reversed", False))
     feat.Midplane = bool(spec.get("midplane", False))
     return feat
@@ -591,6 +792,7 @@ def _build_revlike(doc, spec, fc_type, default_name):
     sketch = _profile_sketch(doc, spec, fc_type)
     doc.recompute()
     _require_closed_profile(sketch, fc_type)
+    _ensure_material_base(doc, body, sketch, fc_type.split("::")[-1].lower())
     feat = body.newObject(fc_type, spec.get("name") or default_name)
     feat.Profile = sketch
     _set_or_bind(feat, "Angle", spec.get("angle", 360.0))
@@ -634,6 +836,7 @@ def _build_datum_plane(doc, spec):
     dp = body.newObject("PartDesign::Plane", spec.get("base") or "DatumPlane")
     plane = spec["plane"]
     support_prop = "AttachmentSupport" if hasattr(dp, "AttachmentSupport") else "Support"
+    center_target = None
     if isinstance(plane, str):
         role = _ORIGIN_ROLE.get(plane.upper())
         if role is None:
@@ -660,15 +863,29 @@ def _build_datum_plane(doc, spec):
             face_name = sketcher_ops._resolve_semantic_face(ref, face_name)
         n = int(face_name[4:]) if face_name.startswith("Face") else 0
         if n < 1 or n > len(ref.Shape.Faces):
+            if not face_name.startswith("Face"):
+                raise ValueError(
+                    f"plane.face[1] must be a face name ('FaceN', 1-"
+                    f"{len(ref.Shape.Faces)}) or a direction token ('+Z', '-X', 'top', "
+                    "'bottom', 'front', 'back', 'left', 'right', 'MaxX', ...), got "
+                    f"{face_name!r}."
+                )
             raise ValueError(
                 f"'{face_name}' out of range on '{ref.Name}' (1-{len(ref.Shape.Faces)})."
             )
         setattr(dp, support_prop, [(ref, face_name)])
+        if plane.get("center"):
+            center_target = (ref, face_name)
     else:
         raise ValueError(f"plane must be XY/XZ/YZ or {{'face': ...}}, got {plane!r}")
     dp.MapMode = "FlatFace"
     offset = float(spec.get("offset", 0) or 0)
-    if offset:
+    if center_target is not None:
+        # plane={"face": [...], "center": true}: origin at the middle of the
+        # face instead of its parametric origin (a corner on rectangular
+        # faces), so a sketch attached to this datum lands where it looks.
+        sketcher_ops.center_attachment(dp, center_target[0], center_target[1], doc, offset)
+    elif offset:
         dp.AttachmentOffset = FreeCAD.Placement(FreeCAD.Vector(0, 0, offset), FreeCAD.Rotation())
     return dp
 
@@ -760,12 +977,22 @@ def _build_hull(doc, spec):
 
 def _build_thickness(doc, spec):
     _require(spec, "faces", "value")
+    if spec["faces"] == "all":
+        # faces = the faces to OPEN. Selecting all of them leaves nothing to
+        # remove: FreeCAD accepts the feature and returns the solid unchanged,
+        # so the old path reported success with identical geometry (live).
+        raise ValueError(
+            "thickness needs the faces to OPEN; faces='all' removes every wall and "
+            "FreeCAD returns the solid unchanged. List the faces to remove "
+            '(e.g. faces=[5] or ["Face5"]) or all but one.'
+        )
     body = sketcher_ops._get_or_create_body(doc, spec.get("body"))
     base = _get_obj(doc, spec["base"], "base feature")
     owner = _parent_body(base)
     if owner is not None:
         _require_end_of_chain(owner, base, "thickness")
     names = _resolve_elements(base, spec["faces"], "Face")
+    _record_resolved_faces(base, names)
     feat = body.newObject("PartDesign::Thickness", spec.get("name") or "Thickness")
     if "Faces" in feat.PropertiesList:
         # FreeCAD <= 1.0: plain Base link + separate Faces LinkSub.
@@ -787,6 +1014,7 @@ def _build_draft(doc, spec):
     if owner is not None:
         _require_end_of_chain(owner, base, "draft")
     names = _resolve_elements(base, spec["faces"], "Face")
+    _record_resolved_faces(base, names)
     neutral = spec.get("neutral_plane", names[0])
     neutral_names = _resolve_elements(
         base, neutral if isinstance(neutral, list) else [neutral], "Face"
@@ -823,6 +1051,33 @@ def _build_draft(doc, spec):
 _CUT_TYPES = ("pocket", "groove")
 
 
+def _cut_without_material(feat) -> str:
+    """Warn when a cut feature has no solid to cut into.
+
+    A pocket/groove whose profile resolves to no material (an attachment chain
+    ending in another body, an un-attached sketch in an empty body) still
+    "succeeds": FreeCAD returns the profile's own extrusion — a floating disk
+    where the user expected a hole (live: 942.5 mm^3 of nothing). The body's
+    material or a BaseFeature is what makes a cut real.
+    """
+    try:
+        if getattr(feat, "BaseFeature", None) is not None:
+            return ""
+        body = _parent_body(feat)
+        if body is not None:
+            sh = body.Shape
+            if sh is not None and not sh.isNull() and float(sh.Volume) > 0:
+                return ""  # attachment fusion: the body's material is the base
+        return (
+            f"{feat.Name} has no material to cut: neither the body nor a BaseFeature "
+            "provides a solid, so the result is the profile's own extrusion (a floating "
+            "disk), not a hole. Attach the profile to a face of the solid this body "
+            "contains, or give the body its base first."
+        )
+    except Exception:
+        return ""
+
+
 def _cut_removed_nothing(feat) -> str:
     """Warn when a cut feature removed no material.
 
@@ -853,23 +1108,164 @@ def _cut_removed_nothing(feat) -> str:
     )
 
 
+def _pad_created_disconnected_solid(feat) -> str:
+    """Warn when an additive feature left the Body with a floating solid.
+
+    A PartDesign Body has AllowCompound=true by default, so a pad whose
+    profile does not touch the base still "succeeds" — the Body quietly
+    becomes a two-solid compound (live: a 750 mm^3 slab floating 15 mm off
+    the base, counted into the Body's volume, no error anywhere). A solid
+    count that grew past the predecessor's is the signal.
+    """
+    try:
+        baseline = getattr(feat, "BaseFeature", None)
+        if baseline is None:
+            profile = feat.Profile[0] if getattr(feat, "Profile", None) else None
+            support = list(getattr(profile, "AttachmentSupport", None) or [])
+            baseline = support[0][0] if support else None
+        if baseline is None:
+            return ""
+        before = len(baseline.Shape.Solids)
+        after = len(feat.Shape.Solids)
+    except Exception:
+        return ""
+    if after <= max(before, 1):
+        return ""
+    return (
+        f"{feat.Name} produced {after} disconnected solid(s) (the base had {before}): the "
+        "profile does not touch the base, so the pad floats next to it (FreeCAD bodies "
+        "allow compounds, so this is valid but almost never intended). Check the sketch's "
+        "attachment and its position on the face."
+    )
+
+
+def _thickness_changed_nothing(feat) -> str:
+    """Warn when a shell left the volume unchanged.
+
+    The remaining case is a selection that spans the whole surface (or a body
+    whose walls cannot be offset): FreeCAD computes, returns the base solid,
+    and the op would report plain success with identical geometry.
+    """
+    try:
+        baseline = getattr(feat, "Base", None)
+        if isinstance(baseline, tuple):
+            baseline = baseline[0]
+        if baseline is None:
+            baseline = getattr(feat, "BaseFeature", None)
+        if baseline is None:
+            return ""
+        prev = float(baseline.Shape.Volume)
+        new = float(feat.Shape.Volume)
+    except Exception:
+        return ""
+    if prev <= 0 or abs(new - prev) > max(1e-6, prev * 1e-9):
+        return ""
+    return (
+        f"{feat.Name} changed nothing (volume still {round(new, 1)} mm^3): the selected "
+        "faces leave no wall to create. For a shell, select the faces to OPEN — a "
+        "selection covering the whole surface removes nothing."
+    )
+
+
+def _thickness_grew_outward(feat) -> str:
+    """Warn when the shell ADDED material outside the original part.
+
+    PartDesign's Thickness default offsets outward whenever the selected face
+    normal points out of the material (live: a 100x60x40 box came back
+    -3..103 in every axis, 240000 -> 59850 mm^3 with the walls sitting on the
+    OUTSIDE). "Shell" usually means hollowing the part, so the growth is worth
+    naming; reversed=true flips the direction.
+    """
+    try:
+        baseline = getattr(feat, "Base", None)
+        if isinstance(baseline, tuple):
+            baseline = baseline[0]
+        if baseline is None:
+            baseline = getattr(feat, "BaseFeature", None)
+        if baseline is None:
+            return ""
+        b0 = baseline.Shape.BoundBox
+        b1 = feat.Shape.BoundBox
+    except Exception:
+        return ""
+    grew = (
+        b1.XMin < b0.XMin - 1e-6
+        or b1.YMin < b0.YMin - 1e-6
+        or b1.ZMin < b0.ZMin - 1e-6
+        or b1.XMax > b0.XMax + 1e-6
+        or b1.YMax > b0.YMax + 1e-6
+        or b1.ZMax > b0.ZMax + 1e-6
+    )
+    if not grew:
+        return ""
+    return (
+        f"{feat.Name} added material OUTSIDE the base part (bbox grew from "
+        f"[{round(b0.XMin, 1)}, {round(b0.YMin, 1)}, {round(b0.ZMin, 1)}] x "
+        f"[{round(b0.XMax, 1)}, {round(b0.YMax, 1)}, {round(b0.ZMax, 1)}] to "
+        f"[{round(b1.XMin, 1)}, {round(b1.YMin, 1)}, {round(b1.ZMin, 1)}] x "
+        f"[{round(b1.XMax, 1)}, {round(b1.YMax, 1)}, {round(b1.ZMax, 1)}]): the "
+        "selected face's normal points out of the material, so the wall was offset "
+        "outward. Pass reversed=true for an inward (hollowing) shell."
+    )
+
+
 def describe_feature(feat, spec) -> dict:
     """Extra result fields for the RPC response (sketch, hull, cut no-ops)."""
-    if spec.get("type") == "hull":
+    op = spec.get("type")
+    if op == "hull":
         sh = feat.Shape
         return {"volume_mm3": round(sh.Volume, 2), "solids": len(sh.Solids)}
-    if spec.get("type") in _CUT_TYPES:
-        message = _cut_removed_nothing(feat)
-        return {"warnings": [message]} if message else {}
-    if spec.get("type") != "sketch":
-        return {}
+    warnings: list[str] = []
+    resolved = pop_last_feature_info() if op in ("thickness", "draft") else None
+    if op in _CUT_TYPES:
+        message = _cut_without_material(feat) or _cut_removed_nothing(feat)
+        if message:
+            warnings.append(message)
+    if op in ("pad", "pocket"):
+        length = spec.get("length")
+        if isinstance(length, (int, float)) and length < 0:
+            warnings.append(
+                f"{feat.Name} length {length} is negative: FreeCAD reads that as the "
+                "opposite direction (it is not an error), and the geometry went that way."
+            )
+    if op == "pad":
+        message = _pad_created_disconnected_solid(feat)
+        if message:
+            warnings.append(message)
+    if op == "thickness":
+        for helper in (_thickness_changed_nothing, _thickness_grew_outward):
+            message = helper(feat)
+            if message:
+                warnings.append(message)
+    if op == "move" and spec.get("base") and feat is not None and spec["base"] != feat.Name:
+        # The move went to the owning Body (a feature's Placement is reset by
+        # every recompute) — say so, or the redirect looks like the wrong
+        # object was moved.
+        return {
+            "moved_object": feat.Name,
+            "note": (
+                f"'{spec['base']}' is a PartDesign feature: FreeCAD resets a feature's "
+                f"Placement on the next recompute, so the move was applied to its Body "
+                f"'{feat.Name}'."
+            ),
+        }
+    if op != "sketch":
+        out = {"warnings": warnings} if warnings else {}
+        if resolved:
+            # Which faces the selector resolved to (center + normal): a
+            # direction token picks the farthest face facing that way, so a
+            # surprise pick must be visible in the reply.
+            out["resolved"] = resolved
+        return out
     info = sketcher_ops.pop_last_sketch_info() or {}
     out = {k: v for k, v in info.items() if k != "object_name"}
     if info.get("fully_constrained") is False:
-        out["warnings"] = [
+        warnings.append(
             f"sketch '{feat.Name}' is under-constrained (DoF={info.get('dof')}); "
             "add dimensional/geometric constraints to fully define it."
-        ]
+        )
+    if warnings:
+        out["warnings"] = warnings
     return out
 
 
@@ -986,4 +1382,13 @@ def create_feature_gui(doc, spec):
         invalid = True
     if invalid:
         raise RuntimeError(_invalid_shape_error(ftype, feat))
+    # Settle the lazy Shape caches INSIDE this op: a read immediately after the
+    # commit (the caller's measure_geometry, the connectivity audit) otherwise
+    # saw an interim result — live: a datum-plane pocket reported Body volume
+    # 239100.0 for a cut that is exactly 239057.5 once the caches catch up.
+    with contextlib.suppress(Exception):
+        _ = feat.Shape
+        body = _parent_body(feat)
+        if body is not None:
+            _ = body.Shape
     return feat

@@ -6,7 +6,6 @@ from ..guidance import detect_risks, suggest_next_steps
 from ..pattern_store import add_pattern, search_patterns
 from ..responses import (
     ToolResponse,
-    add_screenshot_if_available,
     json_response,
     screenshot_content,
     text_response,
@@ -21,14 +20,6 @@ from ..session_state import (
 )
 
 logger = logging.getLogger("CADPilot")
-
-# Screenshot parameters sent inline with mutation RPCs. The addon resolves
-# missing width/height to a downscaled default (see view_manager).
-_INLINE_SCREENSHOT = {"view_name": "Isometric"}
-
-
-def _shot_params(with_screenshot: bool) -> dict[str, Any] | None:
-    return _INLINE_SCREENSHOT if with_screenshot else None
 
 
 def _normalize_object_names(objects: Any) -> list[str]:
@@ -77,18 +68,12 @@ def _set_last_doc(doc_name: str | None) -> None:
 def create_document_operation(
     freecad: FreeCADConnection,
     name: str,
-    with_screenshot: bool = False,
-    screenshot_mode: str | None = None,
 ) -> ToolResponse:
     try:
-        shot = _shot_params(with_screenshot)
-        res = freecad.create_document(name, screenshot=shot)
+        res = freecad.create_document(name)
         if res["success"]:
             _set_last_doc(res["document_name"])
-            response = text_response(f"Document '{res['document_name']}' created successfully")
-            return add_screenshot_if_available(
-                response, res.get("screenshot"), not with_screenshot, screenshot_mode
-            )
+            return text_response(f"Document '{res['document_name']}' created successfully")
         return text_response(f"Failed to create document: {res['error']}")
     except Exception as e:
         logger.error(f"Failed to create document: {e!s}")
@@ -97,12 +82,10 @@ def create_document_operation(
 
 def create_object_operation(
     freecad: FreeCADConnection,
-    with_screenshot: bool,
     doc_name: str,
     obj_type: str,
     obj_name: str,
     obj_properties: dict[str, Any] | None = None,
-    screenshot_mode: str | None = None,
 ) -> ToolResponse:
     try:
         obj_data = {
@@ -110,17 +93,10 @@ def create_object_operation(
             "Type": obj_type,
             "Properties": obj_properties or {},
         }
-        # The screenshot rides along with the mutation RPC (single round trip,
-        # no race with intervening ops); the client falls back to a second
-        # get_active_screenshot call against old addons.
-        res = freecad.create_object(doc_name, obj_data, screenshot=_shot_params(with_screenshot))
+        res = freecad.create_object(doc_name, obj_data)
         if res["success"]:
-            response = text_response(f"Object '{res['object_name']}' created successfully")
-        else:
-            return text_response(f"Failed to create object: {res['error']}")
-        return add_screenshot_if_available(
-            response, res.get("screenshot"), not with_screenshot, screenshot_mode
-        )
+            return text_response(f"Object '{res['object_name']}' created successfully")
+        return text_response(f"Failed to create object: {res['error']}")
     except Exception as e:
         logger.error(f"Failed to create object: {e!s}")
         return text_response(f"Failed to create object: {e!s}")
@@ -128,26 +104,19 @@ def create_object_operation(
 
 def edit_object_operation(
     freecad: FreeCADConnection,
-    with_screenshot: bool,
     doc_name: str,
     obj_name: str,
     obj_properties: dict[str, Any],
-    screenshot_mode: str | None = None,
 ) -> ToolResponse:
     try:
         res = freecad.edit_object(
             doc_name,
             obj_name,
             {"Properties": obj_properties},
-            screenshot=_shot_params(with_screenshot),
         )
         if res["success"]:
-            response = text_response(f"Object '{res['object_name']}' edited successfully")
-        else:
-            return text_response(f"Failed to edit object: {res['error']}")
-        return add_screenshot_if_available(
-            response, res.get("screenshot"), not with_screenshot, screenshot_mode
-        )
+            return text_response(f"Object '{res['object_name']}' edited successfully")
+        return text_response(f"Failed to edit object: {res['error']}")
     except Exception as e:
         logger.error(f"Failed to edit object: {e!s}")
         return text_response(f"Failed to edit object: {e!s}")
@@ -155,20 +124,14 @@ def edit_object_operation(
 
 def delete_object_operation(
     freecad: FreeCADConnection,
-    with_screenshot: bool,
     doc_name: str,
     obj_name: str,
-    screenshot_mode: str | None = None,
 ) -> ToolResponse:
     try:
-        res = freecad.delete_object(doc_name, obj_name, screenshot=_shot_params(with_screenshot))
+        res = freecad.delete_object(doc_name, obj_name)
         if res["success"]:
-            response = text_response(f"Object '{res['object_name']}' deleted successfully")
-        else:
-            return text_response(f"Failed to delete object: {res['error']}")
-        return add_screenshot_if_available(
-            response, res.get("screenshot"), not with_screenshot, screenshot_mode
-        )
+            return text_response(f"Object '{res['object_name']}' deleted successfully")
+        return text_response(f"Failed to delete object: {res['error']}")
     except Exception as e:
         logger.error(f"Failed to delete object: {e!s}")
         return text_response(f"Failed to delete object: {e!s}")
@@ -176,9 +139,7 @@ def delete_object_operation(
 
 def execute_code_operation(
     freecad: FreeCADConnection,
-    with_screenshot: bool,
     code: str,
-    screenshot_mode: str | None = None,
     doc_name: str | None = None,
 ) -> ToolResponse:
     # Bind the run to ONE document up front: under two concurrent agents the
@@ -204,9 +165,7 @@ def execute_code_operation(
         else ""
     )
     try:
-        res = freecad.execute_code(
-            code, screenshot=_shot_params(with_screenshot), doc_name=doc_name
-        )
+        res = freecad.execute_code(code, doc_name=doc_name)
         _set_last_doc(doc_name)
         if res["success"]:
             # The addon wraps the snippet in a FreeCAD transaction; ``changed``
@@ -270,11 +229,8 @@ def execute_code_operation(
                     + " — that change happened outside this document's transaction, so it is "
                     "not part of any session step (it owns its own undo entry on that document)"
                 )
-            response = text_response(
+            return text_response(
                 f"Code executed successfully: {res['message']}{step_note}{bind_note}"
-            )
-            return add_screenshot_if_available(
-                response, res.get("screenshot"), not with_screenshot, screenshot_mode
             )
         return text_response(f"Failed to execute code: {res['error']}{bind_note}")
     except Exception as e:
@@ -322,22 +278,19 @@ def get_task_result_operation(
 
 def execute_operations_operation(
     freecad: FreeCADConnection,
-    with_screenshot: bool,
     doc_name: str,
     ops: list[dict[str, Any]],
     stop_on_error: bool = False,
-    screenshot_mode: str | None = None,
 ) -> ToolResponse:
     try:
         res = freecad.execute_operations(
             doc_name,
             ops,
             stop_on_error,
-            screenshot=_shot_params(with_screenshot),
         )
         succeeded = sum(1 for r in res.get("results", []) if r.get("success"))
         total = len(res.get("results", []))
-        response = json_response(
+        return json_response(
             {
                 "summary": (
                     f"Batch finished: {succeeded}/{total} operations succeeded"
@@ -345,9 +298,6 @@ def execute_operations_operation(
                 ),
                 **res,
             }
-        )
-        return add_screenshot_if_available(
-            response, res.get("screenshot"), not with_screenshot, screenshot_mode
         )
     except Exception as e:
         logger.error(f"Failed to execute operations: {e!s}")
@@ -364,7 +314,6 @@ def get_view_operation(
     width: int | None = None,
     height: int | None = None,
     focus_object: str | None = None,
-    screenshot_mode: str | None = None,
     doc_name: str | None = None,
 ) -> ToolResponse:
     try:
@@ -372,7 +321,7 @@ def get_view_operation(
             view_name, width, height, focus_object, doc_name=doc_name
         )
         if screenshot is not None:
-            return [screenshot_content(screenshot, screenshot_mode)]
+            return [screenshot_content(screenshot)]
         return text_response(
             "Cannot get screenshot in the current view type (such as TechDraw or Spreadsheet)"
         )
@@ -383,37 +332,17 @@ def get_view_operation(
 
 def get_objects_operation(
     freecad: FreeCADConnection,
-    with_screenshot: bool,
     doc_name: str,
-    screenshot_mode: str | None = None,
+    obj_name: str | None = None,
 ) -> ToolResponse:
     try:
-        response = json_response(freecad.get_objects(doc_name))
-        screenshot = freecad.get_active_screenshot(doc_name=doc_name) if with_screenshot else None
-        return add_screenshot_if_available(
-            response, screenshot, not with_screenshot, screenshot_mode
-        )
+        if obj_name is not None:
+            return json_response(freecad.get_object(doc_name, obj_name))
+        return json_response(freecad.get_objects(doc_name))
     except Exception as e:
-        logger.error(f"Failed to get objects: {e!s}")
-        return text_response(f"Failed to get objects: {e!s}")
-
-
-def get_object_operation(
-    freecad: FreeCADConnection,
-    with_screenshot: bool,
-    doc_name: str,
-    obj_name: str,
-    screenshot_mode: str | None = None,
-) -> ToolResponse:
-    try:
-        response = json_response(freecad.get_object(doc_name, obj_name))
-        screenshot = freecad.get_active_screenshot(doc_name=doc_name) if with_screenshot else None
-        return add_screenshot_if_available(
-            response, screenshot, not with_screenshot, screenshot_mode
-        )
-    except Exception as e:
-        logger.error(f"Failed to get object: {e!s}")
-        return text_response(f"Failed to get object: {e!s}")
+        target = f"object '{obj_name}'" if obj_name is not None else "objects"
+        logger.error(f"Failed to get {target}: {e!s}")
+        return text_response(f"Failed to get {target}: {e!s}")
 
 
 def list_documents_operation(freecad: FreeCADConnection) -> ToolResponse:
@@ -453,7 +382,7 @@ _ISLAND_OBJECTS_PREVIEW = 4
 
 # Result keys that are transport bookkeeping rather than findings: `objects` is
 # the whole document's object-name fingerprint (hundreds of names on a real
-# model), `screenshot` is consumed by add_screenshot_if_available, and
+# model), `screenshot` may still arrive from an old addon's mutation reply, and
 # success/object_name are already spelled out in the summary text.
 _RESULT_BOOKKEEPING = frozenset({"success", "object_name", "screenshot", "objects", "transaction"})
 
@@ -560,7 +489,6 @@ def _record_step_if_tracked(
 
 def cad_operation(
     freecad: FreeCADConnection,
-    with_screenshot: bool,
     operation: str,
     doc_name: str,
     *,
@@ -571,7 +499,6 @@ def cad_operation(
     stop_on_error: bool = False,
     description: str = "",
     auto_audit: bool = True,
-    screenshot_mode: str | None = None,
 ) -> ToolResponse:
     """Unified mutation entry point (nsforge math()-style dispatcher).
 
@@ -581,7 +508,6 @@ def cad_operation(
     must stay in sync with the undo stack.
     """
     _set_last_doc(doc_name)
-    shot = _shot_params(with_screenshot)
     batch_succeeded = 0
     try:
         if operation == "create_object":
@@ -592,7 +518,7 @@ def cad_operation(
                 "Type": obj_type,
                 "Properties": obj_properties or {},
             }
-            res = freecad.create_object(doc_name, obj_data, screenshot=shot)
+            res = freecad.create_object(doc_name, obj_data)
             success = bool(res.get("success"))
             summary = (
                 f"Object '{res['object_name']}' created successfully"
@@ -606,9 +532,7 @@ def cad_operation(
         elif operation == "edit_object":
             if not obj_name:
                 return text_response("edit_object requires obj_name")
-            res = freecad.edit_object(
-                doc_name, obj_name, {"Properties": obj_properties or {}}, screenshot=shot
-            )
+            res = freecad.edit_object(doc_name, obj_name, {"Properties": obj_properties or {}})
             success = bool(res.get("success"))
             summary = (
                 f"Object '{res['object_name']}' edited successfully"
@@ -622,7 +546,7 @@ def cad_operation(
         elif operation == "delete_object":
             if not obj_name:
                 return text_response("delete_object requires obj_name")
-            res = freecad.delete_object(doc_name, obj_name, screenshot=shot)
+            res = freecad.delete_object(doc_name, obj_name)
             success = bool(res.get("success"))
             summary = (
                 f"Object '{res['object_name']}' deleted successfully"
@@ -644,7 +568,7 @@ def cad_operation(
                 )
             # Internal keys LAST: user params must never clobber them.
             spec = {**params, "type": operation, "base": obj_name}
-            res = freecad.create_feature(doc_name, spec, screenshot=shot)
+            res = freecad.create_feature(doc_name, spec)
             success = bool(res.get("success"))
             summary = (
                 f"{operation} '{res['object_name']}' created successfully"
@@ -656,7 +580,7 @@ def cad_operation(
         elif operation == "batch":
             if not ops:
                 return text_response("batch requires a non-empty ops list")
-            res = freecad.execute_operations(doc_name, ops, stop_on_error, screenshot=shot)
+            res = freecad.execute_operations(doc_name, ops, stop_on_error)
             results = res.get("results", [])
             batch_succeeded = sum(1 for r in results if r.get("success"))
             success = bool(res.get("success"))
@@ -694,9 +618,7 @@ def cad_operation(
         response = _success_response(summary + step_note, res)
     else:
         return text_response(summary)
-    return add_screenshot_if_available(
-        response, res.get("screenshot"), not with_screenshot, screenshot_mode
-    )
+    return response
 
 
 # --- modeling sessions --------------------------------------------------------
@@ -743,7 +665,10 @@ def session_start_operation(
             "name": sess.name,
             "doc_name": sess.doc_name,
             "message": f"Session started. Mutations via cad() on '{doc_name}' are now "
-            "recorded as steps; use session_rollback to backtrack.",
+            "recorded as steps; use session(action='rollback') to backtrack. "
+            "Note: FreeCAD keeps the last 20 undo steps by default (Preferences > "
+            "General > Document), so a session longer than that cannot roll back past "
+            "the window; session(action='status') reports when a rollback came up short.",
         }
     )
 
@@ -751,7 +676,9 @@ def session_start_operation(
 def _require_session() -> tuple[Any | None, ToolResponse | None]:
     sess = get_current_session()
     if sess is None:
-        return None, text_response("No active session. Use session_start or session_resume first.")
+        return None, text_response(
+            "No active session. Use session(action='start') or session(action='resume') first."
+        )
     return sess, None
 
 
@@ -873,7 +800,17 @@ def session_rollback_operation(
         return text_response(f"Rollback failed in FreeCAD: {res.get('error')}")
 
     undone = res.get("count", n)
+    ghosts = int(res.get("ghosts_skipped", 0) or 0)
     warnings = []
+    if ghosts:
+        # Other documents' transactions ride on this document's undo stack
+        # (FreeCAD attributes an entry to the document that is ACTIVE at commit
+        # time). The addon pops them out of the way without counting them; a
+        # pre-fix addon counted them and reported steps it never undid.
+        warnings.append(
+            f"{ghosts} transaction(s) belonging to other documents were skipped while "
+            "undoing (FreeCAD shares one undo stack across documents)."
+        )
     if undone < n:
         warnings.append(
             f"Only {undone}/{n} transactions could be undone, so the model was NOT fully "
@@ -919,20 +856,31 @@ def session_rollback_operation(
             "The session has no recorded starting object set (it predates that field, or the "
             "addon could not be queried), so the rollback to step 0 could not be verified."
         )
+    # "Success" must mean the model reached the target state, not merely that
+    # FreeCAD's undo stack moved: a count-based success is exactly how a
+    # rollback that popped another document's ghost entry (or a manual GUI
+    # edit) reported clean while every step stayed applied.
+    ok = undone >= n and state_matches is not False
+    head = (
+        f"Rolled back {undone} step(s) to step {sess.step_count}. "
+        f"Removed: {[s.step_number for s in removed]}."
+        if ok
+        else (
+            f"ROLLBACK INCOMPLETE: only {undone}/{n} transaction(s) were undone and the "
+            f"object set does not match step {to_step}. Inspect the document before "
+            "continuing; step_control rollback_to can rebuild the model from the journal."
+        )
+    )
     return json_response(
         {
-            "success": True,
+            "success": ok,
             "rolled_back_to": sess.step_count,
             "undone_transactions": undone,
             "removed_steps": [s.step_number for s in removed],
             "state_matches_log": state_matches,
             "objects": res.get("objects", []),
             "warnings": warnings,
-            "display_text": (
-                f"Rolled back {undone} step(s) to step {sess.step_count}. "
-                f"Removed: {[s.step_number for s in removed]}."
-                + (" WARNING: " + " ".join(warnings) if warnings else "")
-            ),
+            "display_text": head + (" WARNING: " + " ".join(warnings) if warnings else ""),
         }
     )
 
@@ -950,8 +898,33 @@ def session_redo_operation(freecad: FreeCADConnection, n: int = 1) -> ToolRespon
         return text_response(f"Redo failed: {e!s}")
     if not res.get("success"):
         return text_response(f"Redo failed in FreeCAD: {res.get('error')}")
-    restored = sess.restore_steps(res.get("count", 0))
+    count = int(res.get("count", 0) or 0)
+    if count <= 0:
+        # FreeCAD's redo stack held nothing of this document. Reporting
+        # success with restored_steps=[] (the old behavior) turned a diverged
+        # stack into a silent no-op loop that never drained the redo buffer.
+        return text_response(
+            "Redo restored nothing: FreeCAD's redo stack holds no transaction for this "
+            f"document, so the session's redo buffer ({len(sess.redo_buffer)} step(s)) and "
+            "the document are out of sync (the stack was consumed or cleared by other "
+            "work). Nothing was changed; inspect with session(action='status') before "
+            "continuing."
+        )
+    restored = sess.restore_steps(count)
     save_session(sess)
+    if len(restored) != count:
+        return json_response(
+            {
+                "success": False,
+                "restored_steps": [s.step_number for s in restored],
+                "step_count": sess.step_count,
+                "redo_remaining": len(sess.redo_buffer),
+                "error": (
+                    f"FreeCAD redid {count} transaction(s) but only {len(restored)} step(s) "
+                    "came back from the redo buffer — the log is out of sync with the model."
+                ),
+            }
+        )
     return json_response(
         {
             "success": True,
@@ -1140,7 +1113,7 @@ def session_pause_operation() -> ToolResponse:
         {
             "success": True,
             "session_id": sess.session_id,
-            "message": f"Session '{sess.name}' paused and saved. Resume with session_resume('{sess.session_id}').",
+            "message": f"Session '{sess.name}' paused and saved. Resume with session(action='resume', session_id='{sess.session_id}').",
         }
     )
 
@@ -1234,6 +1207,76 @@ def session_complete_operation(
             "message": f"Session completed; workflow stored as pattern '{pattern['pattern_id']}'. "
             "Recall it later with recall_patterns().",
         }
+    )
+
+
+_SESSION_ACTIONS = (
+    "start",
+    "status",
+    "get_steps",
+    "rollback",
+    "redo",
+    "add_note",
+    "pause",
+    "resume",
+    "list",
+    "complete",
+)
+
+
+def session_action_operation(
+    freecad: FreeCADConnection,
+    action: str,
+    *,
+    doc_name: str | None = None,
+    session_id: str = "",
+    name: str = "",
+    create_document: bool = False,
+    to_step: int | None = None,
+    n: int = 1,
+    force: bool = False,
+    note: str = "",
+    note_type: str = "observation",
+    save: bool = False,
+    save_path: str | None = None,
+    description: str = "",
+    tags: list[str] | None = None,
+) -> ToolResponse:
+    """Dispatch the unified ``session`` tool to the per-action operation."""
+    if action == "start":
+        if not doc_name:
+            return text_response("session(action='start') requires doc_name")
+        return session_start_operation(freecad, doc_name, name, create_document)
+    if action == "status":
+        return session_status_operation(freecad)
+    if action == "get_steps":
+        return session_get_steps_operation()
+    if action == "rollback":
+        if to_step is None:
+            # No safe default here: 0 undoes ALL steps, so omitting to_step
+            # must fail loudly instead of wiping the whole session.
+            return text_response(
+                "session(action='rollback') requires to_step (keep steps 1..to_step; 0 = undo all)"
+            )
+        return session_rollback_operation(freecad, to_step, force)
+    if action == "redo":
+        return session_redo_operation(freecad, n)
+    if action == "add_note":
+        return session_add_note_operation(note, note_type)
+    if action == "pause":
+        return session_pause_operation()
+    if action == "resume":
+        if not session_id:
+            return text_response(
+                "session(action='resume') requires session_id (see session(action='list'))"
+            )
+        return session_resume_operation(freecad, session_id)
+    if action == "list":
+        return session_list_operation()
+    if action == "complete":
+        return session_complete_operation(freecad, save, save_path, description, tags)
+    return text_response(
+        f"unknown session action '{action}'. Supported: {', '.join(_SESSION_ACTIONS)}"
     )
 
 
@@ -1417,13 +1460,11 @@ def get_anchors_operation(
 
 def set_anchors_operation(
     freecad: FreeCADConnection,
-    with_screenshot: bool,
     doc_name: str,
     obj_name: str,
     anchors: dict[str, Any],
     replace: bool = False,
     coord_frame: str = "local",
-    screenshot_mode: str | None = None,
 ) -> ToolResponse:
     if not anchors:
         return text_response("set_anchors requires a non-empty anchors dict")
@@ -1435,7 +1476,6 @@ def set_anchors_operation(
             anchors,
             replace,
             coord_frame,
-            screenshot=_shot_params(with_screenshot),
         )
     except Exception as e:
         logger.error(f"Failed to set anchors: {e!s}")
@@ -1456,19 +1496,15 @@ def set_anchors_operation(
             res,
         )
     response = json_response({"summary": summary, **res})
-    return add_screenshot_if_available(
-        response, res.get("screenshot"), not with_screenshot, screenshot_mode
-    )
+    return response
 
 
 def assemble_operation(
     freecad: FreeCADConnection,
-    with_screenshot: bool,
     doc_name: str,
     mates: list[dict[str, Any]],
     tolerance: float = 0.1,
     stop_on_error: bool = True,
-    screenshot_mode: str | None = None,
 ) -> ToolResponse:
     if not mates:
         return text_response("assemble requires a non-empty mates list")
@@ -1479,7 +1515,6 @@ def assemble_operation(
             mates,
             tolerance,
             stop_on_error,
-            screenshot=_shot_params(with_screenshot),
         )
     except Exception as e:
         logger.error(f"Failed to assemble: {e!s}")
@@ -1500,9 +1535,7 @@ def assemble_operation(
             res,
         )
     response = json_response({"summary": summary, **res})
-    return add_screenshot_if_available(
-        response, res.get("screenshot"), not with_screenshot, screenshot_mode
-    )
+    return response
 
 
 def verify_assembly_operation(

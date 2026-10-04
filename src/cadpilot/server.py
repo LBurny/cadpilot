@@ -14,7 +14,7 @@ except ImportError:
     # FastMCP to MCPServer; the API surface used here is unchanged.
     from mcp.server.mcpserver import Context
     from mcp.server.mcpserver import MCPServer as FastMCP
-from mcp.types import ImageContent, TextContent
+from mcp.types import TextContent
 
 from .freecad_client import FreeCADConnection
 from .operations import (
@@ -29,7 +29,6 @@ from .operations import (
     execute_code_operation,
     get_addon_log_operation,
     get_anchors_operation,
-    get_object_operation,
     get_objects_operation,
     get_positioning_info_operation,
     get_task_result_operation,
@@ -41,23 +40,14 @@ from .operations import (
     operation_help_operation,
     recall_patterns_operation,
     save_pattern_operation,
-    session_add_note_operation,
-    session_complete_operation,
-    session_get_steps_operation,
-    session_list_operation,
-    session_pause_operation,
-    session_redo_operation,
-    session_resume_operation,
-    session_rollback_operation,
-    session_start_operation,
-    session_status_operation,
+    session_action_operation,
     set_anchors_operation,
     step_control_operation,
     step_plan_operation,
     verify_assembly_operation,
 )
 from .prompt_text import ASSET_CREATION_STRATEGY
-from .responses import set_screenshot_mode, text_response
+from .responses import text_response
 from .server_state import ServerState
 
 logging.basicConfig(
@@ -180,20 +170,15 @@ def _maybe_start_log_forwarder() -> None:
 def create_document(
     ctx: Context,
     name: str,
-    with_screenshot: bool | None = None,
-    screenshot_mode: Literal["image", "file"] | None = None,
-) -> list[TextContent | ImageContent]:
+) -> list[TextContent]:
     """Create a new document in FreeCAD.
 
     Args:
         name: Document name.
-        with_screenshot/screenshot_mode: screenshot (default off): "file" = path only (default), "image" = inline PNG.
     """
     return create_document_operation(
         get_freecad_connection(),
         name,
-        with_screenshot=state.resolve_screenshot(with_screenshot),
-        screenshot_mode=screenshot_mode,
     )
 
 
@@ -231,9 +216,7 @@ def cad(
     ops: list[dict[str, Any]] | None = None,
     stop_on_error: bool = False,
     description: str = "",
-    with_screenshot: bool | None = None,
-    screenshot_mode: Literal["image", "file"] | None = None,
-) -> list[TextContent | ImageContent]:
+) -> list[TextContent]:
     """CAD modeling operation (unified mutation tool).
 
     Feature ops take obj_name as the BASE object (for sketch/variables/
@@ -246,11 +229,9 @@ def cad(
         ops: Operation dicts for batch.
         stop_on_error: batch — stop at the first failed op.
         description: Note recorded into the session step log.
-        with_screenshot/screenshot_mode: screenshot (default off): "file" = path only (default), "image" = inline PNG.
     """
     return cad_operation(
         get_freecad_connection(),
-        state.resolve_screenshot(with_screenshot),
         operation,
         doc_name,
         obj_type=obj_type,
@@ -260,7 +241,6 @@ def cad(
         stop_on_error=stop_on_error,
         description=description,
         auto_audit=state.auto_audit,
-        screenshot_mode=screenshot_mode,
     )
 
 
@@ -295,21 +275,16 @@ def execute_code(
     ctx: Context,
     code: str,
     doc_name: str | None = None,
-    with_screenshot: bool | None = None,
-    screenshot_mode: Literal["image", "file"] | None = None,
-) -> list[TextContent | ImageContent]:
+) -> list[TextContent]:
     """Execute Python in FreeCAD's GUI thread (FreeCAD/FreeCADGui/Part pre-imported). print() output is returned.
 
     Args:
         code: Python code to execute. Start with a # comment describing the step (the Steps panel shows it).
         doc_name: bind to this document — transaction, step journal and App.ActiveDocument (multi-agent safe). Defaults to the active session's doc.
-        with_screenshot/screenshot_mode: screenshot (default off): "file" = path only (default), "image" = inline PNG.
     """
     return execute_code_operation(
         get_freecad_connection(),
-        state.resolve_screenshot(with_screenshot),
         code,
-        screenshot_mode=screenshot_mode,
         doc_name=doc_name,
     )
 
@@ -323,9 +298,8 @@ def get_view(
     width: int | None = None,
     height: int | None = None,
     focus_object: str | None = None,
-    screenshot_mode: Literal["image", "file"] | None = None,
     doc_name: str | None = None,
-) -> list[ImageContent | TextContent]:
+) -> list[TextContent]:
     """Get a screenshot of one document's view. Context-expensive — call only for visual checks; prefer get_objects/measure_geometry for data.
 
     Args:
@@ -333,12 +307,13 @@ def get_view(
         width/height: Pixels; default caps the long edge at 384, smaller saves context.
         focus_object: Object to focus on; default fits all objects.
         doc_name: frame THIS document; default is the foreground tab, which a concurrent agent may have switched (multi-agent safe).
-        screenshot_mode: "file" = path only (default), "image" = inline PNG.
+
+    Returns the saved image file path.
     """
     if state.only_text_feedback:
         return text_response("Screenshots are disabled by --only-text-feedback.")
     return get_view_operation(
-        get_freecad_connection(), view_name, width, height, focus_object, screenshot_mode, doc_name
+        get_freecad_connection(), view_name, width, height, focus_object, doc_name
     )
 
 
@@ -346,41 +321,18 @@ def get_view(
 def get_objects(
     ctx: Context,
     doc_name: str,
-    with_screenshot: bool | None = None,
-    screenshot_mode: Literal["image", "file"] | None = None,
-) -> list[TextContent | ImageContent]:
-    """Get all objects in a document.
+    obj_name: str | None = None,
+) -> list[TextContent]:
+    """Get the objects in a document, or one object's properties.
 
     Args:
-        with_screenshot/screenshot_mode: screenshot (default off): "file" = path only (default), "image" = inline PNG.
+        obj_name: omit to list all objects; pass a name for that object's
+            full properties.
     """
     return get_objects_operation(
         get_freecad_connection(),
-        state.resolve_screenshot(with_screenshot),
-        doc_name,
-        screenshot_mode=screenshot_mode,
-    )
-
-
-@mcp.tool()
-def get_object(
-    ctx: Context,
-    doc_name: str,
-    obj_name: str,
-    with_screenshot: bool | None = None,
-    screenshot_mode: Literal["image", "file"] | None = None,
-) -> list[TextContent | ImageContent]:
-    """Get an object's properties from a document.
-
-    Args:
-        with_screenshot/screenshot_mode: screenshot (default off): "file" = path only (default), "image" = inline PNG.
-    """
-    return get_object_operation(
-        get_freecad_connection(),
-        state.resolve_screenshot(with_screenshot),
         doc_name,
         obj_name,
-        screenshot_mode=screenshot_mode,
     )
 
 
@@ -396,86 +348,59 @@ def list_documents(ctx: Context) -> list[TextContent]:
 
 
 @mcp.tool()
-def session_start(
+def session(
     ctx: Context,
-    doc_name: str,
+    action: Literal[
+        "start",
+        "status",
+        "get_steps",
+        "rollback",
+        "redo",
+        "add_note",
+        "pause",
+        "resume",
+        "list",
+        "complete",
+    ],
+    doc_name: str | None = None,
+    session_id: str = "",
     name: str = "",
     create_document: bool = False,
-) -> list[TextContent]:
-    """Start a modeling session bound to a document: every successful cad()
-    mutation is recorded as a transaction-backed step, so session_rollback
-    enables trial-and-error modeling. A mutating execute_code run is an
-    atomic step too; a read-only run is not recorded.
-
-    Args:
-        name: Optional human-readable session name.
-        create_document: Create the document first if it does not exist.
-
-    Returns: Session info including session_id.
-    """
-    return session_start_operation(get_freecad_connection(), doc_name, name, create_document)
-
-
-@mcp.tool()
-def session_status(ctx: Context) -> list[TextContent]:
-    """Show the active session: step count, document state, next-step
-    suggestions, and risks (e.g. drift from GUI edits, non-atomic steps).
-
-    Returns: JSON summary with a human-readable display_text.
-    """
-    return session_status_operation(get_freecad_connection())
-
-
-@mcp.tool()
-def session_get_steps(ctx: Context) -> list[TextContent]:
-    """Return all recorded steps and notes of the active session.
-
-    Returns: JSON list of step records.
-    """
-    return session_get_steps_operation()
-
-
-@mcp.tool()
-def session_rollback(
-    ctx: Context,
-    to_step: int,
+    to_step: int | None = None,
+    n: int = 1,
     force: bool = False,
-) -> list[TextContent]:
-    """Roll back the model to a previous step: undoes the matching document
-    transactions and truncates the step log; removed steps sit in a redo
-    buffer until a new cad() call discards them.
-
-    Args:
-        to_step: Keep steps 1..to_step; undo everything after (0 = undo all).
-        force: Roll back even across non-atomic execute_code steps (risky:
-            undo may revert the wrong change).
-    """
-    return session_rollback_operation(get_freecad_connection(), to_step, force)
-
-
-@mcp.tool()
-def session_redo(ctx: Context, n: int = 1) -> list[TextContent]:
-    """Redo n previously rolled-back steps (valid until a new cad() call).
-
-    Args:
-        n: Number of steps to restore (default 1).
-    """
-    return session_redo_operation(get_freecad_connection(), n)
-
-
-@mcp.tool()
-def session_add_note(
-    ctx: Context,
-    note: str,
+    note: str = "",
     note_type: str = "observation",
+    save: bool = False,
+    save_path: str | None = None,
+    description: str = "",
+    tags: list[str] | None = None,
 ) -> list[TextContent]:
-    """Attach a human/LLM insight to the session log (not an operation step).
+    """Modeling session bound to a document: cad() mutations become
+    transaction-backed steps you can roll back and redo.
 
-    Args:
-        note: Note content.
-        note_type: "observation" | "assumption" | "limitation" | "correction".
+    Actions: start (doc_name, create_document?) | status | get_steps |
+    rollback (to_step, force?) | redo (n?) | add_note (note, note_type?) |
+    pause | resume (session_id) | list | complete (save?, save_path?,
+    description?, tags?). Reference: operation_help("session").
     """
-    return session_add_note_operation(note, note_type)
+    return session_action_operation(
+        get_freecad_connection(),
+        action,
+        doc_name=doc_name,
+        session_id=session_id,
+        name=name,
+        create_document=create_document,
+        to_step=to_step,
+        n=n,
+        force=force,
+        note=note,
+        note_type=note_type,
+        save=save,
+        save_path=save_path,
+        description=description,
+        tags=tags,
+    )
 
 
 @mcp.tool()
@@ -546,57 +471,6 @@ def diagnose(ctx: Context, host: str | None = None) -> list[TextContent]:
         host: FreeCAD host to probe; defaults to this server's --host.
     """
     return diagnose_operation(host or state.rpc_host)
-
-
-@mcp.tool()
-def session_pause(ctx: Context) -> list[TextContent]:
-    """Pause the active session (persisted to disk; resume later). Returns
-    the session_id."""
-    return session_pause_operation()
-
-
-@mcp.tool()
-def session_resume(ctx: Context, session_id: str) -> list[TextContent]:
-    """Resume a paused/completed session from disk.
-
-    Args:
-        session_id: The session to resume (see session_list). Warns if the
-            bound document is no longer open.
-    """
-    return session_resume_operation(get_freecad_connection(), session_id)
-
-
-@mcp.tool()
-def session_list(ctx: Context) -> list[TextContent]:
-    """List all persisted sessions (most recently updated first).
-
-    Returns:
-        JSON list with session_id, name, doc_name, status, step_count.
-    """
-    return session_list_operation()
-
-
-@mcp.tool()
-def session_complete(
-    ctx: Context,
-    save: bool = False,
-    save_path: str | None = None,
-    description: str = "",
-    tags: list[str] | None = None,
-) -> list[TextContent]:
-    """Complete the active session: store the workflow as a reusable pattern
-    (recall later with recall_patterns) and optionally save the document.
-
-    Args:
-        save: Save the FreeCAD document (.FCStd).
-        save_path: Target file path (saveAs); omit to save in place.
-        description: What this workflow builds (stored with the pattern).
-        tags: Retrieval tags for the pattern.
-
-    Returns:
-        JSON with pattern_id and save result.
-    """
-    return session_complete_operation(get_freecad_connection(), save, save_path, description, tags)
 
 
 @mcp.tool()
@@ -794,8 +668,6 @@ def set_anchors(
     anchors: dict[str, Any],
     replace: bool = False,
     coord_frame: Literal["local", "global"] = "local",
-    with_screenshot: bool | None = None,
-    screenshot_mode: Literal["image", "file"] | None = None,
 ) -> list[TextContent]:
     """Define explicit named anchors on an object. Anchors persist with the
     document and follow Placement moves. Records a modeling-session step.
@@ -805,17 +677,14 @@ def set_anchors(
         replace: Replace all existing anchors instead of merging.
         coord_frame: "local" (stored as-is) or "global" (converted — use
             whenever your source coordinates are global).
-        with_screenshot/screenshot_mode: screenshot (default off): "file" = path only (default), "image" = inline PNG.
     """
     return set_anchors_operation(
         get_freecad_connection(),
-        state.resolve_screenshot(with_screenshot),
         doc_name,
         obj_name,
         anchors,
         replace,
         coord_frame,
-        screenshot_mode=screenshot_mode,
     )
 
 
@@ -826,8 +695,6 @@ def assemble(
     mates: list[dict[str, Any]],
     tolerance: float = 0.1,
     stop_on_error: bool = True,
-    with_screenshot: bool | None = None,
-    screenshot_mode: Literal["image", "file"] | None = None,
 ) -> list[TextContent]:
     """Assemble parts by snapping named anchors together (ONE transaction);
     mates over tolerance fail and roll back. For PERSISTENT joints use
@@ -837,16 +704,13 @@ def assemble(
         mates: Non-empty list of mate dicts.
         tolerance: Max allowed post-move residual in mm (default 0.1).
         stop_on_error: Abort and roll back at the first failed mate.
-        with_screenshot/screenshot_mode: screenshot (default off): "file" = path only (default), "image" = inline PNG.
     """
     return assemble_operation(
         get_freecad_connection(),
-        state.resolve_screenshot(with_screenshot),
         doc_name,
         mates,
         tolerance,
         stop_on_error,
-        screenshot_mode=screenshot_mode,
     )
 
 
@@ -953,20 +817,6 @@ def main():
         help="Never return screenshots, even when a tool call requests one (for text-only models)",
     )
     parser.add_argument(
-        "--with-screenshots",
-        action="store_true",
-        help="Attach a screenshot to every mutation/read tool response by default (tools can still opt out per call)",
-    )
-    parser.add_argument(
-        "--screenshot-mode",
-        choices=["image", "file"],
-        default="file",
-        help="How screenshots are delivered: 'file' (default) saves them under "
-        "~/.cadpilot/screenshots/ and returns only the path, keeping base64 out of the "
-        "model's context; 'image' inlines base64 image blocks (for clients without a "
-        "file-reading tool)",
-    )
-    parser.add_argument(
         "--host",
         type=_validate_host,
         default="localhost",
@@ -979,17 +829,9 @@ def main():
     )
     args = parser.parse_args()
     state.only_text_feedback = args.only_text_feedback
-    state.with_screenshots = args.with_screenshots
     state.rpc_host = args.host
     state.auto_audit = not args.no_auto_audit
-    set_screenshot_mode(args.screenshot_mode)
-    if state.only_text_feedback and state.with_screenshots:
-        logger.warning(
-            "Both --only-text-feedback and --with-screenshots given; --only-text-feedback wins"
-        )
     logger.info(f"Only text feedback: {state.only_text_feedback}")
-    logger.info(f"Screenshots by default: {state.with_screenshots}")
-    logger.info(f"Screenshot mode: {args.screenshot_mode}")
     logger.info(f"Auto connectivity audit: {state.auto_audit}")
     logger.info(f"Connecting to FreeCAD RPC server at: {state.rpc_host}")
     _maybe_start_log_forwarder()

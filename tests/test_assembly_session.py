@@ -22,6 +22,7 @@ def _fake_assembly_result(method_calls):
             "assembly": "MCP_Assembly",
             "joint_group": "Joints",
             "ground_link": f"L_{spec['ground']}",
+            "ground_joint": "GroundedJoint",
         }
     if op == "add_component":
         return {
@@ -125,6 +126,79 @@ def test_mate_records_step_joint_and_undo(asm_conn, asm_home):
     # 移动侧（a=Gear）的装配前位姿快照进了 undo
     assert undo["links_restore"]["L_Gear"]["Base"]["x"] == 9
     assert "0.0" in r[0].text
+
+
+def test_mate_restores_every_link_the_solver_actually_moved(asm_conn, asm_home, monkeypatch):
+    """The solver picks the side it moves (usually b's), and a mate can shift
+    several links in one solve. The old record named ref_a's link only, so a
+    rollback restored a part that had never moved and left the moved one
+    displaced (live: a hinge lid stayed put after rollback)."""
+    assembly_session_operation(asm_conn, "start", doc_name="Car", part="Chassis")
+    assembly_session_operation(asm_conn, "add_component", part="Lid")
+
+    def moved_mate(doc_name, spec):
+        asm_conn._record("assembly_op", doc_name, spec)
+        return {
+            "joint": "J_MCP",
+            "residual_mm": 0.0,
+            "residual_deg": 0.0,
+            "moved_link": "L_Lid",
+            "pre_placement": {
+                "Base": {"x": 0, "y": 0, "z": 150},
+                "Rotation": {"Axis": {"x": 0, "y": 0, "z": 1}, "Angle": 0},
+            },
+            "moved_links": {
+                "L_Lid": {
+                    "pre": {
+                        "Base": {"x": 0, "y": 0, "z": 150},
+                        "Rotation": {"Axis": {"x": 0, "y": 0, "z": 1}, "Angle": 0},
+                    },
+                    "to": {
+                        "Base": {"x": 0, "y": 0, "z": 20},
+                        "Rotation": {"Axis": {"x": 0, "y": 0, "z": 1}, "Angle": 0},
+                    },
+                },
+                "L_Chassis": {
+                    "pre": {
+                        "Base": {"x": 1, "y": 0, "z": 0},
+                        "Rotation": {"Axis": {"x": 0, "y": 0, "z": 1}, "Angle": 0},
+                    },
+                    "to": {
+                        "Base": {"x": 2, "y": 0, "z": 0},
+                        "Rotation": {"Axis": {"x": 0, "y": 0, "z": 1}, "Angle": 0},
+                    },
+                },
+            },
+        }
+
+    monkeypatch.setattr(asm_conn, "assembly_op", moved_mate, raising=False)
+    assembly_session_operation(
+        asm_conn,
+        "mate",
+        a={"part": "Chassis", "face": "Face1"},
+        b={"part": "Lid", "face": "Face1"},
+    )
+    undo = astate.current_session().steps[-1].undo
+    assert set(undo["links_restore"]) == {"L_Lid", "L_Chassis"}
+    assert undo["links_restore"]["L_Lid"]["Base"]["z"] == 150
+    assert undo["links_restore"]["L_Chassis"]["Base"]["x"] == 1
+
+
+def test_start_undo_tears_the_assembly_down_on_rollback_across_it(asm_conn, asm_home):
+    """to_step=0 used to leave MCP_Assembly, its ground joint and the ground
+    link behind — the start step carried an empty undo."""
+    assembly_session_operation(asm_conn, "start", doc_name="Car", part="Chassis")
+    assembly_session_operation(asm_conn, "add_component", part="Lid")
+    s = astate.current_session()
+    start_undo = s.steps[0].undo
+    assert start_undo["remove_assembly"] == "MCP_Assembly"
+    assert start_undo["remove_links"] == ["L_Chassis"]
+    assert start_undo["joints_to_delete"] == ["GroundedJoint"]
+    plan = astate.plan_rollback(s, 0)
+    assert plan["remove_assembly"] == "MCP_Assembly"
+    assert "L_Chassis" in plan["remove_links"]
+    # Rolling back to step 1 (keeping start) must NOT tear the assembly down.
+    assert astate.plan_rollback(s, 1)["remove_assembly"] is None
 
 
 def test_mate_with_trim_undo_covers_cut_and_repoint(asm_conn, asm_home):

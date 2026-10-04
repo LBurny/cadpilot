@@ -34,12 +34,12 @@ def test_get_anchors_exception_is_caught(fake_freecad):
 # --- set_anchors -----------------------------------------------------------
 
 
-def test_set_anchors_passes_args_and_no_screenshot_by_default(fake_freecad):
+def test_set_anchors_passes_args(fake_freecad):
     anchors = {"rear_dropout": {"pos": [-430, 0, 70], "dir": [0, 1, 0]}}
-    resp = set_anchors_operation(fake_freecad, False, "Doc", "Frame", anchors)
+    resp = set_anchors_operation(fake_freecad, "Doc", "Frame", anchors)
     _, args, _ = fake_freecad.calls[0]
     assert args[:5] == ("Doc", "Frame", anchors, False, "local")
-    assert args[5] is None  # screenshot=None when with_screenshot=False
+    assert args[5] is None  # the operation never sends a screenshot spec
     data = _json(resp)
     assert data["success"] is True
     assert data["anchor_count"] == 1
@@ -47,7 +47,7 @@ def test_set_anchors_passes_args_and_no_screenshot_by_default(fake_freecad):
 
 def test_set_anchors_passes_global_coord_frame(fake_freecad):
     anchors = {"rear_dropout": {"pos": [-430, 0, 70]}}
-    set_anchors_operation(fake_freecad, False, "Doc", "Frame", anchors, coord_frame="global")
+    set_anchors_operation(fake_freecad, "Doc", "Frame", anchors, coord_frame="global")
     _, args, _ = fake_freecad.calls[0]
     assert args[4] == "global"
 
@@ -56,20 +56,20 @@ def test_set_anchors_records_session_step(fake_freecad, isolated_home):
     from cadpilot.session_state import get_current_session, new_session, set_current_session
 
     set_current_session(new_session("S", "Doc"))
-    resp = set_anchors_operation(fake_freecad, False, "Doc", "Frame", {"p": {"pos": [0, 0, 0]}})
+    resp = set_anchors_operation(fake_freecad, "Doc", "Frame", {"p": {"pos": [0, 0, 0]}})
     assert get_current_session().step_count == 1
     assert "step #1 of session 'S'" in _json(resp)["summary"]
 
 
 def test_set_anchors_rejects_empty_anchors(fake_freecad):
-    resp = set_anchors_operation(fake_freecad, False, "Doc", "Frame", {})
+    resp = set_anchors_operation(fake_freecad, "Doc", "Frame", {})
     assert "non-empty anchors dict" in resp[0].text
     assert fake_freecad.calls == []  # validation happens before any RPC
 
 
 def test_set_anchors_exception_is_caught(fake_freecad):
     fake_freecad.errors["set_anchors"] = RuntimeError("boom")
-    resp = set_anchors_operation(fake_freecad, False, "Doc", "Frame", {"p": {"pos": [0, 0, 0]}})
+    resp = set_anchors_operation(fake_freecad, "Doc", "Frame", {"p": {"pos": [0, 0, 0]}})
     assert "Failed to set anchors" in resp[0].text
 
 
@@ -86,7 +86,7 @@ def test_assemble_passes_mates_and_returns_residuals(fake_freecad):
             "mode": "axis",
         }
     ]
-    resp = assemble_operation(fake_freecad, False, "Doc", mates)
+    resp = assemble_operation(fake_freecad, "Doc", mates)
     _, args, _ = fake_freecad.calls[0]
     assert args == ("Doc", mates, 0.1, True, None)
     data = _json(resp)
@@ -112,7 +112,6 @@ def test_assemble_partial_failure_is_reported(fake_freecad):
     data = _json(
         assemble_operation(
             fake_freecad,
-            False,
             "Doc",
             [{"obj": "Wheel", "anchor": "a", "target": "F", "target_anchor": "b"}],
         )
@@ -134,7 +133,6 @@ def test_assemble_records_step_only_when_committed(fake_freecad, isolated_home):
     }
     assemble_operation(
         fake_freecad,
-        False,
         "Doc",
         [{"obj": "W", "anchor": "a", "target": "F", "target_anchor": "b"}],
     )
@@ -145,7 +143,6 @@ def test_assemble_exception_is_caught(fake_freecad):
     fake_freecad.errors["assemble"] = ConnectionResetError("reset")
     resp = assemble_operation(
         fake_freecad,
-        False,
         "Doc",
         [{"obj": "W", "anchor": "a", "target": "F", "target_anchor": "b"}],
     )
@@ -153,7 +150,7 @@ def test_assemble_exception_is_caught(fake_freecad):
 
 
 def test_assemble_rejects_empty_mates(fake_freecad):
-    resp = assemble_operation(fake_freecad, False, "Doc", [])
+    resp = assemble_operation(fake_freecad, "Doc", [])
     assert "non-empty mates list" in resp[0].text
     assert fake_freecad.calls == []  # validation happens before any RPC
 

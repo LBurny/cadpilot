@@ -73,8 +73,8 @@ def suggest_next_steps(
     if session.step_count >= 10 and session.status == "active":
         suggestions.append(
             {
-                "tool": "session_complete",
-                "operation": "",
+                "tool": "session",
+                "operation": "complete",
                 "reason": f"{session.step_count} steps recorded — consider completing the "
                 "session to save the workflow into the pattern store",
             }
@@ -115,7 +115,7 @@ def detect_risks(
                 "level": "warning",
                 "type": "non_atomic_steps",
                 "message": f"Step(s) {non_atomic} were recorded via execute_code without a "
-                "transaction; session_rollback past them may undo the wrong change.",
+                "transaction; session(action='rollback') past them may undo the wrong change.",
             }
         )
 
@@ -186,7 +186,7 @@ def detect_risks(
                 "level": "info",
                 "type": "redo_available",
                 "message": f"{len(session.redo_buffer)} undone step(s) can be restored with "
-                "session_redo — any new cad() step discards them.",
+                "session(action='redo') — any new cad() step discards them.",
             }
         )
     return risks

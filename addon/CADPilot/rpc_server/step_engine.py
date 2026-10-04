@@ -36,6 +36,7 @@ from rpc_server.object_factory import (
     create_object_gui,
     delete_object_gui,
     edit_object_gui,
+    repair_body_tips,
 )
 from rpc_server.property_mapper import Object
 
@@ -96,6 +97,24 @@ def _undo_names(doc) -> list[str]:
         return []
 
 
+def _is_ghost_entry(name) -> bool:
+    """A transaction belonging to ANOTHER document, parked on this stack.
+
+    FreeCAD 1.1.4 attributes an undo entry to the document that is ACTIVE when
+    the transaction is recorded, not to the one it was opened on: committing on
+    a non-active document leaves a "-> <name>" entry on the active document's
+    stack (live-verified with plain FreeCAD, no CADPilot involved). A ghost is
+    not a step of this document; popping it via ``doc.undo()`` is a no-op here,
+    so it must never consume one of a rollback's ``n`` slots.
+    """
+    return str(name).startswith("->")
+
+
+def _real_undo_names(doc) -> list[str]:
+    """Undo-stack names minus other documents' ghosts (see _is_ghost_entry)."""
+    return [n for n in _undo_names(doc) if not _is_ghost_entry(n)]
+
+
 def _stack_holds_journal(
     doc, records: list[sj.StepRecord], upto_index: int, undo_count: int
 ) -> bool:
@@ -115,7 +134,11 @@ def _stack_holds_journal(
     if undo_count <= 0:
         return True
     expected = [r.transaction for r in reversed(records) if r.index > upto_index and r.transaction]
-    return _undo_names(doc)[:undo_count] == expected[:undo_count]
+    # Ghosts (other documents' transactions parked here) sit between this
+    # document's entries; _stack_op pops straight past them, so the comparison
+    # must look at the same non-ghost sequence or every rollback degraded to
+    # the full rebuild while a model was merely sharing the FreeCAD instance.
+    return _real_undo_names(doc)[:undo_count] == expected[:undo_count]
 
 
 def _object_names(doc) -> list[str]:
@@ -170,6 +193,38 @@ def engine_quiet() -> _EngineQuiet:
     return _EngineQuiet()
 
 
+@contextlib.contextmanager
+def active_document(doc):
+    """Make ``doc`` the App-active document while a transaction is recorded.
+
+    FreeCAD 1.1.4 attributes an undo entry to the document that is ACTIVE at
+    commit time, not to the one the transaction was opened on: committing on a
+    non-active document leaves a ghost entry ("-> <name>") on the active
+    document's stack, where a later ``undo()`` pops the ghost instead of its
+    own step while this document's objects stay untouched — a rollback then
+    reports success and truncates its log while the model never moved
+    (live-verified, and reproduced with plain FreeCAD, no CADPilot involved).
+    Activating the target for the open/commit window keeps every entry on its
+    real stack; the previously active document is restored afterwards.
+    """
+    if doc is None:
+        yield
+        return
+    previous = None
+    with contextlib.suppress(Exception):
+        active = FreeCAD.ActiveDocument
+        previous = active.Name if active is not None else None
+    if previous != doc.Name:
+        with contextlib.suppress(Exception):
+            FreeCAD.setActiveDocument(doc.Name)
+    try:
+        yield
+    finally:
+        if previous is not None and previous != doc.Name:
+            with contextlib.suppress(Exception):
+                FreeCAD.setActiveDocument(previous)
+
+
 def undo_n(doc, n: int) -> dict[str, Any]:
     """Undo up to ``n`` transactions; report how many actually went.
 
@@ -185,23 +240,46 @@ def redo_n(doc, n: int) -> dict[str, Any]:
 
 
 def _stack_op(doc, n: int, undo: bool) -> dict[str, Any]:
-    if n <= 0:
-        return {"success": True, "count": 0, "objects": _object_names(doc)}
+    """Undo/redo up to ``n`` of THIS document's transactions.
+
+    Ghost entries (``-> name``: another document's transaction that was
+    committed while this one was active) are popped out of the way but do NOT
+    consume a slot — they are no-ops here, and counting them is exactly how a
+    rollback reported "undone N" while its own steps were still applied.
+    """
+    stack = [str(x) for x in (getattr(doc, "UndoNames" if undo else "RedoNames", []) or [])]
+    if n <= 0 or not stack:
+        return {"success": True, "count": 0, "ghosts_skipped": 0, "objects": _object_names(doc)}
     with _EngineQuiet():
-        stack = list(getattr(doc, "UndoNames" if undo else "RedoNames", []) or [])
         done = 0
-        for _ in range(min(n, len(stack))):
+        ghosts = 0
+        idx = 0
+        while done < n and idx < len(stack):
+            ghost = _is_ghost_entry(stack[idx])
+            idx += 1
             try:
                 doc.undo() if undo else doc.redo()
-                done += 1
             except Exception as e:
                 FreeCAD.Console.PrintWarning(
                     f"CADPilot: {'undo' if undo else 'redo'} stopped: {e}\n"
                 )
                 break
+            if ghost:
+                ghosts += 1
+            else:
+                done += 1
         with contextlib.suppress(Exception):
             doc.recompute()
-    return {"success": True, "count": done, "objects": _object_names(doc)}
+    if ghosts:
+        dbglog.get_logger("tx").info(
+            "stack op skipped %d ghost entry(ies) owned by other documents", ghosts
+        )
+    return {
+        "success": True,
+        "count": done,
+        "ghosts_skipped": ghosts,
+        "objects": _object_names(doc),
+    }
 
 
 # --- recording ---------------------------------------------------------------
@@ -568,6 +646,11 @@ def execute_record(doc, rec: sj.StepRecord) -> dict[str, Any]:
 
 def run_record(doc, records: list[sj.StepRecord], rec: sj.StepRecord) -> dict[str, Any]:
     """Execute ``rec`` in its own transaction, journal written inside it."""
+    with active_document(doc):
+        return _run_record_locked(doc, records, rec)
+
+
+def _run_record_locked(doc, records: list[sj.StepRecord], rec: sj.StepRecord) -> dict[str, Any]:
     tx = _transaction_name(rec)
     before = _object_names(doc)
     token_before = None
@@ -935,6 +1018,11 @@ def _snapshot(doc, records, note: str, accept_done: bool = False) -> dict[str, A
 
 def _remove_objects(doc, names: list[str]) -> list[str]:
     """Delete objects by name in one transaction; returns the names removed."""
+    with active_document(doc):
+        return _remove_objects_locked(doc, names)
+
+
+def _remove_objects_locked(doc, names: list[str]) -> list[str]:
     removed: list[str] = []
     if not names:
         return removed
@@ -954,6 +1042,11 @@ def _remove_objects(doc, names: list[str]) -> list[str]:
             except Exception as exc:  # still referenced, or not removable
                 FreeCAD.Console.PrintWarning(f"CADPilot: could not remove '{name}': {exc}\n")
         doc.recompute()
+        # Removing the feature that WAS a Body's Tip leaves the Body Invalid
+        # until the tip is re-pointed; a rollback that drops a tip feature must
+        # leave a usable document behind.
+        if repair_body_tips(doc):
+            doc.recompute()
         doc.commitTransaction()
     except Exception:
         with contextlib.suppress(Exception):

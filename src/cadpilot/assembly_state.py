@@ -167,6 +167,7 @@ def plan_rollback(session: AssemblySession, to_step: int) -> dict[str, Any]:
     restore: dict[str, Any] = {}
     repoint: dict[str, Any] = {}
     remove_links: list[str] = []
+    remove_assembly: str | None = None
     for step in reversed([s for s in session.steps if s.step_number > to_step]):
         undo = step.undo
         joints += list(undo.get("joints_to_delete", []))
@@ -175,6 +176,11 @@ def plan_rollback(session: AssemblySession, to_step: int) -> dict[str, Any]:
             restore.setdefault(link, plc)
         repoint.update(undo.get("links_repoint", {}))
         remove_links += list(undo.get("remove_links", []))
+        if undo.get("remove_assembly"):
+            # Only the start step carries this; crossing it tears the assembly
+            # down. Without it a to_step=0 rollback left MCP_Assembly, its
+            # ground joint and the ground link behind (live-verified).
+            remove_assembly = undo["remove_assembly"]
     return {
         "operation": "rollback_step",
         "joints_to_delete": joints,
@@ -182,6 +188,7 @@ def plan_rollback(session: AssemblySession, to_step: int) -> dict[str, Any]:
         "links_restore": restore,
         "links_repoint": repoint,
         "remove_links": remove_links,
+        "remove_assembly": remove_assembly,
     }
 
 

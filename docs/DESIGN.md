@@ -69,7 +69,7 @@ Docstrings are paid for in every conversation, so each `@mcp.tool()` docstring i
 
 ### 4.3 The knowledge hierarchy
 
-Prompts tell the model where to look: its own knowledge first, then `recall_patterns` (a persistent store of modeling recipes that worked before), then `inspect_freecad` (which lists an object's properties and methods, or a module's API, at runtime). A recipe that proved out is saved back with `save_pattern` or `session_complete`, so later sessions build on it.
+Prompts tell the model where to look: its own knowledge first, then `recall_patterns` (a persistent store of modeling recipes that worked before), then `inspect_freecad` (which lists an object's properties and methods, or a module's API, at runtime). A recipe that proved out is saved back with `save_pattern` or `session(action="complete")`, so later sessions build on it.
 
 ## 5. Reversibility: transactions, sessions, and the step journal
 
@@ -77,7 +77,7 @@ Every committed change runs inside a FreeCAD transaction. Two journals sit on to
 
 ### 5.1 Modeling sessions
 
-A session (`session_start` through `session_complete`) records each change as a step: the operation, its parameters, the result, the list of objects in the document afterwards, and any notes the model or user attached. The object list is the fingerprint used to detect when the document no longer matches the log.
+A session (`session` tool, `start` through `complete`) records each change as a step: the operation, its parameters, the result, the list of objects in the document afterwards, and any notes the model or user attached. The object list is the fingerprint used to detect when the document no longer matches the log.
 
 Rolling back to step N runs `doc.undo()` once per removed step, then truncates the log; no part of the model is deleted or rebuilt. The removed steps sit in a redo buffer until a new step arrives, which mirrors FreeCAD's own redo semantics.
 
@@ -179,7 +179,7 @@ Several rules keep it reliable, all verified against a live FreeCAD:
 
 ## 9. Screenshot policy
 
-Screenshots are optional and off by default. A single call can request one; `--with-screenshots` makes them the default; `--only-text-feedback` prohibits them outright, giving text-only models a hard guarantee; `file` delivery (the default `--screenshot-mode`) writes them to `$CADPILOT_HOME/screenshots/` and returns only the path, keeping base64 out of the context, while `--screenshot-mode image` restores inline base64 blocks. Mutating tools capture the screenshot inside the same request that does the work, in one round trip, and fall back to a second call against older addons. Captures are capped at 512 pixels on the long edge unless a size is given, and a few view types, such as TechDraw and Spreadsheet, return none at all.
+Screenshots come from a single tool: `get_view`. Everything else is text-only, which keeps token usage flat. Each capture is written to `$CADPILOT_HOME/screenshots/` (newest 100 kept) and the response carries only its path as text, so no image data enters the context; a multimodal client opens the PNG with its own file-reading tool. `--only-text-feedback` turns even `get_view` into a text notice, giving text-only models a hard guarantee. Captures are capped at 384 pixels on the long edge unless a size is given, and a few view types, such as TechDraw and Spreadsheet, return none at all.
 
 ## 10. Long-running computations
 

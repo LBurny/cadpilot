@@ -59,23 +59,23 @@ assemble(); move a parent part, call solve, children follow.
 
 For any non-trivial modeling task, work inside a session:
 
-1. session_start(doc_name, create_document=True) — binds a session to the document.
+1. session(action="start", doc_name=..., create_document=True) — binds a session to the document.
 2. Build with cad() — every successful mutation is recorded as a step
    (backed by a FreeCAD transaction).
-3. Trial and error: use session_rollback(to_step) to backtrack instead of
-   deleting and rebuilding. session_redo() restores rolled-back steps until a
-   new cad() call. Check session_status() when unsure — it shows step count,
+3. Trial and error: use session(action="rollback", to_step=N) to backtrack instead of
+   deleting and rebuilding. session(action="redo") restores rolled-back steps until a
+   new cad() call. Check session(action="status") when unsure — it shows step count,
    suggestions, and risks (e.g. the model was edited in the GUI).
 4. execute_code() works too but records NON-ATOMIC steps that block rollback
    unless forced — prefer cad() when the operation is expressible with it.
-5. When satisfied: session_complete(save=True, description=..., tags=...) —
+5. When satisfied: session(action="complete", save=True, description=..., tags=...) —
    saves the document and stores the whole workflow into the pattern store.
 
 ## Knowledge hierarchy (use in this order)
 
 1. Your own FreeCAD Python knowledge — always try this first.
 2. recall_patterns(query) — retrieval of workflows that worked before
-  (from session_complete and save_pattern), when you are unsure.
+  (from session(action="complete") and save_pattern), when you are unsure.
 3. inspect_freecad(doc_name, obj_name) or inspect_freecad(dotted_name="Part.makeLoft")
   — runtime API introspection as the last-resort reference.
 After a non-trivial approach succeeds, store it with save_pattern() so it can be
@@ -106,7 +106,7 @@ computing Placement values; use relative moves and alignment instead:
       as a BLOCKING issue: realign the listed parts with move/align_shapes/
       assemble so they genuinely touch before adding new parts. Parts that
       merely LOOK close in a screenshot but have a small gap are reported —
-      trust the numbers, not the view. session_status() also surfaces
+      trust the numbers, not the view. session(action="status") also surfaces
       unresolved islands as a disconnected_islands risk.
 
 ## Building content
@@ -117,7 +117,7 @@ computing Placement values; use relative moves and alignment instead:
    (cad(operation="create_object") with Part::Box/Cylinder/...) are for quick
    stock, fixtures, and mating references — not the main design path.
    - When creating or editing many objects, prefer cad(operation="batch") to
-     do them in one call (one undo unit, at most one screenshot).
+     do them in one call (one undo unit).
 
 2. Always assign clear and descriptive names to objects.
 

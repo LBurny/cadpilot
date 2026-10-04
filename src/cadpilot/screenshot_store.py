@@ -1,9 +1,8 @@
-"""File-mode screenshot storage: decode base64 PNGs to disk, prune old ones.
+"""Screenshot storage: decode base64 PNGs to disk, prune old ones.
 
-File mode is the default delivery: the LLM client reads the file with its own
-file tool (multimodal), and the tool result stays a tiny path string instead
-of a permanent base64 blob in the conversation. ``--screenshot-mode image``
-or a per-call ``screenshot_mode="image"`` restores inline delivery.
+File delivery is the only mode: the tool result stays a tiny path string
+instead of a permanent base64 blob in the conversation, and a multimodal
+client opens the PNG with its own file-reading tool.
 """
 
 import base64
@@ -16,7 +15,7 @@ from .session_state import data_dir
 logger = logging.getLogger("CADPilot")
 
 # Old screenshots are pruned down to this many newest files on each save.
-_KEPT_SCREENSHOTS = 20
+_KEPT_SCREENSHOTS = 100
 
 
 def screenshot_dir() -> Path:

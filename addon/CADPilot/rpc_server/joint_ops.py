@@ -222,6 +222,45 @@ def _joints_of(asm):
     return [o for o in asm.Joints] if asm.Joints else []
 
 
+def _links_of(asm):
+    """The component links of an assembly (App::Link children of the group)."""
+    return [o for o in getattr(asm, "Group", []) or [] if getattr(o, "TypeId", "") == "App::Link"]
+
+
+def _same_placement(a, b) -> bool:
+    if (a.Base - b.Base).Length > 1e-9:
+        return False
+    return abs(a.Rotation.multiply(b.Rotation.inverted()).Angle) <= 1e-9
+
+
+def _joint_link_names(j) -> set:
+    """The link names a joint's two references point at."""
+    names = set()
+    for attr in ("Reference1", "Reference2"):
+        ref = getattr(j, attr, None)
+        if isinstance(ref, (list, tuple)) and ref and hasattr(ref[0], "Name"):
+            names.add(ref[0].Name)
+    return names
+
+
+def _duplicate_joint_warnings(asm, ref_a, ref_b) -> list:
+    """Warn when the same link pair is already constrained by another joint.
+
+    Live-verified: a second revolute on the same pair was accepted silently and
+    both joints reported residual 0 — an over-constrained assembly with no
+    signal. The solver treats both as real constraints, so say so.
+    """
+    pair = {ref_a[0].Name, ref_b[0].Name}
+    existing = [j.Name for j in _joints_of(asm) if _joint_link_names(j) == pair]
+    if not existing:
+        return []
+    return [
+        f"another joint ({', '.join(existing)}) already constrains this link pair; both "
+        "stay active, so the pair is constrained twice (a redundant/over-constrained "
+        "assembly). Use unmate first if the new joint is meant to replace it."
+    ]
+
+
 def _solve_converged(doc, asm) -> None:
     """Single solve + recompute. Repeated solve(True) passes corrupt the
     solver's storePrev state (observed: deterministic ~40 mm drift on a
@@ -267,7 +306,12 @@ def _op_start(doc, spec: dict) -> dict:
     JointObject.ViewProviderGroundedJoint(ground.ViewObject)
     doc.recompute()
     _settle_shapes(doc, asm)
-    return {"assembly": asm.Name, "joint_group": jg.Name, "ground_link": link.Name}
+    return {
+        "assembly": asm.Name,
+        "joint_group": jg.Name,
+        "ground_link": link.Name,
+        "ground_joint": ground.Name,
+    }
 
 
 def _op_add_component(doc, spec: dict) -> dict:
@@ -371,8 +415,16 @@ def _op_mate(doc, spec: dict) -> dict:
     if refusal:
         raise ValueError(refusal)
     landing_warnings = _landing_warnings(doc, spec, ref_a, ref_b)
-    moved_link = ref_a[0]
-    pre_placement = _placement_to_dict(moved_link.Placement)
+    landing_warnings += _duplicate_joint_warnings(asm, ref_a, ref_b)
+    # Which link the solver MOVES is its own choice (usually b's), not a's: the
+    # old record named ref_a's link, so a rollback restored a part that had
+    # never moved and left the moved one where the solve put it (live: a hinge
+    # lid stayed at z 70..90 after rollback instead of returning to 150..170).
+    # Snapshot every component link, then diff after the solve.
+    links_before = {
+        lnk.Name: App.Placement(lnk.Placement.Base, lnk.Placement.Rotation)
+        for lnk in _links_of(asm)
+    }
     j = _make_joint(asm, spec["joint"], ref_a, ref_b, spec.get("name") or "")
     # GUI-equivalent mating: preSolve (matchJCS) positions the moving part
     # AND its downstream children with normals opposing; the final solve
@@ -385,23 +437,49 @@ def _op_mate(doc, spec: dict) -> dict:
     asm.solve(True)
     doc.recompute()
     mm, deg = _residual(j)
+    moved_links = {}
+    for lnk in _links_of(asm):
+        before = links_before.get(lnk.Name)
+        if before is not None and not _same_placement(before, lnk.Placement):
+            moved_links[lnk.Name] = {
+                "pre": _placement_to_dict(before),
+                "to": _placement_to_dict(lnk.Placement),
+            }
+    # Legacy single-link fields (an older MCP client records only these) must
+    # name the link that ACTUALLY moved, b's side preferred when both did.
+    if ref_b[0].Name in moved_links:
+        primary = ref_b[0].Name
+    elif ref_a[0].Name in moved_links:
+        primary = ref_a[0].Name
+    elif moved_links:
+        primary = next(iter(moved_links))
+    else:
+        primary = ref_a[0].Name
+    entry = moved_links.get(primary)
+    if entry is None:
+        entry = {
+            "pre": _placement_to_dict(ref_a[0].Placement),
+            "to": _placement_to_dict(ref_a[0].Placement),
+        }
     # preSolve vs. solve-only is the difference between a correct mate and
     # faces landing perpendicular; record which path ran and how it settled.
     logger.debug(
-        "mate %s (%s): preSolve=%s residual=%.3fmm/%.2fdeg",
+        "mate %s (%s): preSolve=%s residual=%.3fmm/%.2fdeg moved=%s",
         j.Name,
         spec["joint"],
         used_pre_solve,
         mm,
         deg,
+        list(moved_links),
     )
     res = {
         "joint": j.Name,
         "residual_mm": mm,
         "residual_deg": deg,
-        "moved_link": moved_link.Name,
-        "pre_placement": pre_placement,
-        "moved_to": _placement_to_dict(moved_link.Placement),
+        "moved_link": primary,
+        "pre_placement": entry["pre"],
+        "moved_to": entry["to"],
+        "moved_links": moved_links,
         "landing": {"a": list(ref_a[1]), "b": list(ref_b[1])},
         "warnings": landing_warnings,
     }
@@ -485,6 +563,18 @@ def _op_rollback_step(doc, spec: dict) -> dict:
                 with contextlib.suppress(Exception):
                     part.ViewObject.Visibility = True
             doc.removeObject(link_name)
+    asm_name = spec.get("remove_assembly")
+    if asm_name and doc.getObject(asm_name) is not None:
+        # Tearing the assembly down (rollback across 'start'): its remaining
+        # children — the joint group above all — go with it, or the document is
+        # left with orphans that make a fresh start() fail.
+        for child in [
+            o for o in doc.Objects if any(i.Name == asm_name for i in getattr(o, "InList", []))
+        ]:
+            with contextlib.suppress(Exception):
+                doc.removeObject(child.Name)
+        with contextlib.suppress(Exception):
+            doc.removeObject(asm_name)
     doc.recompute()
     _settle_shapes(doc, asm)
     return {"done": True}

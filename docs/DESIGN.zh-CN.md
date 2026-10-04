@@ -69,7 +69,7 @@ docstring 在每场对话中都消耗 token，因此每个 `@mcp.tool()` 的 doc
 
 ### 4.3 知识层级
 
-提示词规定了模型的查阅次序：先自身知识，再 `recall_patterns`（已验证建模方案的持久存储），再 `inspect_freecad`（运行时列出对象的属性方法或某模块的 API）。验证有效的方案经 `save_pattern` 或 `session_complete` 写回，供后续会话复用。
+提示词规定了模型的查阅次序：先自身知识，再 `recall_patterns`（已验证建模方案的持久存储），再 `inspect_freecad`（运行时列出对象的属性方法或某模块的 API）。验证有效的方案经 `save_pattern` 或 `session(action="complete")` 写回，供后续会话复用。
 
 ## 5. 可撤销性：事务、会话与步骤日志
 
@@ -77,7 +77,7 @@ docstring 在每场对话中都消耗 token，因此每个 `@mcp.tool()` 的 doc
 
 ### 5.1 建模会话
 
-会话（`session_start` 至 `session_complete`）把每次改动记为一步：操作、参数、结果、操作后文档中的对象清单，以及模型或用户附加的笔记。对象清单即指纹，用于检测文档与日志是否仍然一致。
+会话（`session` 工具，从 `start` 到 `complete`）把每次改动记为一步：操作、参数、结果、操作后文档中的对象清单，以及模型或用户附加的笔记。对象清单即指纹，用于检测文档与日志是否仍然一致。
 
 回滚到第 N 步，就是对每个被移除的步骤执行一次 `doc.undo()` 并截断日志，不删除也不重建模型。被回滚的步骤进入重做缓冲区，直到新步骤到来才清空，与 FreeCAD 自身的重做语义一致。
 
@@ -179,7 +179,7 @@ docstring 在每场对话中都消耗 token，因此每个 `@mcp.tool()` 的 doc
 
 ## 9. 截图策略
 
-截图是可选项，默认关闭。单次调用可按需请求；`--with-screenshots` 将默认改为开启；`--only-text-feedback` 则彻底禁止，为纯文本模型提供硬保证；默认的 `file` 投递方式会把截图写入 `$CADPILOT_HOME/screenshots/` 并只返回路径，避免 base64 占用上下文，`--screenshot-mode image` 恢复内联 base64 图片。改动类工具在与操作相同的请求内完成截图，单次往返即可；对旧版插件则回退为第二次单独调用。长边默认不超过 512 像素，除非显式给出尺寸。少数视图类型（如 TechDraw、Spreadsheet）无法截图，返回空。
+截图只来自一个工具：`get_view`，其余工具一律纯文本，token 占用保持稳定。每张截图写入 `$CADPILOT_HOME/screenshots/`（保留最新 100 张），响应只带文件路径文本，图像数据不进入上下文；多模态客户端用自己的文件读取工具打开 PNG。`--only-text-feedback` 连 `get_view` 也只回文本提示，为纯文本模型提供硬保证。长边默认不超过 384 像素，除非显式给出尺寸。少数视图类型（如 TechDraw、Spreadsheet）无法截图，返回空。
 
 ## 10. 长时间计算
 

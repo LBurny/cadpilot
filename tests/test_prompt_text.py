@@ -10,7 +10,7 @@ def test_prompt_covers_dual_mode_workflow():
         "sketch",
         "pad",
         "mate",
-        "session_start",
+        'session(action="start"',
         "recall_patterns",
     ):
         assert keyword in ASSET_CREATION_STRATEGY, keyword
