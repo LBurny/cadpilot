@@ -386,8 +386,13 @@ class FreeCADConnection:
 
     def list_documents(self) -> list[str]:
         res = self._invoke("list_documents")
-        # New addon returns {"success": True, "documents": [...]};
+        # New addon returns {"success": ..., "documents": [...]};
         # old addon returns the list directly.
-        if isinstance(res, dict) and "documents" in res:
-            return res["documents"]
+        if isinstance(res, dict):
+            if res.get("success") is False:
+                # Addon failure carries documents: [] — swallowing it reported
+                # a wedged GUI thread as "no documents open".
+                raise RuntimeError(res.get("error", "list_documents failed"))
+            if "documents" in res:
+                return res["documents"]
         return res if isinstance(res, list) else []
