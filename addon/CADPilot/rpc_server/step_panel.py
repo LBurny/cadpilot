@@ -61,9 +61,11 @@ _THEME_DARK = {
     "sel": "rgba(92, 148, 184, 0.45)",
     "seltext": "#f2f5f7",
     "red": "#e06c60",
-    "accent": "#4cae64",
-    "accentbg": "rgba(76, 174, 100, 0.16)",
-    "accenthover": "rgba(76, 174, 100, 0.26)",
+    # The primary-button accent is one neutral light gray in BOTH palettes:
+    # it must read on the theme's surface whichever mode FreeCAD is in.
+    "accent": "#9aa3ab",
+    "accentbg": "rgba(154, 163, 171, 0.16)",
+    "accenthover": "rgba(154, 163, 171, 0.26)",
 }
 _THEME_LIGHT = {
     "dim": "#66707a",
@@ -76,9 +78,9 @@ _THEME_LIGHT = {
     "sel": "rgba(70, 130, 170, 0.30)",
     "seltext": "#1c2126",
     "red": "#c94f45",
-    "accent": "#2f8f4e",
-    "accentbg": "rgba(47, 143, 78, 0.12)",
-    "accenthover": "rgba(47, 143, 78, 0.20)",
+    "accent": "#9aa3ab",
+    "accentbg": "rgba(154, 163, 171, 0.16)",
+    "accenthover": "rgba(154, 163, 171, 0.26)",
 }
 
 
