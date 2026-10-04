@@ -526,11 +526,17 @@ def _apply_op(doc, spec: dict[str, Any]) -> dict[str, Any]:
         return {"success": True, "index": rec.index}
     if operation == "insert":
         steps = list(spec.get("steps") or (spec.get("params") or {}).get("steps") or [])
+        if not steps:
+            return {
+                "success": False,
+                "error": "insert needs a non-empty steps list (a single step dict or "
+                "{'steps': [...]}); the MCP step_control wraps params automatically",
+            }
         added = sj.insert_steps(records, int(spec.get("index") or 0), steps, EXECUTABLE_OPS)
         if added is None:
             return {
                 "success": False,
-                "error": "insert point is inside executed history (or steps empty) — "
+                "error": f"insert point {spec.get('index')} is inside executed history — "
                 "the plan tail is append/insert-only",
             }
         write_journal(doc, records)

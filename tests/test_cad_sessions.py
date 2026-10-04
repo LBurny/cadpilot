@@ -165,12 +165,15 @@ def test_cad_screenshot_only_when_requested(fake_freecad, isolated_home):
 
 def test_execute_code_that_changed_the_document_is_an_atomic_step(fake_freecad, isolated_home):
     """The addon wraps a mutating snippet in a transaction, so the session
-    records an atomic step and rollback can undo it."""
+    records an atomic step and rollback can undo it. The current addon also
+    reports WHICH document owns the transaction — only same-document changes
+    are recorded (a foreign one would corrupt session_rollback)."""
     sess = _start_session(fake_freecad)
     fake_freecad.result_overrides["execute_code"] = {
         "success": True,
         "message": "Python code executed successfully.",
         "changed": True,
+        "document": "Doc",
     }
     resp = execute_code_operation(fake_freecad, False, "b.Height = 10")
     assert "atomic step #1" in _text(resp)

@@ -349,14 +349,27 @@ def _build_variables(doc, spec):
     return ss
 
 
+def _move_vec3(v, name):
+    """Vector as [x, y, z] or {"x":.., "y":.., "z":..} -> FreeCAD.Vector.
+
+    The rest of the API takes plain coordinate lists; dict-only here used to
+    crash with AttributeError on the natural list form.
+    """
+    if isinstance(v, dict):
+        return FreeCAD.Vector(float(v.get("x", 0)), float(v.get("y", 0)), float(v.get("z", 0)))
+    if isinstance(v, (list, tuple)) and len(v) == 3:
+        return FreeCAD.Vector(float(v[0]), float(v[1]), float(v[2]))
+    raise ValueError(f"{name} must be [x, y, z] or {{'x':.., 'y':.., 'z':..}}, got {v!r}")
+
+
 def _build_move(doc, spec):
     """Apply a relative translation and/or rotation to an existing object.
 
     This is NOT a parametric feature — it directly modifies the object's Placement.
-    Supported spec keys:
-      translate: {"x": dx, "y": dy, "z": dz}  — relative translation
-      rotate: {"axis": {"x":..,"y":..,"z":..}, "angle": degrees}  — relative rotation
-      placement: {"Base": {"x":..,"y":..,"z":..}, "Rotation": {...}}  — absolute override
+    Supported spec keys (vectors accept [x,y,z] or {"x":..,"y":..,"z":..}):
+      translate: [dx, dy, dz] or {"x": dx, "y": dy, "z": dz}  — relative translation
+      rotate: {"axis": [ax,ay,az], "angle": degrees}  — relative rotation
+      placement: {"Base": [x,y,z], "Rotation": {"Axis": [...], "Angle": deg}}  — absolute override
     If both translate/rotate and placement are given, placement wins (absolute).
     """
     _require(spec, "base")
@@ -368,14 +381,10 @@ def _build_move(doc, spec):
         p = spec["placement"]
         base = p.get("Base", p.get("Position", {"x": 0, "y": 0, "z": 0}))
         rot_data = p.get("Rotation", {"Axis": {"x": 0, "y": 0, "z": 1}, "Angle": 0})
-        new_base = FreeCAD.Vector(
-            float(base.get("x", 0)), float(base.get("y", 0)), float(base.get("z", 0))
-        )
+        new_base = _move_vec3(base, "placement.Base")
         axis = rot_data.get("Axis", {"x": 0, "y": 0, "z": 1})
         new_rot = FreeCAD.Rotation(
-            FreeCAD.Vector(
-                float(axis.get("x", 0)), float(axis.get("y", 0)), float(axis.get("z", 0))
-            ),
+            _move_vec3(axis, "placement.Rotation.Axis"),
             float(rot_data.get("Angle", 0)),
         )
         obj.Placement = FreeCAD.Placement(new_base, new_rot)
@@ -386,22 +395,16 @@ def _build_move(doc, spec):
     rotate = spec.get("rotate", {})
     if not translate and not rotate:
         raise ValueError("move requires at least one of: translate, rotate, placement.")
-    dx = float(translate.get("x", 0)) if translate else 0
-    dy = float(translate.get("y", 0)) if translate else 0
-    dz = float(translate.get("z", 0)) if translate else 0
-    delta = FreeCAD.Vector(dx, dy, dz)
+    delta = _move_vec3(translate, "translate") if translate else FreeCAD.Vector(0, 0, 0)
 
     # Relative rotation
     delta_rot = FreeCAD.Rotation()
     if rotate:
-        r_axis = rotate.get("axis", {"x": 0, "y": 0, "z": 1})
+        if not isinstance(rotate, dict):
+            raise ValueError(f"rotate must be a dict {{'axis':…, 'angle':…}}, got {rotate!r}")
+        r_axis = _move_vec3(rotate.get("axis", {"x": 0, "y": 0, "z": 1}), "rotate.axis")
         r_angle = float(rotate.get("angle", 0))  # degrees
-        delta_rot = FreeCAD.Rotation(
-            FreeCAD.Vector(
-                float(r_axis.get("x", 0)), float(r_axis.get("y", 0)), float(r_axis.get("z", 0))
-            ),
-            r_angle,
-        )
+        delta_rot = FreeCAD.Rotation(r_axis, r_angle)
 
     # Compose the new placement. Translation is always in the GLOBAL frame;
     # rotation is applied around the object's current placement base.
@@ -540,7 +543,18 @@ def _build_datum_plane(doc, spec):
         if not (isinstance(face, (list, tuple)) and len(face) == 2):
             raise ValueError("plane.face must be [object_name, 'FaceN'].")
         ref = _get_obj(doc, face[0], "datum plane face object")
-        setattr(dp, support_prop, [(ref, str(face[1]))])
+        face_name = str(face[1])
+        # Direction tokens (+Z/top/…) resolve like a sketch's plane.face —
+        # face names are re-derived after every feature, so the direction is
+        # the stable reference.
+        if face_name.startswith(("+", "-")) or face_name.lower() in sketcher_ops._FACE_WORDS:
+            face_name = sketcher_ops._resolve_semantic_face(ref, face_name)
+        n = int(face_name[4:]) if face_name.startswith("Face") else 0
+        if n < 1 or n > len(ref.Shape.Faces):
+            raise ValueError(
+                f"'{face_name}' out of range on '{ref.Name}' (1-{len(ref.Shape.Faces)})."
+            )
+        setattr(dp, support_prop, [(ref, face_name)])
     else:
         raise ValueError(f"plane must be XY/XZ/YZ or {{'face': ...}}, got {plane!r}")
     dp.MapMode = "FlatFace"
@@ -783,7 +797,12 @@ def create_feature_gui(doc, spec):
     doc.recompute()
     state = [str(s) for s in getattr(feat, "State", [])]
     if "Invalid" in state:
-        raise RuntimeError(f"{ftype} failed to recompute (check parameters/geometry).")
+        # StatusString carries FreeCAD's actual failure reason (bad support,
+        # missing subelement, …) — "check parameters/geometry" alone sends the
+        # caller hunting blind.
+        status = str(getattr(feat, "StatusString", "") or "").strip()
+        detail = f" — {status}" if status and status != "Invalid" else ""
+        raise RuntimeError(f"{ftype} failed to recompute{detail} (check parameters/geometry).")
     shape = getattr(feat, "Shape", None)
     if shape is not None and not shape.isNull() and not shape.isValid():
         raise RuntimeError(f"{ftype} produced an invalid Shape.")

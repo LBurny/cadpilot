@@ -150,17 +150,36 @@ def execute_code_operation(
             sess = get_current_session()
             step_note = ""
             if changed and sess is not None and sess.status == "active":
-                step = sess.add_step(
-                    "execute_code",
-                    f"execute_code: {code[:80]}",
-                    params_summary=code[:200],
-                    result_summary=str(res.get("message", ""))[:200],
-                    atomic=True,
-                )
-                save_session(sess)
-                step_note = (
-                    f" (recorded as atomic step #{step.step_number} of session '{sess.name}')"
-                )
+                # A session step must own a transaction on the SESSION's
+                # document — a snippet that mutated another document (its undo
+                # entry lives on that document's stack) must never be recorded
+                # here, or session_rollback pops the wrong document's
+                # transactions and silently reports success.
+                changed_doc = res.get("document")
+                if changed_doc is None:
+                    step_note = (
+                        " (changed a document, but the addon did not report which one — "
+                        "not recorded; update the FreeCAD addon for session tracking)"
+                    )
+                elif changed_doc != sess.doc_name:
+                    step_note = (
+                        f" (changed document '{changed_doc}' — not part of session "
+                        f"'{sess.name}' (bound to '{sess.doc_name}'); not recorded. "
+                        "It is a journal step on that document: roll it back with "
+                        "step_control(doc_name=…) instead)"
+                    )
+                else:
+                    step = sess.add_step(
+                        "execute_code",
+                        f"execute_code: {code[:80]}",
+                        params_summary=code[:200],
+                        result_summary=str(res.get("message", ""))[:200],
+                        atomic=True,
+                    )
+                    save_session(sess)
+                    step_note = (
+                        f" (recorded as atomic step #{step.step_number} of session '{sess.name}')"
+                    )
             elif not changed:
                 step_note = " (read-only: no document change, not recorded as a step)"
             response = text_response(f"Code executed successfully: {res['message']}{step_note}")
@@ -476,7 +495,15 @@ def cad_operation(
             if not obj_name and operation not in CAD_NO_BASE_OPERATIONS:
                 return text_response(f"{operation} requires obj_name (the base object)")
             params = dict(obj_properties or {})
-            spec = {"type": operation, "base": obj_name, **params}
+            reserved = {"type", "base"} & set(params)
+            if reserved:
+                return text_response(
+                    f"{operation}: obj_properties key(s) {sorted(reserved)} are reserved for the "
+                    "internal feature spec and cannot be set directly. Use operation-specific keys "
+                    "(see operation_help) — e.g. pocket takes 'length', not FreeCAD's 'Type' enum."
+                )
+            # Internal keys LAST: user params must never clobber them.
+            spec = {**params, "type": operation, "base": obj_name}
             res = freecad.create_feature(doc_name, spec, screenshot=shot)
             success = bool(res.get("success"))
             summary = (
@@ -589,18 +616,17 @@ def session_status_operation(freecad: FreeCADConnection) -> ToolResponse:
     # apart. Report that instead of silently trusting this one.
     journal = _journal_snapshot(freecad, sess.doc_name) if doc_open else None
     journal_risks: list[str] = []
-    if journal:
-        if journal.get("drift"):
-            journal_risks.append(
-                "The addon step journal no longer matches FreeCAD's undo stack "
-                "(the model was undone or redone outside cad() — e.g. from the "
-                "CADPilot Steps panel or Ctrl+Z). Prefer step_control for rollback."
-            )
-        if journal.get("done", 0) != sess.step_count:
-            journal_risks.append(
-                f"Session log has {sess.step_count} step(s) but the addon journal "
-                f"has {journal.get('done', 0)} executed — they are out of sync."
-            )
+    # Only the journal-vs-undo-stack drift check is actionable: the journal
+    # is document-lifetime (it counts pre-session work and read-only
+    # execute_code inspections) while the session log is session-lifetime,
+    # so the two step counts legitimately differ on nearly every document —
+    # comparing them is a permanent false positive.
+    if journal and journal.get("drift"):
+        journal_risks.append(
+            "The addon step journal no longer matches FreeCAD's undo stack "
+            "(the model was undone or redone outside cad() — e.g. from the "
+            "CADPilot Steps panel or Ctrl+Z). Prefer step_control for rollback."
+        )
 
     lines = [
         f"**{sess.name}** (doc `{sess.doc_name}`, {sess.step_count} steps, {sess.status})",
@@ -861,6 +887,23 @@ def step_control_operation(
         "force": force,
         "confirm": confirm,
     }
+    if action == "insert":
+        # Accept the natural forms in params: a single step dict (like update
+        # takes), a "steps" list, or both forms nested. The addon only reads
+        # a steps list, and an empty one fails with a misleading error.
+        p = params or {}
+        if "steps" in p:
+            steps = p["steps"]
+        elif p:
+            steps = [p]
+        else:
+            steps = []
+        if not steps or not isinstance(steps, list) or not all(isinstance(s, dict) for s in steps):
+            return text_response(
+                "insert requires steps as a list of step dicts — pass params as a single "
+                "step dict, or params={'steps': […]} for several"
+            )
+        spec["steps"] = steps
     try:
         res = freecad.journal_op(doc_name, spec)
     except Exception as e:

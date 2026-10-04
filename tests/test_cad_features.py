@@ -97,3 +97,43 @@ def test_edit_passes_expression_strings_through(fake_freecad, isolated_home):
     _, args, _ = fake_freecad.calls[0]
     assert args[0] == "Doc"
     assert args[2] == {"Properties": {"Length": "=Spreadsheet.width * 2", "Width": 30}}
+
+
+def test_feature_rejects_reserved_spec_keys(fake_freecad, isolated_home):
+    """obj_properties keys 'type'/'base' are internal spec keys. Letting them
+    through used to clobber the spec — a pocket with {'type': 'ThroughAll'}
+    died with a baffling "unknown feature type 'ThroughAll'" error instead of
+    a hint at the right key."""
+    resp = cad_operation(
+        fake_freecad,
+        False,
+        "pocket",
+        "Doc",
+        obj_name="Sketch",
+        obj_properties={"type": "ThroughAll", "length": 10},
+    )
+    assert "reserved" in _text(resp)
+    assert fake_freecad.calls == []
+
+    resp = cad_operation(
+        fake_freecad,
+        False,
+        "fillet",
+        "Doc",
+        obj_name="Box",
+        obj_properties={"base": "Box", "radius": 2},
+    )
+    assert "reserved" in _text(resp)
+    assert fake_freecad.calls == []
+
+
+def test_feature_internal_spec_keys_win_over_params(fake_freecad, isolated_home):
+    """Regression guard for the dict-order bug: internal spec keys must be
+    written AFTER user params so the operation type always reaches the addon."""
+    cad_operation(
+        fake_freecad, False, "pad", "Doc", obj_name="Sketch", obj_properties={"length": 5}
+    )
+    _, args, _ = fake_freecad.calls[0]
+    assert args[1]["type"] == "pad"
+    assert args[1]["base"] == "Sketch"
+    assert args[1]["length"] == 5

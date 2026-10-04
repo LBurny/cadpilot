@@ -240,3 +240,128 @@ def test_mate_trim_result_without_user_trim_does_not_crash(asm_conn, asm_home, m
     undo = astate.current_session().steps[-1].undo
     assert undo["cuts_to_delete"] == []
     assert undo["links_repoint"] == {}
+
+
+# --- addon-side regression guards (joint_ops.py; AST, no FreeCAD import) ----
+
+import ast  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+_JOINT_OPS = ast.parse(
+    (
+        Path(__file__).resolve().parents[1] / "addon" / "CADPilot" / "rpc_server" / "joint_ops.py"
+    ).read_text(encoding="utf-8")
+)
+
+
+def _func(tree, name):
+    return next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name
+    )
+
+
+def test_anchor_ref_unpacks_the_four_tuple_and_surfaces_errors():
+    """assembly_ops._resolve_anchor returns (pos, dir, source, error); the mate
+    ref resolver used to unpack 2 values, so EVERY anchor-based mate crashed
+    with 'too many values to unpack' before any geometry was touched."""
+    body = ast.get_source_segment(
+        (
+            Path(__file__).resolve().parents[1]
+            / "addon"
+            / "CADPilot"
+            / "rpc_server"
+            / "joint_ops.py"
+        ).read_text(encoding="utf-8"),
+        _func(_JOINT_OPS, "_resolve_ref"),
+    )
+    assert "_resolve_anchor" in body
+    assert "_dir, _src, aerr" in body or body.count("aerr") >= 2, (
+        "unpack the error slot and propagate it"
+    )
+
+
+def test_anchor_ref_maps_the_anchor_into_the_link_frame():
+    """After add_component the link owns the placement and the base part sits
+    at identity — the anchor resolves in the base frame, so probing
+    link.Shape without mapping through link.Placement probes the wrong place."""
+    body = ast.get_source_segment(
+        (
+            Path(__file__).resolve().parents[1]
+            / "addon"
+            / "CADPilot"
+            / "rpc_server"
+            / "joint_ops.py"
+        ).read_text(encoding="utf-8"),
+        _func(_JOINT_OPS, "_resolve_ref"),
+    )
+    assert "multVec" in body, "anchor positions must be mapped through link.Placement"
+
+
+def test_rollback_restores_placements_before_removing_links():
+    """remove_links hands the link's CURRENT placement back to the part;
+    restoring placements only afterwards silently leaks the post-mate
+    placement into the base part (live-caught: rollback left the peg at its
+    mated corner instead of its pre-mate position)."""
+    fn = _func(_JOINT_OPS, "_op_rollback_step")
+    lines = {"links_restore": [], "remove_links": []}
+    for n in ast.walk(fn):
+        if (
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "get"
+            and n.args
+            and isinstance(n.args[0], ast.Constant)
+            and n.args[0].value in lines
+        ):
+            lines[n.args[0].value].append(n.lineno)
+    assert lines["links_restore"] and lines["remove_links"], "both loops must exist"
+    assert min(lines["links_restore"]) < min(lines["remove_links"]), (
+        "links_restore must run before remove_links"
+    )
+
+
+def test_mate_reports_landing_and_warns_on_vertex_landing():
+    """Face refs land on the nearest VERTEX (arbitrary on symmetric faces) —
+    residual 0 does not mean the part landed where the user meant. The result
+    must report the landing vertices and warn on far-from-intent landings."""
+    fn = _func(_JOINT_OPS, "_op_mate")
+    src = ast.get_source_segment(
+        (
+            Path(__file__).resolve().parents[1]
+            / "addon"
+            / "CADPilot"
+            / "rpc_server"
+            / "joint_ops.py"
+        ).read_text(encoding="utf-8"),
+        fn,
+    )
+    assert '"landing"' in src
+    assert '"warnings"' in src
+    assert "_landing_warnings" in src
+
+
+def test_landing_warnings_measure_distance_to_each_ref_kinds_intent():
+    """Anchor and point refs have the same arbitrary-nearest-vertex problem as
+    face refs, so the warning must measure against the intent point of the
+    actual ref kind: face center for a face ref (skipped when point_on_face
+    aims deliberately), the anchor's position for an anchor ref, the point
+    itself for a point ref."""
+    fn = _func(_JOINT_OPS, "_landing_warnings")
+    src = ast.get_source_segment(
+        (
+            Path(__file__).resolve().parents[1]
+            / "addon"
+            / "CADPilot"
+            / "rpc_server"
+            / "joint_ops.py"
+        ).read_text(encoding="utf-8"),
+        fn,
+    )
+    assert "CenterOfMass" in src, "face refs measure against the face center"
+    assert "point_on_face" in src, "point_on_face exempts the face-center check"
+    assert "_resolve_anchor" in src, "anchor refs measure against the anchor position"
+    assert "multVec" in src, "anchor positions are local — map into the link frame"
+    assert 'r["point"]' in src, "point refs measure against the point itself"
+    assert "Vertexes" in src, "single-vertex faces (a circular seam) must be exempt"

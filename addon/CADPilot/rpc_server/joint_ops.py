@@ -148,8 +148,14 @@ def _resolve_ref(doc, ref: dict):
     if "anchor" in ref:
         from . import assembly_ops as aops
 
-        pos, _dir = aops._resolve_anchor(doc.getObject(ref["part"]), ref["anchor"])
-        pt = pos
+        # _resolve_anchor returns (pos, dir, source, error) in the BASE
+        # object's placed frame. After add_component the link owns the
+        # placement (the base sits at identity), so probing link.Shape needs
+        # the anchor mapped through link.Placement.
+        pos, _dir, _src, aerr = aops._resolve_anchor(doc.getObject(ref["part"]), ref["anchor"])
+        if aerr:
+            raise ValueError(aerr)
+        pt = link.Placement.multVec(pos)
     else:
         pt = App.Vector(*ref["point"])
     best, bd = None, 1.0  # 1 mm tolerance band around the part surface
@@ -245,10 +251,65 @@ def _op_add_component(doc, spec: dict) -> dict:
     return {"link": link.Name, "placement": _placement_to_dict(link.Placement)}
 
 
+def _landing_warnings(doc, spec: dict, ref_a, ref_b) -> list[str]:
+    """Warn when a mate lands far from the point the user aimed at.
+
+    All refs resolve to a VERTEX of the face (GUI click semantics), and the
+    nearest vertex to the intent point is arbitrary on symmetric faces — a
+    plate's top face lands at a corner — so a residual-0 mate can still put
+    the part where the user never meant it. Intent point per ref kind: the
+    face center for a plain face ref, the anchor position for an anchor ref,
+    the point itself for a point ref. A face with a single vertex (a circular
+    face's seam) offers no choice, so it never warns.
+    """
+    warnings = []
+    for side, resolved in (("a", ref_a), ("b", ref_b)):
+        r = spec[side]
+        link, fe = resolved
+        if "face" in r:
+            if r.get("point_on_face") is not None:
+                continue  # the user aimed deliberately at that point
+            intent_desc = "the face center"
+            remedy = 'add "point_on_face": [x,y,z] to the ref, or use an anchor/point ref'
+        elif "anchor" in r:
+            intent_desc = f"anchor '{r['anchor']}'"
+            remedy = "the mate lands on the vertex nearest the anchor"
+        else:
+            intent_desc = "the point ref"
+            remedy = "the mate lands on the vertex nearest that point"
+        try:
+            face = link.Shape.getElement(fe[0])
+            if len(face.Vertexes) <= 1:
+                continue
+            if "face" in r:
+                intent = face.CenterOfMass
+            elif "anchor" in r:
+                from . import assembly_ops as aops
+
+                pos, _d, _s, aerr = aops._resolve_anchor(doc.getObject(r["part"]), r["anchor"])
+                if aerr:
+                    continue
+                intent = link.Placement.multVec(pos)
+            else:
+                intent = App.Vector(*r["point"])
+            vertex = link.Shape.getElement(fe[1])
+            d = vertex.Point.distanceToPoint(intent)
+        except Exception:
+            continue
+        if d > 0.5:  # rigid measure — placement-invariant, safe pre-solve
+            warnings.append(
+                f"'{r['part']}' {fe[0]} landed on {fe[1]} ({d:.1f}mm from {intent_desc}) — "
+                f"refs pick the nearest vertex (GUI click semantics); {remedy}, "
+                "or accept the vertex."
+            )
+    return warnings
+
+
 def _op_mate(doc, spec: dict) -> dict:
     asm = _get_assembly(doc)
     ref_a = _resolve_ref(doc, spec["a"])
     ref_b = _resolve_ref(doc, spec["b"])
+    landing_warnings = _landing_warnings(doc, spec, ref_a, ref_b)
     moved_link = ref_a[0]
     pre_placement = _placement_to_dict(moved_link.Placement)
     j = _make_joint(asm, spec["joint"], ref_a, ref_b, spec.get("name") or "")
@@ -280,6 +341,8 @@ def _op_mate(doc, spec: dict) -> dict:
         "moved_link": moved_link.Name,
         "pre_placement": pre_placement,
         "moved_to": _placement_to_dict(moved_link.Placement),
+        "landing": {"a": list(ref_a[1]), "b": list(ref_b[1])},
+        "warnings": landing_warnings,
     }
     trim = spec.get("trim")
     if trim:
@@ -290,6 +353,12 @@ def _op_mate(doc, spec: dict) -> dict:
         t = trim_ops.apply_trim(doc, inserted, base, trim["winner"])
         if t:
             res["trim"] = t
+        else:
+            # apply_trim returns None for a sub-1 mm³ graze — say so instead
+            # of silently dropping the requested trim from the result.
+            res["warnings"] = res["warnings"] + [
+                f"trim requested but '{inserted}' and '{base}' overlap by less than 1 mm³ — nothing trimmed"
+            ]
     return res
 
 
@@ -334,6 +403,14 @@ def _op_rollback_step(doc, spec: dict) -> dict:
         part = doc.getObject(part_name)
         if link is not None and part is not None:
             link.LinkedObject = part
+    # Restore link placements BEFORE removing links: remove_links hands the
+    # link's CURRENT placement back to the part, so restoring afterwards (when
+    # the link is already gone) would silently leak the post-mate placement
+    # into the base part instead of the pre-mate one.
+    for link_name, plc in spec.get("links_restore", {}).items():
+        link = doc.getObject(link_name)
+        if link is not None:
+            link.Placement = _dict_to_placement(plc)
     for link_name in spec.get("remove_links", []):
         link = doc.getObject(link_name)
         if link is not None:
@@ -344,10 +421,6 @@ def _op_rollback_step(doc, spec: dict) -> dict:
                 with contextlib.suppress(Exception):
                     part.ViewObject.Visibility = True
             doc.removeObject(link_name)
-    for link_name, plc in spec.get("links_restore", {}).items():
-        link = doc.getObject(link_name)
-        if link is not None:
-            link.Placement = _dict_to_placement(plc)
     doc.recompute()
     return {"done": True}
 

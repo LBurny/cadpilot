@@ -81,3 +81,42 @@ def test_cut_no_op_is_detected_against_the_predecessor():
     ), "describe_feature must consult the cut types"
     assert "warnings" in _strings(describe)
     assert "pocket" in _strings(_FEATURE), "_CUT_TYPES must cover pocket"
+
+
+def test_move_accepts_list_vectors():
+    """The whole API takes plain coordinate lists; move's dict-only form used
+    to crash with "'list' object has no attribute 'get'" on the natural input."""
+    body = _func(_FEATURE, "_build_move")
+    assert any(isinstance(n, ast.Name) and n.id == "_move_vec3" for n in ast.walk(body)), (
+        "translate/rotate/placement vectors must go through a list-tolerant parser"
+    )
+
+
+def test_move_vec3_helper_parses_lists_and_dicts():
+    helper = _func(_FEATURE, "_move_vec3")
+    seg = ast.unparse(helper)
+    assert "list" in seg and "tuple" in seg, "lists must be accepted"
+    assert "dict" in seg, "dicts must stay accepted"
+    assert "raise ValueError" in seg, "malformed vectors must raise a clear error"
+
+
+def test_datum_plane_accepts_a_direction_face_token():
+    """datum_plane's plane.face used to stuff the token straight into the
+    attachment — '+Z' is no subelement, so it recomputed Invalid. It must use
+    the same direction resolution as a sketch's plane.face."""
+    body = _func(_FEATURE, "_build_datum_plane")
+    assert any(
+        isinstance(n, ast.Attribute) and n.attr == "_resolve_semantic_face" for n in ast.walk(body)
+    ), "datum_plane plane.face must resolve direction tokens"
+    assert any(isinstance(n, ast.Attribute) and n.attr == "_FACE_WORDS" for n in ast.walk(body)), (
+        "direction words must be recognized"
+    )
+
+
+def test_recompute_failure_reports_status_string():
+    """'failed to recompute (check parameters/geometry)' alone sends the caller
+    hunting blind; FreeCAD's StatusString carries the actual reason."""
+    body = _func(_FEATURE, "create_feature_gui")
+    assert any(isinstance(n, ast.Constant) and n.value == "StatusString" for n in ast.walk(body)), (
+        "read the feature's StatusString for the failure detail"
+    )

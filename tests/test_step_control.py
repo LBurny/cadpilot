@@ -161,7 +161,28 @@ def test_session_status_reports_journal_drift(fake_freecad, isolated_home):
 
     assert payload["journal"]["drift"] is True
     assert any("undo stack" in r for r in payload["journal_risks"])
-    assert any("out of sync" in r for r in payload["journal_risks"])
+
+
+def test_session_status_does_not_false_positive_on_count_mismatch(fake_freecad, isolated_home):
+    """The journal is document-lifetime (pre-session work, read-only
+    execute_code) while the session log is session-lifetime — differing step
+    counts are the NORMAL state, not a desync. The count comparison used to
+    fire a permanent "out of sync" warning; only drift is actionable."""
+    _open_session("Doc")
+    fake_freecad.documents.append("Doc")
+    fake_freecad.result_overrides["get_step_journal"] = {
+        "success": True,
+        "document": "Doc",
+        "count": 12,
+        "done": 12,
+        "planned": 0,
+        "drift": False,
+        "records": [],
+    }
+    payload = json.loads(_text(session_status_operation(fake_freecad)))
+
+    assert payload["journal"]["done"] == 12
+    assert payload["journal_risks"] == []
 
 
 def test_session_status_without_journal_support_is_unchanged(fake_freecad, isolated_home):
@@ -196,3 +217,31 @@ def test_session_rollback_warns_about_pre_rollback_drift(fake_freecad, isolated_
     assert any("drift" in w for w in payload["warnings"])
     methods = fake_freecad.called_methods()
     assert methods.index("get_step_journal") < methods.index("undo_transactions")
+
+
+def test_insert_wraps_a_single_step_dict(fake_freecad):
+    """A single step dict in params (the same shape update takes) is the
+    natural form — it used to silently produce an empty steps list and a
+    misleading 'inside executed history' error."""
+    step = {"operation": "create_object", "obj_name": "B", "obj_type": "Part::Box"}
+    resp = step_control_operation(fake_freecad, "Doc", "insert", index=1, params=step)
+    assert json.loads(_text(resp))["success"] is True
+    spec = fake_freecad.calls[-1][1][1]
+    assert spec["steps"] == [step]
+
+
+def test_insert_passes_a_steps_list_through(fake_freecad):
+    steps = [
+        {"operation": "create_object", "obj_name": "A", "obj_type": "Part::Box"},
+        {"operation": "create_object", "obj_name": "B", "obj_type": "Part::Box"},
+    ]
+    resp = step_control_operation(fake_freecad, "Doc", "insert", index=1, params={"steps": steps})
+    assert json.loads(_text(resp))["success"] is True
+    spec = fake_freecad.calls[-1][1][1]
+    assert spec["steps"] == steps
+
+
+def test_insert_rejects_empty_params_before_the_rpc(fake_freecad):
+    resp = step_control_operation(fake_freecad, "Doc", "insert", index=1, params={})
+    assert "steps" in _text(resp)
+    assert fake_freecad.calls == []

@@ -953,6 +953,7 @@ class FreeCADRPC:
             except Exception:
                 pass
             # Capture screenshot in the same GUI dispatch if requested
+            doc_name = doc.Name if doc is not None else None
             if tmp_path is not None:
                 shot = save_active_screenshot(
                     tmp_path,
@@ -961,14 +962,18 @@ class FreeCADRPC:
                     screenshot.get("height"),
                     screenshot.get("focus_object"),
                 )
-                return True, tmp_path if shot is True else None, changed
-            return True, None, changed
+                return True, tmp_path if shot is True else None, changed, doc_name
+            return True, None, changed, doc_name
 
         try:
             out = dispatch_to_gui(combined_task, timeout=self.EXECUTE_CODE_TIMEOUT)
             if isinstance(out, tuple) and len(out) >= 2:
                 res, shot_path = out[0], out[1]
                 changed = out[2] if len(out) > 2 else False
+                # Which document owns the transaction — a mutating run whose
+                # doc differs from the caller's active session must NOT be
+                # recorded there, or session_rollback pops the wrong stack.
+                changed_doc = out[3] if len(out) > 3 else None
             else:
                 # Timeout or error from dispatch layer
                 code_preview = code if len(code) <= 800 else code[:800] + "\n...(truncated)"
@@ -982,6 +987,7 @@ class FreeCADRPC:
                 result = {
                     "success": True,
                     "changed": bool(changed),
+                    "document": changed_doc,
                     "message": "Python code executed successfully.\nOutput: "
                     + output_buffer.getvalue(),
                 }

@@ -48,6 +48,8 @@ def _validate_ref(ref: Any) -> str | None:
         return "mate refs must be dicts with 'part'"
     if sum(1 for k in _REF_KEYS if k in ref) != 1:
         return f"mate ref needs exactly one of {_REF_KEYS}"
+    if "point_on_face" in ref and "face" not in ref:
+        return "point_on_face is only a modifier of a face ref (it picks the landing vertex near that point)"
     return None
 
 

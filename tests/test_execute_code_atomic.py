@@ -118,3 +118,89 @@ def test_mcp_session_step_uses_the_addon_changed_flag():
         "must consult the addon result"
     )
     assert any(isinstance(n, ast.Constant) and n.value == "changed" for n in ast.walk(body))
+
+
+def test_execute_code_result_reports_the_mutated_document():
+    """session_rollback issues undos on the SESSION's document. A mutating
+    snippet whose transaction lives on another document must therefore never
+    enter the session log — the addon reports the owning document so the MCP
+    side can filter."""
+    body = _func(_RPC, "execute_code")
+    assert any(isinstance(n, ast.Constant) and n.value == "document" for n in ast.walk(body))
+
+
+# --- MCP-side behavioral tests (fake connection) ----------------------------
+
+from cadpilot.operations import (  # noqa: E402
+    execute_code_operation,
+    session_start_operation,
+)
+from cadpilot.session_state import get_current_session  # noqa: E402
+
+
+def _text(resp):
+    return " ".join(c.text for c in resp if hasattr(c, "text"))
+
+
+def _open_session(fake_freecad):
+    fake_freecad.documents = ["Doc"]
+    session_start_operation(fake_freecad, "Doc", "s")
+    return get_current_session()
+
+
+def test_mutating_snippet_on_the_session_document_is_recorded(fake_freecad, isolated_home):
+    sess = _open_session(fake_freecad)
+    fake_freecad.result_overrides["execute_code"] = {
+        "success": True,
+        "changed": True,
+        "document": "Doc",
+        "message": "Python code executed successfully.",
+    }
+    resp = execute_code_operation(fake_freecad, False, "doc.Box.Length = 1")
+    assert "recorded as atomic step" in _text(resp)
+    assert sess.step_count == 1
+
+
+def test_mutating_snippet_on_a_foreign_document_is_not_recorded(fake_freecad, isolated_home):
+    """The live-caught bug: an execute_code mutating JournalTest entered the
+    session bound to UserTest1; session_rollback(9) then popped a UserTest1
+    transaction instead and reported state_matches_log=true anyway."""
+    sess = _open_session(fake_freecad)
+    fake_freecad.result_overrides["execute_code"] = {
+        "success": True,
+        "changed": True,
+        "document": "OtherDoc",
+        "message": "Python code executed successfully.",
+    }
+    resp = execute_code_operation(fake_freecad, False, "doc = FreeCAD.getDocument('OtherDoc')")
+    text = _text(resp)
+    assert "not part of session" in text
+    assert "step_control" in text
+    assert sess.step_count == 0
+
+
+def test_mutating_snippet_without_a_document_field_is_not_recorded(fake_freecad, isolated_home):
+    """Old addons report `changed` but not `document` — unattributable, so
+    skip recording (the addon journal still holds the step)."""
+    sess = _open_session(fake_freecad)
+    fake_freecad.result_overrides["execute_code"] = {
+        "success": True,
+        "changed": True,
+        "message": "Python code executed successfully.",
+    }
+    resp = execute_code_operation(fake_freecad, False, "doc.Box.Length = 1")
+    assert "not recorded" in _text(resp)
+    assert sess.step_count == 0
+
+
+def test_read_only_snippet_is_still_not_recorded(fake_freecad, isolated_home):
+    sess = _open_session(fake_freecad)
+    fake_freecad.result_overrides["execute_code"] = {
+        "success": True,
+        "changed": False,
+        "document": "Doc",
+        "message": "Python code executed successfully.",
+    }
+    resp = execute_code_operation(fake_freecad, False, "print(1)")
+    assert "read-only" in _text(resp)
+    assert sess.step_count == 0

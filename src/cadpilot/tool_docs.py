@@ -87,9 +87,9 @@ worse than failing. Workaround: pattern the profile (one pocket per instance,
 e.g. from execute_code) or pattern a Part-level solid with boolean ops.""",
     "move": """\
 move — relative Placement change (obj_name = object to move).
-Optional in obj_properties:
-  translate {"x":..,"y":..,"z":..} — relative translation in GLOBAL coords
-  rotate {"axis": {"x","y","z"}, "angle": degrees} — relative rotation
+Optional in obj_properties (vectors accept [x,y,z] or {"x":..,"y":..,"z":..}):
+  translate [dx,dy,dz] — relative translation in GLOBAL coords
+  rotate {"axis": [ax,ay,az], "angle": degrees} — relative rotation
   placement — absolute Placement override (same format as obj_properties.Placement)""",
     "variables": """\
 variables — create/update a Spreadsheet parameter table (idempotent).
@@ -194,7 +194,8 @@ Optional: neutral_plane, pull_direction ({"edge": ["ObjName", "EdgeN"]}), body, 
 datum_plane — PartDesign datum plane (obj_name = plane name, default
 "DatumPlane", may be omitted).
 Required in obj_properties: plane — "XY"/"XZ"/"YZ" (attached to the body
-origin) or {"face": ["ObjName", "FaceN"]} (attached to an existing face).
+origin) or {"face": ["ObjName", "FaceN"]} (attached to an existing face;
+"+Z"/"top"/… direction tokens resolve like a sketch's plane.face).
 Optional: offset (mm along the plane normal), body.
 Sketch on it with plane={"datum": name}.""",
     "hull": """\
@@ -235,8 +236,13 @@ A mate ref is {"part": <name>} plus exactly ONE of:
   "face": "FaceN"   — direct face reference
   "anchor": <name>  — resolve a named anchor (get_anchors/set_anchors)
   "point": [x,y,z]  — global point; nearest planar face is used
-The contact point maps to the nearest vertex of the face, which decides WHERE
-on the face the mate lands (GUI click semantics).
+The contact point maps to the nearest VERTEX of the face, which decides WHERE
+on the face the mate lands (GUI click semantics). On a symmetric face the
+nearest vertex to the center is arbitrary (a square face lands at a corner),
+so the mate result reports the landing vertices and warns when the landing
+is far from the face center — control it with "point_on_face": [x,y,z]
+(a face-ref modifier picking the vertex near that global point), an anchor,
+or a point ref.
 
 joint_type: fixed (default) / revolute / cylindrical / slider / ball /
 distance / parallel / perpendicular / angle.
