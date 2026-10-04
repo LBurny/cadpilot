@@ -51,14 +51,17 @@ def _normalize_object_names(objects: Any) -> list[str]:
 
 
 def create_document_operation(
-    freecad: FreeCADConnection, name: str, with_screenshot: bool = False
+    freecad: FreeCADConnection,
+    name: str,
+    with_screenshot: bool = False,
+    screenshot_mode: str | None = None,
 ) -> ToolResponse:
     try:
         shot = _shot_params(with_screenshot)
         res = freecad.create_document(name, screenshot=shot)
         if res["success"]:
             response = text_response(f"Document '{res['document_name']}' created successfully")
-            return add_screenshot_if_available(response, res.get("screenshot"), not with_screenshot)
+            return add_screenshot_if_available(response, res.get("screenshot"), not with_screenshot, screenshot_mode)
         return text_response(f"Failed to create document: {res['error']}")
     except Exception as e:
         logger.error(f"Failed to create document: {e!s}")
@@ -72,6 +75,7 @@ def create_object_operation(
     obj_type: str,
     obj_name: str,
     obj_properties: dict[str, Any] | None = None,
+    screenshot_mode: str | None = None,
 ) -> ToolResponse:
     try:
         obj_data = {
@@ -87,7 +91,7 @@ def create_object_operation(
             response = text_response(f"Object '{res['object_name']}' created successfully")
         else:
             return text_response(f"Failed to create object: {res['error']}")
-        return add_screenshot_if_available(response, res.get("screenshot"), not with_screenshot)
+        return add_screenshot_if_available(response, res.get("screenshot"), not with_screenshot, screenshot_mode)
     except Exception as e:
         logger.error(f"Failed to create object: {e!s}")
         return text_response(f"Failed to create object: {e!s}")
@@ -99,6 +103,7 @@ def edit_object_operation(
     doc_name: str,
     obj_name: str,
     obj_properties: dict[str, Any],
+    screenshot_mode: str | None = None,
 ) -> ToolResponse:
     try:
         res = freecad.edit_object(
@@ -111,7 +116,7 @@ def edit_object_operation(
             response = text_response(f"Object '{res['object_name']}' edited successfully")
         else:
             return text_response(f"Failed to edit object: {res['error']}")
-        return add_screenshot_if_available(response, res.get("screenshot"), not with_screenshot)
+        return add_screenshot_if_available(response, res.get("screenshot"), not with_screenshot, screenshot_mode)
     except Exception as e:
         logger.error(f"Failed to edit object: {e!s}")
         return text_response(f"Failed to edit object: {e!s}")
@@ -122,6 +127,7 @@ def delete_object_operation(
     with_screenshot: bool,
     doc_name: str,
     obj_name: str,
+    screenshot_mode: str | None = None,
 ) -> ToolResponse:
     try:
         res = freecad.delete_object(doc_name, obj_name, screenshot=_shot_params(with_screenshot))
@@ -129,7 +135,7 @@ def delete_object_operation(
             response = text_response(f"Object '{res['object_name']}' deleted successfully")
         else:
             return text_response(f"Failed to delete object: {res['error']}")
-        return add_screenshot_if_available(response, res.get("screenshot"), not with_screenshot)
+        return add_screenshot_if_available(response, res.get("screenshot"), not with_screenshot, screenshot_mode)
     except Exception as e:
         logger.error(f"Failed to delete object: {e!s}")
         return text_response(f"Failed to delete object: {e!s}")
@@ -139,6 +145,7 @@ def execute_code_operation(
     freecad: FreeCADConnection,
     with_screenshot: bool,
     code: str,
+    screenshot_mode: str | None = None,
 ) -> ToolResponse:
     try:
         res = freecad.execute_code(code, screenshot=_shot_params(with_screenshot))
@@ -187,7 +194,7 @@ def execute_code_operation(
             elif not changed:
                 step_note = " (read-only: no document change, not recorded as a step)"
             response = text_response(f"Code executed successfully: {res['message']}{step_note}")
-            return add_screenshot_if_available(response, res.get("screenshot"), not with_screenshot)
+            return add_screenshot_if_available(response, res.get("screenshot"), not with_screenshot, screenshot_mode)
         return text_response(f"Failed to execute code: {res['error']}")
     except Exception as e:
         logger.error(f"Failed to execute code: {e!s}")
@@ -238,6 +245,7 @@ def execute_operations_operation(
     doc_name: str,
     ops: list[dict[str, Any]],
     stop_on_error: bool = False,
+    screenshot_mode: str | None = None,
 ) -> ToolResponse:
     try:
         res = freecad.execute_operations(
@@ -257,7 +265,7 @@ def execute_operations_operation(
                 **res,
             }
         )
-        return add_screenshot_if_available(response, res.get("screenshot"), not with_screenshot)
+        return add_screenshot_if_available(response, res.get("screenshot"), not with_screenshot, screenshot_mode)
     except Exception as e:
         logger.error(f"Failed to execute operations: {e!s}")
         hint = (
@@ -273,11 +281,12 @@ def get_view_operation(
     width: int | None = None,
     height: int | None = None,
     focus_object: str | None = None,
+    screenshot_mode: str | None = None,
 ) -> ToolResponse:
     try:
         screenshot = freecad.get_active_screenshot(view_name, width, height, focus_object)
         if screenshot is not None:
-            return [screenshot_content(screenshot)]
+            return [screenshot_content(screenshot, screenshot_mode)]
         return text_response(
             "Cannot get screenshot in the current view type (such as TechDraw or Spreadsheet)"
         )
@@ -290,11 +299,12 @@ def get_objects_operation(
     freecad: FreeCADConnection,
     with_screenshot: bool,
     doc_name: str,
+    screenshot_mode: str | None = None,
 ) -> ToolResponse:
     try:
         response = json_response(freecad.get_objects(doc_name))
         screenshot = freecad.get_active_screenshot() if with_screenshot else None
-        return add_screenshot_if_available(response, screenshot, not with_screenshot)
+        return add_screenshot_if_available(response, screenshot, not with_screenshot, screenshot_mode)
     except Exception as e:
         logger.error(f"Failed to get objects: {e!s}")
         return text_response(f"Failed to get objects: {e!s}")
@@ -305,11 +315,12 @@ def get_object_operation(
     with_screenshot: bool,
     doc_name: str,
     obj_name: str,
+    screenshot_mode: str | None = None,
 ) -> ToolResponse:
     try:
         response = json_response(freecad.get_object(doc_name, obj_name))
         screenshot = freecad.get_active_screenshot() if with_screenshot else None
-        return add_screenshot_if_available(response, screenshot, not with_screenshot)
+        return add_screenshot_if_available(response, screenshot, not with_screenshot, screenshot_mode)
     except Exception as e:
         logger.error(f"Failed to get object: {e!s}")
         return text_response(f"Failed to get object: {e!s}")
@@ -437,6 +448,7 @@ def cad_operation(
     stop_on_error: bool = False,
     description: str = "",
     auto_audit: bool = True,
+    screenshot_mode: str | None = None,
 ) -> ToolResponse:
     """Unified mutation entry point (nsforge math()-style dispatcher).
 
@@ -558,7 +570,7 @@ def cad_operation(
         response = text_response(summary + step_note)
     else:
         return text_response(summary)
-    return add_screenshot_if_available(response, res.get("screenshot"), not with_screenshot)
+    return add_screenshot_if_available(response, res.get("screenshot"), not with_screenshot, screenshot_mode)
 
 
 # --- modeling sessions --------------------------------------------------------
@@ -1247,6 +1259,7 @@ def set_anchors_operation(
     anchors: dict[str, Any],
     replace: bool = False,
     coord_frame: str = "local",
+    screenshot_mode: str | None = None,
 ) -> ToolResponse:
     if not anchors:
         return text_response("set_anchors requires a non-empty anchors dict")
@@ -1278,7 +1291,7 @@ def set_anchors_operation(
             res,
         )
     response = json_response({"summary": summary, **res})
-    return add_screenshot_if_available(response, res.get("screenshot"), not with_screenshot)
+    return add_screenshot_if_available(response, res.get("screenshot"), not with_screenshot, screenshot_mode)
 
 
 def assemble_operation(
@@ -1288,6 +1301,7 @@ def assemble_operation(
     mates: list[dict[str, Any]],
     tolerance: float = 0.1,
     stop_on_error: bool = True,
+    screenshot_mode: str | None = None,
 ) -> ToolResponse:
     if not mates:
         return text_response("assemble requires a non-empty mates list")
@@ -1318,7 +1332,7 @@ def assemble_operation(
             res,
         )
     response = json_response({"summary": summary, **res})
-    return add_screenshot_if_available(response, res.get("screenshot"), not with_screenshot)
+    return add_screenshot_if_available(response, res.get("screenshot"), not with_screenshot, screenshot_mode)
 
 
 def verify_assembly_operation(

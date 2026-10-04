@@ -57,7 +57,7 @@ from .operations import (
     verify_assembly_operation,
 )
 from .prompt_text import ASSET_CREATION_STRATEGY
-from .responses import set_screenshot_mode
+from .responses import set_screenshot_mode, text_response
 from .server_state import ServerState
 
 logging.basicConfig(
@@ -178,15 +178,22 @@ def _maybe_start_log_forwarder() -> None:
 
 @mcp.tool()
 def create_document(
-    ctx: Context, name: str, with_screenshot: bool | None = None
+    ctx: Context,
+    name: str,
+    with_screenshot: bool | None = None,
+    screenshot_mode: Literal["image", "file"] | None = None,
 ) -> list[TextContent | ImageContent]:
     """Create a new document in FreeCAD.
 
     Args:
         name: Document name.
+        with_screenshot/screenshot_mode: attach a screenshot (default off): "image" = inline PNG, "file" = path only (default: server config).
     """
     return create_document_operation(
-        get_freecad_connection(), name, with_screenshot=state.resolve_screenshot(with_screenshot)
+        get_freecad_connection(),
+        name,
+        with_screenshot=state.resolve_screenshot(with_screenshot),
+        screenshot_mode=screenshot_mode,
     )
 
 
@@ -225,6 +232,7 @@ def cad(
     stop_on_error: bool = False,
     description: str = "",
     with_screenshot: bool | None = None,
+    screenshot_mode: Literal["image", "file"] | None = None,
 ) -> list[TextContent | ImageContent]:
     """CAD modeling operation (unified mutation tool).
 
@@ -235,12 +243,10 @@ def cad(
 
     Args:
         obj_type: Object type for create_object (e.g. "Part::Box").
-        obj_name: Base object (new-object name for sketch/variables/
-            datum_plane/hull).
-        obj_properties: Properties/params for the operation.
         ops: Operation dicts for batch.
         stop_on_error: batch — stop at the first failed op.
         description: Note recorded into the session step log.
+        with_screenshot/screenshot_mode: attach a screenshot (default off): "image" = inline PNG, "file" = path only (default: server config).
     """
     return cad_operation(
         get_freecad_connection(),
@@ -254,15 +260,15 @@ def cad(
         stop_on_error=stop_on_error,
         description=description,
         auto_audit=state.auto_audit,
+        screenshot_mode=screenshot_mode,
     )
 
 
 @mcp.tool()
 def execute_code_async(ctx: Context, code: str) -> list[TextContent]:
-    """Execute Python code in FreeCAD without waiting (background thread, NOT
-    the GUI thread): the code must not touch FreeCADGui, view/selection,
-    document objects, recompute, or save — use execute_code for any of that.
-    Only for long pure CPU computations on already-fetched shapes. Use
+    """Execute Python code without waiting (background thread, NOT the GUI
+    thread): the code must not touch FreeCADGui, view/selection, document
+    objects, recompute, or save — use execute_code for any of that. Use
     task_print(...) for output (print() is not captured); poll with
     get_task_result.
 
@@ -279,8 +285,7 @@ def get_task_result(ctx: Context, task_id: str) -> list[TextContent]:
     Args:
         task_id: Task ID from execute_code_async.
 
-    Returns:
-        JSON {status: running | done | error, output, traceback on error}.
+    Returns: JSON {status: running | done | error, output, traceback}.
     """
     return get_task_result_operation(get_freecad_connection(), task_id)
 
@@ -290,15 +295,20 @@ def execute_code(
     ctx: Context,
     code: str,
     with_screenshot: bool | None = None,
+    screenshot_mode: Literal["image", "file"] | None = None,
 ) -> list[TextContent | ImageContent]:
     """Execute arbitrary Python in FreeCAD's GUI thread (full FreeCAD API;
     FreeCAD/FreeCADGui already imported). print() output is returned.
 
     Args:
         code: Python code to execute.
+        with_screenshot/screenshot_mode: attach a screenshot (default off): "image" = inline PNG, "file" = path only (default: server config).
     """
     return execute_code_operation(
-        get_freecad_connection(), state.resolve_screenshot(with_screenshot), code
+        get_freecad_connection(),
+        state.resolve_screenshot(with_screenshot),
+        code,
+        screenshot_mode=screenshot_mode,
     )
 
 
@@ -311,15 +321,21 @@ def get_view(
     width: int | None = None,
     height: int | None = None,
     focus_object: str | None = None,
+    screenshot_mode: Literal["image", "file"] | None = None,
 ) -> list[ImageContent | TextContent]:
-    """Get a screenshot of the active view.
+    """Get a screenshot of the active view. Context-expensive — call only for visual checks; prefer get_objects/measure_geometry for data.
 
     Args:
         view_name: Camera view.
-        width/height: Pixels; default is the viewport size.
+        width/height: Pixels; default caps the long edge at 384, smaller saves context.
         focus_object: Object to focus on; default fits all objects.
+        screenshot_mode: "image" = inline PNG, "file" = path only (default: server config).
     """
-    return get_view_operation(get_freecad_connection(), view_name, width, height, focus_object)
+    if state.only_text_feedback:
+        return text_response("Screenshots are disabled by --only-text-feedback.")
+    return get_view_operation(
+        get_freecad_connection(), view_name, width, height, focus_object, screenshot_mode
+    )
 
 
 @mcp.tool()
@@ -327,10 +343,18 @@ def get_objects(
     ctx: Context,
     doc_name: str,
     with_screenshot: bool | None = None,
+    screenshot_mode: Literal["image", "file"] | None = None,
 ) -> list[TextContent | ImageContent]:
-    """Get all objects in a document (screenshot only when requested)."""
+    """Get all objects in a document.
+
+    Args:
+        with_screenshot/screenshot_mode: attach a screenshot (default off): "image" = inline PNG, "file" = path only (default: server config).
+    """
     return get_objects_operation(
-        get_freecad_connection(), state.resolve_screenshot(with_screenshot), doc_name
+        get_freecad_connection(),
+        state.resolve_screenshot(with_screenshot),
+        doc_name,
+        screenshot_mode=screenshot_mode,
     )
 
 
@@ -340,14 +364,19 @@ def get_object(
     doc_name: str,
     obj_name: str,
     with_screenshot: bool | None = None,
+    screenshot_mode: Literal["image", "file"] | None = None,
 ) -> list[TextContent | ImageContent]:
-    """Get an object's properties from a document (screenshot only when
-    requested)."""
+    """Get an object's properties from a document.
+
+    Args:
+        with_screenshot/screenshot_mode: attach a screenshot (default off): "image" = inline PNG, "file" = path only (default: server config).
+    """
     return get_object_operation(
         get_freecad_connection(),
         state.resolve_screenshot(with_screenshot),
         doc_name,
         obj_name,
+        screenshot_mode=screenshot_mode,
     )
 
 
@@ -371,8 +400,8 @@ def session_start(
 ) -> list[TextContent]:
     """Start a modeling session bound to a document: every successful cad()
     mutation is recorded as a transaction-backed step, so session_rollback
-    enables trial-and-error modeling. An execute_code run that changes the
-    document is atomic too; a read-only one still needs force to roll past.
+    enables trial-and-error modeling. A mutating execute_code run is an
+    atomic step too; a read-only run is not recorded.
 
     Args:
         name: Optional human-readable session name.
@@ -388,8 +417,7 @@ def session_status(ctx: Context) -> list[TextContent]:
     """Show the active session: step count, document state, next-step
     suggestions, and risks (e.g. drift from GUI edits, non-atomic steps).
 
-    Returns:
-        JSON summary with a human-readable display_text.
+    Returns: JSON summary with a human-readable display_text.
     """
     return session_status_operation(get_freecad_connection())
 
@@ -398,9 +426,7 @@ def session_status(ctx: Context) -> list[TextContent]:
 def session_get_steps(ctx: Context) -> list[TextContent]:
     """Return all recorded steps and notes of the active session.
 
-    Returns:
-        JSON list (step_number, operation, description, params, objects_after
-        fingerprint, atomic flag, timestamp).
+    Returns: JSON list of step records.
     """
     return session_get_steps_operation()
 
@@ -510,7 +536,7 @@ def get_addon_log(
 def diagnose(ctx: Context, host: str | None = None) -> list[TextContent]:
     """Diagnose why CADPilot cannot reach FreeCAD — runs while FreeCAD is down
     or frozen. Probes the RPC port, the FreeCAD process, the addon install and
-    its logs (incl. the bootstrap crash log) on Windows/macOS/Linux.
+    its logs (incl. the bootstrap crash log).
 
     Args:
         host: FreeCAD host to probe; defaults to this server's --host.
@@ -580,9 +606,6 @@ def save_pattern(
     """Store a reusable modeling pattern (code snippet or workflow) — call
     this after a non-trivial approach worked.
 
-    Knowledge hierarchy: 1) your own knowledge, 2) recall_patterns,
-    3) inspect_freecad — then store new approaches back here.
-
     Args:
         name: Short pattern name (e.g. "flanged pipe via loft").
         description: What it does and when to use it.
@@ -616,10 +639,8 @@ def recall_patterns(
 @mcp.tool()
 def operation_help(ctx: Context, operation: str | None = None) -> list[TextContent]:
     """Full parameter reference for a cad() operation or assembly_session.
-
-    Detailed docs live here (not in docstrings) to keep the tool list small
-    in context. Call with an operation name (e.g. "sketch", "hull",
-    "assembly_session") or none for the topic list.
+    Call with an operation name (e.g. "sketch", "hull") or none for the
+    topic list.
     """
     return operation_help_operation(operation)
 
@@ -634,12 +655,9 @@ def inspect_freecad(
     """Runtime introspection of the FreeCAD Python API — last resort when
     your knowledge and recall_patterns are insufficient.
 
-    Modes: doc_name + obj_name gives the object's TypeId, settable
-    properties (with types), public methods, docstring; dotted_name (e.g.
-    "Part.makeLoft") gives its docstring or a module/class member list.
-
-    Returns:
-        JSON with properties/members/docstring (compact, capped).
+    Modes: doc_name + obj_name → the object's TypeId, settable properties,
+    methods, docstring; dotted_name (e.g. "Part.makeLoft") → a docstring or
+    module/class member list.
     """
     return inspect_freecad_operation(get_freecad_connection(), doc_name, obj_name, dotted_name)
 
@@ -734,9 +752,6 @@ def align_shapes(
         mode: "touch" (face-to-face, normals opposing) | "center" (centers
             coincide) | "axis" (cylindrical axes aligned).
         offset: Extra distance along the target normal (positive = away).
-
-    Returns:
-        JSON with success and the new Placement.
     """
     return align_shapes_operation(
         get_freecad_connection(),
@@ -776,6 +791,7 @@ def set_anchors(
     replace: bool = False,
     coord_frame: Literal["local", "global"] = "local",
     with_screenshot: bool | None = None,
+    screenshot_mode: Literal["image", "file"] | None = None,
 ) -> list[TextContent]:
     """Define explicit named anchors on an object. Anchors persist with the
     document and follow Placement moves. Records a modeling-session step.
@@ -785,6 +801,7 @@ def set_anchors(
         replace: Replace all existing anchors instead of merging.
         coord_frame: "local" (stored as-is) or "global" (converted — use
             whenever your source coordinates are global).
+        with_screenshot/screenshot_mode: attach a screenshot (default off): "image" = inline PNG, "file" = path only (default: server config).
     """
     return set_anchors_operation(
         get_freecad_connection(),
@@ -794,6 +811,7 @@ def set_anchors(
         anchors,
         replace,
         coord_frame,
+        screenshot_mode=screenshot_mode,
     )
 
 
@@ -805,6 +823,7 @@ def assemble(
     tolerance: float = 0.1,
     stop_on_error: bool = True,
     with_screenshot: bool | None = None,
+    screenshot_mode: Literal["image", "file"] | None = None,
 ) -> list[TextContent]:
     """Assemble parts by snapping named anchors together (ONE transaction);
     mates over tolerance fail and roll back. For PERSISTENT joints use
@@ -814,8 +833,7 @@ def assemble(
         mates: Non-empty list of mate dicts.
         tolerance: Max allowed post-move residual in mm (default 0.1).
         stop_on_error: Abort and roll back at the first failed mate.
-
-    Returns: JSON per-mate residuals and passed/failed counts.
+        with_screenshot/screenshot_mode: attach a screenshot (default off): "image" = inline PNG, "file" = path only (default: server config).
     """
     return assemble_operation(
         get_freecad_connection(),
@@ -824,6 +842,7 @@ def assemble(
         mates,
         tolerance,
         stop_on_error,
+        screenshot_mode=screenshot_mode,
     )
 
 

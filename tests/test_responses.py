@@ -64,6 +64,11 @@ def test_add_screenshot_skipped_when_none():
 PNG_1X1 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 
 
+class StubFreeCAD:
+    def get_active_screenshot(self, *args, **kwargs):
+        return PNG_1X1
+
+
 @pytest.fixture
 def file_mode(tmp_path, monkeypatch):
     monkeypatch.setenv("CADPILOT_HOME", str(tmp_path))
@@ -102,10 +107,32 @@ def test_file_mode_falls_back_to_inline_on_write_error(monkeypatch):
 def test_get_view_file_mode_returns_path_text(file_mode):
     from cadpilot.operations.core import get_view_operation
 
-    class StubFreeCAD:
-        def get_active_screenshot(self, *args, **kwargs):
-            return PNG_1X1
-
     resp = get_view_operation(StubFreeCAD(), "Isometric")
     assert isinstance(resp[0], TextContent)
     assert "Screenshot saved to" in resp[0].text
+
+
+def test_get_view_mode_param_overrides_server_default(tmp_path, monkeypatch):
+    from cadpilot.operations.core import get_view_operation
+
+    monkeypatch.setenv("CADPILOT_HOME", str(tmp_path))
+    # global default stays "image"; the per-call mode wins
+    resp = get_view_operation(StubFreeCAD(), "Isometric", screenshot_mode="file")
+    assert isinstance(resp[0], TextContent)
+    assert "Screenshot saved to" in resp[0].text
+
+
+def test_get_view_mode_image_overrides_file_default(file_mode):
+    from cadpilot.operations.core import get_view_operation
+
+    resp = get_view_operation(StubFreeCAD(), "Front", screenshot_mode="image")
+    assert isinstance(resp[0], ImageContent)
+
+
+def test_add_screenshot_mode_param_overrides_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("CADPILOT_HOME", str(tmp_path))
+    resp = add_screenshot_if_available(
+        text_response("ok"), PNG_1X1, False, screenshot_mode="file"
+    )
+    assert isinstance(resp[1], TextContent)
+    assert "Screenshot saved to" in resp[1].text

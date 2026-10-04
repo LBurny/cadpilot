@@ -62,6 +62,23 @@ def test_create_object_without_screenshot_is_text_only(fake_freecad):
     assert not _has_image(resp)
 
 
+def test_cad_screenshot_mode_file_returns_path(fake_freecad, tmp_path, monkeypatch):
+    """cad() threads per-call screenshot_mode through to the response."""
+    monkeypatch.setenv("CADPILOT_HOME", str(tmp_path))
+    resp = cad_operation(
+        fake_freecad,
+        True,
+        "create_object",
+        "Doc",
+        obj_type="Part::Box",
+        obj_name="Box",
+        auto_audit=False,
+        screenshot_mode="file",
+    )
+    assert not _has_image(resp)
+    assert "Screenshot saved to" in _text(resp)
+
+
 def test_create_object_failure_reports_error(fake_freecad):
     fake_freecad.result_overrides["create_object"] = {"success": False, "error": "boom"}
     resp = cad_operation(
@@ -140,6 +157,14 @@ def test_execute_code_failure_skips_screenshot(fake_freecad):
     resp = execute_code_operation(fake_freecad, True, "!!!")
     assert fake_freecad.called_methods() == ["execute_code"]
     assert "syntax" in _text(resp)
+
+
+def test_execute_code_screenshot_mode_file_returns_path(fake_freecad, tmp_path, monkeypatch):
+    """Per-call screenshot_mode="file" threads through to the response."""
+    monkeypatch.setenv("CADPILOT_HOME", str(tmp_path))
+    resp = execute_code_operation(fake_freecad, True, "print(1)", screenshot_mode="file")
+    assert not _has_image(resp)
+    assert "Screenshot saved to" in _text(resp)
 
 
 def test_execute_code_async_response_contains_task_id(fake_freecad):

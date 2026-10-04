@@ -12,8 +12,9 @@ type ToolResponse = list[TextContent | ImageContent]
 # How screenshots are returned: "image" inlines base64 ImageContent (default,
 # works with every MCP client); "file" writes the PNG to disk and returns only
 # the path, so agentic clients with a file-reading tool keep base64 out of the
-# conversation (permanent, cache-busting text). Set once at startup from the
-# --screenshot-mode CLI flag via set_screenshot_mode().
+# conversation (permanent, cache-busting text). The global default is set once
+# at startup from the --screenshot-mode CLI flag via set_screenshot_mode();
+# callers (e.g. get_view) can override it per call with an explicit mode.
 _SCREENSHOT_MODE = "image"
 
 
@@ -38,9 +39,9 @@ def json_response(data: object) -> ToolResponse:
     return text_response(json.dumps(data, ensure_ascii=False, separators=(",", ":"), default=str))
 
 
-def screenshot_content(screenshot: str) -> TextContent | ImageContent:
+def screenshot_content(screenshot: str, mode: str | None = None) -> TextContent | ImageContent:
     """One screenshot content block, inline image or file pointer per mode."""
-    if _SCREENSHOT_MODE == "file":
+    if (mode or _SCREENSHOT_MODE) == "file":
         try:
             info = save_screenshot(screenshot)
         except (ValueError, OSError) as e:
@@ -61,7 +62,8 @@ def add_screenshot_if_available(
     response: ToolResponse,
     screenshot: str | None,
     only_text_feedback: bool,
+    screenshot_mode: str | None = None,
 ) -> ToolResponse:
     if only_text_feedback or screenshot is None:
         return response
-    return [*response, screenshot_content(screenshot)]
+    return [*response, screenshot_content(screenshot, screenshot_mode)]
