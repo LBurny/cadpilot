@@ -169,6 +169,7 @@ class StepPanel(QtWidgets.QDockWidget):
         self._records: list = []
         self._details_for: int = 0
         self._in_apply: bool = False
+        self._drifted: bool = False
         self._entries: list[dict] = []
         self._spotlight: dict | None = None
         self._meta_raw: str = ""
@@ -495,13 +496,12 @@ QLabel#PanelStatus {{ color: {c["dim"]}; padding: 5px 8px 4px 8px; }}
     # --- refresh ---------------------------------------------------------
 
     def refresh(self) -> None:
-        """Redraw when the journal OR the drift state changed.
+        """Redraw when the journal changed; report drift on its own channel.
 
-        The list only needs the journal text, but the status line also reports
-        whether the journal still matches FreeCAD's undo stack — and a manual
-        Ctrl+Z changes that WITHOUT touching the journal (FreeCAD does not
-        restore document-level property changes on undo), so the journal digest
-        alone cannot gate the status line.
+        The tree and the status line are pure functions of the journal text,
+        so the digest gates them. Drift detection cannot share that gate — a
+        manual Ctrl+Z changes the undo stack WITHOUT touching the journal —
+        so it is checked on every tick and logged once per episode.
         """
         doc = FreeCAD.ActiveDocument
         if doc is None:
@@ -516,7 +516,8 @@ QLabel#PanelStatus {{ color: {c["dim"]}; padding: 5px 8px 4px 8px; }}
         except Exception:
             text = ""
         records = sj.from_json(text)
-        note = self._summary(doc, records)
+        self._report_drift(doc, records)
+        note = self._summary(records)
         if text == self._digest and note == self._note:
             return
         old_states = {r.index: r.state for r in self._records}
@@ -555,12 +556,23 @@ QLabel#PanelStatus {{ color: {c["dim"]}; padding: 5px 8px 4px 8px; }}
             text += f"<br><span style='color:{dim}'>Plan: {html.escape(description)}</span>"
         return text
 
-    def _summary(self, doc, records) -> str:
-        text = (
+    def _summary(self, records) -> str:
+        return (
             f"{len(records)} step(s), "
             f"{sj.done_count(records)} done, {sj.pending_count(records)} planned, "
             f"{sum(1 for r in records if r.accepted)} accepted"
         )
+
+    def _report_drift(self, doc, records) -> None:
+        """Log once when the journal and FreeCAD's undo stack start disagreeing.
+
+        A manual Ctrl+Z/Ctrl+Y pops journal transactions without touching the
+        journal itself, so from then on rollback's undo math is unreliable —
+        it may rebuild instead of undoing cleanly. The notice is
+        edge-triggered (clean -> drifted logs one line, drifted -> clean
+        re-arms it): pinned in the status line it stayed on screen forever,
+        because the stack never realigns on its own.
+        """
         try:
             names = list(getattr(doc, "UndoNames", []) or [])
         except Exception:
@@ -569,9 +581,14 @@ QLabel#PanelStatus {{ color: {c["dim"]}; padding: 5px 8px 4px 8px; }}
         # execute_code record has no transaction, so anchoring on the last
         # completed record outright would hide a manual undo here too.
         last = sj.last_atomic_done(records)
-        if last and last.transaction not in names:
-            text += "\nOut of sync with FreeCAD's undo stack (undone manually?)"
-        return text
+        drifted = bool(last and last.transaction not in names)
+        if drifted and not self._drifted:
+            self._log(
+                "out of sync with FreeCAD's undo stack (undone manually?) — "
+                "rollback may rebuild instead of undoing cleanly",
+                "error",
+            )
+        self._drifted = drifted
 
     def _render(self, records, header: str, note: str) -> None:
         self.header.setText(header)
