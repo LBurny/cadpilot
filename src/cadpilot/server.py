@@ -57,6 +57,7 @@ from .operations import (
     verify_assembly_operation,
 )
 from .prompt_text import ASSET_CREATION_STRATEGY
+from .responses import set_screenshot_mode
 from .server_state import ServerState
 
 logging.basicConfig(
@@ -934,6 +935,14 @@ def main():
         help="Attach a screenshot to every mutation/read tool response by default (tools can still opt out per call)",
     )
     parser.add_argument(
+        "--screenshot-mode",
+        choices=["image", "file"],
+        default="image",
+        help="How screenshots are delivered: 'image' inlines base64 image blocks (default, "
+        "works with every client); 'file' saves them under ~/.cadpilot/screenshots/ and "
+        "returns only the path — much cheaper for agentic clients with a file-reading tool",
+    )
+    parser.add_argument(
         "--host",
         type=_validate_host,
         default="localhost",
@@ -949,12 +958,14 @@ def main():
     state.with_screenshots = args.with_screenshots
     state.rpc_host = args.host
     state.auto_audit = not args.no_auto_audit
+    set_screenshot_mode(args.screenshot_mode)
     if state.only_text_feedback and state.with_screenshots:
         logger.warning(
             "Both --only-text-feedback and --with-screenshots given; --only-text-feedback wins"
         )
     logger.info(f"Only text feedback: {state.only_text_feedback}")
     logger.info(f"Screenshots by default: {state.with_screenshots}")
+    logger.info(f"Screenshot mode: {args.screenshot_mode}")
     logger.info(f"Auto connectivity audit: {state.auto_audit}")
     logger.info(f"Connecting to FreeCAD RPC server at: {state.rpc_host}")
     _maybe_start_log_forwarder()

@@ -179,7 +179,7 @@ Several rules keep it reliable, all verified against a live FreeCAD:
 
 ## 9. Screenshot policy
 
-Screenshots are optional and off by default. A single call can request one; `--with-screenshots` makes them the default; `--only-text-feedback` prohibits them outright, giving text-only models a hard guarantee. Mutating tools capture the screenshot inside the same request that does the work, in one round trip, and fall back to a second call against older addons. Captures are capped at 768 pixels on the long edge unless a size is given, and a few view types, such as TechDraw and Spreadsheet, return none at all.
+Screenshots are optional and off by default. A single call can request one; `--with-screenshots` makes them the default; `--only-text-feedback` prohibits them outright, giving text-only models a hard guarantee; `--screenshot-mode file` writes them to `$CADPILOT_HOME/screenshots/` and returns only the path instead of an inline base64 image. Mutating tools capture the screenshot inside the same request that does the work, in one round trip, and fall back to a second call against older addons. Captures are capped at 512 pixels on the long edge unless a size is given, and a few view types, such as TechDraw and Spreadsheet, return none at all.
 
 ## 10. Long-running computations
 

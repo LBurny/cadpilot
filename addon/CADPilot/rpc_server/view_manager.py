@@ -34,7 +34,7 @@ def _get_view_size(view: Any) -> tuple[int, int]:
 # the long edge is scaled down to this many pixels. Full-viewport PNGs
 # base64-encode to hundreds of KB, and every pixel is paid as tokens by
 # the LLM client. Callers can always override with explicit width/height.
-DEFAULT_MAX_DIM = 768
+DEFAULT_MAX_DIM = 512
 
 
 def _resolve_screenshot_size(

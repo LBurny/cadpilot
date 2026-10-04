@@ -21,7 +21,7 @@ AI 通过 CADPilot 构建的模型 —— 演示文件位于 [`examples/`](examp
 * **数据驱动装配** —— 命名锚点、带残差校验的配合、连通性审计，以及持久化关节（FreeCAD 1.1 Assembly 工作台）与声明式优先级裁剪。
 * **工作流记忆** —— 成功的建模套路存为可复用模式，按需召回；越用越聪明。
 * **内置故障诊断** —— `diagnose` 工具在 Windows/macOS/Linux 上探测 RPC 端口、FreeCAD 进程、插件安装与日志，并给出具体修复建议 —— FreeCAD 卡死或未启动时也能用。`get_addon_log` 在 GUI 卡死时仍能读取插件的调试环形日志。
-* **省 token** —— 文本优先响应、截图按需开启（768px 封顶）、精简的工具面、按需获取的操作文档，上下文占用极低。
+* **省 token** —— 文本优先响应、截图按需开启（512px 封顶）、精简的工具面、按需获取的操作文档，上下文占用极低。
 
 ## 安装
 
@@ -116,6 +116,7 @@ uv sync
 
 * `--with-screenshots`：每个变更/读取类工具响应都附带截图（适合多模态模型）
 * `--only-text-feedback`：永不返回截图，即使调用方请求（纯文本模型的硬保证）
+* `--screenshot-mode file`：把截图保存到 `~/.cadpilot/screenshots/` 下，只返回文件路径而不是内联 base64 图片（对具备文件读取工具的 agent 客户端省得多；默认为 `image`）
 * `--host <ip>`：连接另一台机器上的 FreeCAD 实例
 * `--no-auto-audit`：跳过每次变更后的连通性审计（超大模型用）
 
@@ -153,7 +154,7 @@ RPC 服务器默认只监听 `localhost`。要从局域网内另一台机器控�
 * **知识层级** —— `save_pattern` / `recall_patterns`（可复用工作流记忆）、`inspect_freecad`（运行时 API 内省）、`operation_help`（按需获取操作参考文档）。
 * **几何感知** —— `measure_geometry` / `get_topology` / `check_interference` / `get_positioning_info`：每步建模后的定量反馈。
 * **装配** —— `get_anchors` / `set_anchors` / `assemble` / `align_shapes` / `verify_assembly` 提供数据驱动的空间定位；`assembly_session` 提供基于配合的装配状态机（FreeCAD 1.1 Assembly 工作台持久化关节）与声明式优先级裁剪。
-* **文档与视图** —— `create_document` / `list_documents` / `get_objects` / `get_object` / `get_view`（截图默认长边 768px 封顶，节省 token）。
+* **文档与视图** —— `create_document` / `list_documents` / `get_objects` / `get_object` / `get_view`（截图默认长边 512px 封顶，节省 token）。
 * **诊断** —— `diagnose`（跨平台故障探测，FreeCAD 未启动也能用）与 `get_addon_log`（插件的环形调试日志，GUI 卡死时仍可读）。
 
 这些工具背后的架构见[设计文档](docs/DESIGN.zh-CN.md)；可在 FreeCAD 中打开演示模型 [`examples/ModernBicycle.FCStd`](examples/ModernBicycle.FCStd) 试用。

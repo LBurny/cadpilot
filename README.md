@@ -21,7 +21,7 @@ Models built by the AI through CADPilot — demo files live in [`examples/`](exa
 * **Data-driven assembly** — named anchors, residual-checked mates, connectivity audits, and persistent joints (FreeCAD 1.1 Assembly workbench) with declarative priority trimming.
 * **Workflow memory** — successful modeling recipes are stored as reusable patterns and recalled on demand; the agent gets better the more you use it.
 * **Built-in troubleshooting** — the `diagnose` tool probes the RPC port, the FreeCAD process, the addon install and its logs on Windows/macOS/Linux and ends with a concrete fix — and it works while FreeCAD is down or frozen. `get_addon_log` reads the addon's debug ring buffer even when the GUI is wedged.
-* **Token-friendly** — text-first responses with opt-in screenshots (768 px cap), a tiny tool surface, and on-demand operation docs keep context usage low.
+* **Token-friendly** — text-first responses with opt-in screenshots (512 px cap), a tiny tool surface, and on-demand operation docs keep context usage low.
 
 ## Installation
 
@@ -116,6 +116,7 @@ Tool responses are text-only by default — screenshots are opt-in per call (`wi
 
 * `--with-screenshots`: attach a screenshot to every mutation/read tool response (for multimodal models)
 * `--only-text-feedback`: never return screenshots, even when requested (hard guarantee for text-only models)
+* `--screenshot-mode file`: save screenshots under `~/.cadpilot/screenshots/` and return only the file path instead of an inline base64 image (much cheaper for agentic clients with a file-reading tool; default is `image`)
 * `--host <ip>`: connect to a FreeCAD instance on another machine
 * `--no-auto-audit`: skip the connectivity audit after each mutation (for very large models)
 
@@ -153,7 +154,7 @@ Something not talking? Ask the AI to run the **`diagnose`** tool — it checks t
 * **Knowledge hierarchy** — `save_pattern` / `recall_patterns` (reusable workflow memory), `inspect_freecad` (runtime API introspection), `operation_help` (per-operation reference docs).
 * **Geometry sensing** — `measure_geometry` / `get_topology` / `check_interference` / `get_positioning_info`: quantitative feedback after each modeling step.
 * **Assembly** — `get_anchors` / `set_anchors` / `assemble` / `align_shapes` / `verify_assembly` for data-driven spatial positioning; `assembly_session` for mate-based assembly with persistent joints (FreeCAD 1.1 Assembly workbench) and declarative priority trimming.
-* **Documents & views** — `create_document` / `list_documents` / `get_objects` / `get_object` / `get_view` (screenshots capped at 768 px on the long edge by default).
+* **Documents & views** — `create_document` / `list_documents` / `get_objects` / `get_object` / `get_view` (screenshots capped at 512 px on the long edge by default).
 * **Diagnostics** — `diagnose` (cross-platform fault probing that works with FreeCAD down) and `get_addon_log` (the addon's ring-buffer debug log, readable while the GUI is wedged).
 
 See the [design document](docs/DESIGN.md) for the architecture behind these tools, and try the demo model [`examples/ModernBicycle.FCStd`](examples/ModernBicycle.FCStd) in FreeCAD.

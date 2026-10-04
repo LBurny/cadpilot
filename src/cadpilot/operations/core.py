@@ -1,12 +1,16 @@
 import logging
 from typing import Any
 
-from mcp.types import ImageContent
-
 from ..freecad_client import FreeCADConnection
 from ..guidance import detect_risks, suggest_next_steps
 from ..pattern_store import add_pattern, search_patterns
-from ..responses import ToolResponse, add_screenshot_if_available, json_response, text_response
+from ..responses import (
+    ToolResponse,
+    add_screenshot_if_available,
+    json_response,
+    screenshot_content,
+    text_response,
+)
 from ..session_state import (
     get_current_session,
     list_sessions,
@@ -273,7 +277,7 @@ def get_view_operation(
     try:
         screenshot = freecad.get_active_screenshot(view_name, width, height, focus_object)
         if screenshot is not None:
-            return [ImageContent(type="image", data=screenshot, mimeType="image/png")]
+            return [screenshot_content(screenshot)]
         return text_response(
             "Cannot get screenshot in the current view type (such as TechDraw or Spreadsheet)"
         )
