@@ -155,8 +155,20 @@ class FreeCADConnection:
             "delete_object", doc_name, obj_name, screenshot=screenshot
         )
 
-    def execute_code(self, code: str, screenshot: dict[str, Any] | None = None) -> dict[str, Any]:
-        return self._invoke_with_screenshot("execute_code", code, screenshot=screenshot)
+    def execute_code(
+        self,
+        code: str,
+        screenshot: dict[str, Any] | None = None,
+        doc_name: str | None = None,
+    ) -> dict[str, Any]:
+        # XML-RPC is positional: only send doc_name when set, so an addon that
+        # predates the parameter still accepts the two-argument call (and, via
+        # the TypeError fallback below, degrades to active-document behavior).
+        if doc_name is None:
+            return self._invoke_with_screenshot("execute_code", code, screenshot=screenshot)
+        return self._invoke_with_screenshot(
+            "execute_code", code, screenshot=screenshot, doc_name=doc_name
+        )
 
     def execute_code_async(self, code: str) -> dict[str, Any]:
         return self._invoke("execute_code_async", code)
@@ -311,9 +323,16 @@ class FreeCADConnection:
         width: int | None = None,
         height: int | None = None,
         focus_object: str | None = None,
+        doc_name: str | None = None,
     ) -> str | None:
         try:
-            return self._invoke("get_active_screenshot", view_name, width, height, focus_object)
+            if doc_name is None:
+                return self._invoke(
+                    "get_active_screenshot", view_name, width, height, focus_object
+                )
+            return self._invoke(
+                "get_active_screenshot", view_name, width, height, focus_object, doc_name
+            )
         except Exception as e:
             logger.error(f"Error getting screenshot: {e}")
             return None

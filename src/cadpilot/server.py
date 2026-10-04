@@ -187,7 +187,7 @@ def create_document(
 
     Args:
         name: Document name.
-        with_screenshot/screenshot_mode: attach a screenshot (default off): "image" = inline PNG, "file" = path only (default: server config).
+        with_screenshot/screenshot_mode: screenshot (default off): "image" = inline PNG, "file" = path only.
     """
     return create_document_operation(
         get_freecad_connection(),
@@ -246,7 +246,7 @@ def cad(
         ops: Operation dicts for batch.
         stop_on_error: batch — stop at the first failed op.
         description: Note recorded into the session step log.
-        with_screenshot/screenshot_mode: attach a screenshot (default off): "image" = inline PNG, "file" = path only (default: server config).
+        with_screenshot/screenshot_mode: screenshot (default off): "image" = inline PNG, "file" = path only.
     """
     return cad_operation(
         get_freecad_connection(),
@@ -294,21 +294,23 @@ def get_task_result(ctx: Context, task_id: str) -> list[TextContent]:
 def execute_code(
     ctx: Context,
     code: str,
+    doc_name: str | None = None,
     with_screenshot: bool | None = None,
     screenshot_mode: Literal["image", "file"] | None = None,
 ) -> list[TextContent | ImageContent]:
-    """Execute arbitrary Python in FreeCAD's GUI thread (full FreeCAD API;
-    FreeCAD/FreeCADGui already imported). print() output is returned.
+    """Execute Python in FreeCAD's GUI thread (FreeCAD/FreeCADGui/Part pre-imported). print() output is returned.
 
     Args:
         code: Python code to execute. Start with a # comment describing the step (the Steps panel shows it).
-        with_screenshot/screenshot_mode: attach a screenshot (default off): "image" = inline PNG, "file" = path only (default: server config).
+        doc_name: bind to this document — transaction, step journal and App.ActiveDocument (multi-agent safe). Defaults to the active session's doc.
+        with_screenshot/screenshot_mode: screenshot (default off): "image" = inline PNG, "file" = path only.
     """
     return execute_code_operation(
         get_freecad_connection(),
         state.resolve_screenshot(with_screenshot),
         code,
         screenshot_mode=screenshot_mode,
+        doc_name=doc_name,
     )
 
 
@@ -322,19 +324,21 @@ def get_view(
     height: int | None = None,
     focus_object: str | None = None,
     screenshot_mode: Literal["image", "file"] | None = None,
+    doc_name: str | None = None,
 ) -> list[ImageContent | TextContent]:
-    """Get a screenshot of the active view. Context-expensive — call only for visual checks; prefer get_objects/measure_geometry for data.
+    """Get a screenshot of one document's view. Context-expensive — call only for visual checks; prefer get_objects/measure_geometry for data.
 
     Args:
         view_name: Camera view.
         width/height: Pixels; default caps the long edge at 384, smaller saves context.
         focus_object: Object to focus on; default fits all objects.
-        screenshot_mode: "image" = inline PNG, "file" = path only (default: server config).
+        doc_name: frame THIS document; default is the foreground tab, which a concurrent agent may have switched (multi-agent safe).
+        screenshot_mode: "image" = inline PNG, "file" = path only.
     """
     if state.only_text_feedback:
         return text_response("Screenshots are disabled by --only-text-feedback.")
     return get_view_operation(
-        get_freecad_connection(), view_name, width, height, focus_object, screenshot_mode
+        get_freecad_connection(), view_name, width, height, focus_object, screenshot_mode, doc_name
     )
 
 
@@ -348,7 +352,7 @@ def get_objects(
     """Get all objects in a document.
 
     Args:
-        with_screenshot/screenshot_mode: attach a screenshot (default off): "image" = inline PNG, "file" = path only (default: server config).
+        with_screenshot/screenshot_mode: screenshot (default off): "image" = inline PNG, "file" = path only.
     """
     return get_objects_operation(
         get_freecad_connection(),
@@ -369,7 +373,7 @@ def get_object(
     """Get an object's properties from a document.
 
     Args:
-        with_screenshot/screenshot_mode: attach a screenshot (default off): "image" = inline PNG, "file" = path only (default: server config).
+        with_screenshot/screenshot_mode: screenshot (default off): "image" = inline PNG, "file" = path only.
     """
     return get_object_operation(
         get_freecad_connection(),
@@ -801,7 +805,7 @@ def set_anchors(
         replace: Replace all existing anchors instead of merging.
         coord_frame: "local" (stored as-is) or "global" (converted — use
             whenever your source coordinates are global).
-        with_screenshot/screenshot_mode: attach a screenshot (default off): "image" = inline PNG, "file" = path only (default: server config).
+        with_screenshot/screenshot_mode: screenshot (default off): "image" = inline PNG, "file" = path only.
     """
     return set_anchors_operation(
         get_freecad_connection(),
@@ -833,7 +837,7 @@ def assemble(
         mates: Non-empty list of mate dicts.
         tolerance: Max allowed post-move residual in mm (default 0.1).
         stop_on_error: Abort and roll back at the first failed mate.
-        with_screenshot/screenshot_mode: attach a screenshot (default off): "image" = inline PNG, "file" = path only (default: server config).
+        with_screenshot/screenshot_mode: screenshot (default off): "image" = inline PNG, "file" = path only.
     """
     return assemble_operation(
         get_freecad_connection(),

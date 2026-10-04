@@ -404,3 +404,37 @@ def test_get_objects_document_not_found_returns_error_text(fake_freecad):
     fake_freecad.errors["get_objects"] = RuntimeError("Document 'Nope' not found.")
     resp = get_objects_operation(fake_freecad, False, "Nope")
     assert "not found" in resp[0].text
+
+
+# --- multi-agent document binding -------------------------------------------
+
+
+def test_execute_code_passes_explicit_doc_name(fake_freecad):
+    """doc_name binds transaction + journal step + ActiveDocument to ONE
+    document; under two agents the active doc is the other agent's."""
+    execute_code_operation(fake_freecad, False, "print(1)", doc_name="OtherDoc")
+    (_m, _a, kw), = [c for c in fake_freecad.calls if c[0] == "execute_code"]
+    assert kw.get("doc_name") == "OtherDoc"
+
+
+def test_execute_code_binds_active_session_document_automatically(fake_freecad):
+    """The session flow must not have to remember doc_name: an active session
+    binds its document. Without a session the argument stays None (legacy
+    active-document behavior), and an explicit doc_name wins over the session."""
+    from cadpilot.session_state import new_session, set_current_session
+
+    sess = new_session("bind test", "SessDoc")
+    set_current_session(sess)
+    try:
+        execute_code_operation(fake_freecad, False, "print(1)")
+        (_m, _a, kw) = [c for c in fake_freecad.calls if c[0] == "execute_code"][-1]
+        assert kw.get("doc_name") == "SessDoc"
+        execute_code_operation(fake_freecad, False, "print(1)", doc_name="Explicit")
+        (_m, _a, kw) = [c for c in fake_freecad.calls if c[0] == "execute_code"][-1]
+        assert kw.get("doc_name") == "Explicit"
+        set_current_session(None)
+        execute_code_operation(fake_freecad, False, "print(1)")
+        (_m, _a, kw) = [c for c in fake_freecad.calls if c[0] == "execute_code"][-1]
+        assert kw.get("doc_name") is None
+    finally:
+        set_current_session(None)

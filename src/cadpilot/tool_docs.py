@@ -13,6 +13,33 @@ total-size budget as a regression guard.
 from __future__ import annotations
 
 CAD_OP_DOCS: dict[str, str] = {
+    "multi_agent": """\
+multi-agent: several agents share one FreeCAD safely.
+
+Every agent talks to the same FreeCAD over its own MCP server process, and
+they interleave on the GUI thread. The rule that keeps them apart: name the
+document in every call that has a doc_name argument, and give the two
+state-bound calls their document explicitly:
+
+- execute_code: pass doc_name. It binds the wrapper transaction, the step
+  journal entry AND App.ActiveDocument (so App.ActiveDocument inside the
+  snippet resolves to the declared document). Without it all three land on
+  whichever document the OTHER agent's call left active, and steps mix into
+  each other's journals. An active session binds its own document
+  automatically, so the session flow needs no extra argument.
+- get_view: pass doc_name. The default frames the foreground tab, which the
+  other agent may have switched, so the screenshot shows the wrong model.
+- cad / get_objects / get_object / measure_geometry / get_topology /
+  set_anchors / assemble / align_shapes / verify_assembly / step_control /
+  session_*: already take doc_name — always pass it, never rely on the
+  active document.
+
+Screenshots attached to mutations (cad with_screenshot, get_objects, ...)
+frame the mutation's own document.
+
+Hard isolation (two agents that must never see each other, separate undo
+stacks) still means two FreeCAD instances on different ports; a shared
+instance gives correct attribution, not privacy.""",
     "create_object": """\
 create_object — create a FreeCAD object.
 Required: obj_type, obj_name. Optional: obj_properties.
@@ -420,13 +447,22 @@ HELP_TOPICS: dict[str, str] = {
     **{
         op: f'cad(operation="{op}")'
         for op in CAD_OP_DOCS
-        if op not in ("assembly_session", "assemble", "step_plan", "step_control", "get_addon_log")
+        if op
+        not in (
+            "assembly_session",
+            "assemble",
+            "step_plan",
+            "step_control",
+            "get_addon_log",
+            "multi_agent",
+        )
     },
     "assembly_session": "assembly_session tool (persistent-joint assembly)",
     "assemble": "assemble tool (one-shot anchor snapping)",
     "step_plan": "step_plan tool (submit a plan without executing it)",
     "step_control": "step_control tool (run / roll back / re-run steps)",
     "get_addon_log": "get_addon_log tool (read the addon's debug log)",
+    "multi_agent": "running several agents against one FreeCAD without cross-talk",
 }
 
 

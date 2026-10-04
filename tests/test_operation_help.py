@@ -43,18 +43,24 @@ def test_operation_help_tool_registered():
     assert "sketches" in _text(resp)
 
 
-def test_tool_docstring_budget():
-    """Regression guard against prompt explosion: tool docstrings stay slim.
+# Calibrated at v0.5.11's 37-tool set (~10995 chars in use). ELASTIC by user
+# decision: an added tool may raise the budget by ~150 chars (100-200 range),
+# so the limit scales with the tool count instead of punishing growth with a
+# constant cap. The detailed reference still belongs in tool_docs.py (served
+# on demand via operation_help), not in docstrings that get injected into the
+# client's context with every tools/list response.
+BUDGET_REF_TOOLS = 37
+BUDGET_PER_TOOL = 150
 
-    The detailed reference lives in tool_docs.py (served on demand via
-    operation_help), not in docstrings that get injected into the client's
-    context with every tools/list response.
-    """
+
+def test_tool_docstring_budget():
+    """Tool docstrings stay proportional to the tool count, not unbounded."""
     from cadpilot import server
 
     tree = ast.parse(inspect.getsource(server))
     total = 0
-    biggest = []
+    biggest: list[tuple[int, str]] = []
+    tools = 0
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef):
             for dec in node.decorator_list:
@@ -62,5 +68,10 @@ def test_tool_docstring_budget():
                     doc = ast.get_docstring(node) or ""
                     total += len(doc)
                     biggest.append((len(doc), node.name))
+                    tools += 1
     biggest.sort(reverse=True)
-    assert total < 11000, f"tool docstrings total {total} chars; biggest: {biggest[:5]}"
+    limit = 11000 + BUDGET_PER_TOOL * max(0, tools - BUDGET_REF_TOOLS)
+    assert total < limit, (
+        f"tool docstrings total {total} chars (limit {limit} for {tools} tools); "
+        f"biggest: {biggest[:5]} — move reference text to tool_docs.py"
+    )

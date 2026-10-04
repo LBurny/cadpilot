@@ -119,8 +119,8 @@ class FakeFreeCADConnection:
             res["screenshot"] = self.SCREENSHOT
         return self._result("create_feature", res)
 
-    def execute_code(self, code, screenshot=None):
-        self._record("execute_code", code, screenshot=screenshot)
+    def execute_code(self, code, screenshot=None, doc_name=None):
+        self._record("execute_code", code, screenshot=screenshot, doc_name=doc_name)
         res = self._result(
             "execute_code", {"success": True, "message": "Python code executed successfully."}
         )
@@ -153,9 +153,11 @@ class FakeFreeCADConnection:
         )
 
     def get_active_screenshot(
-        self, view_name="Isometric", width=None, height=None, focus_object=None
+        self, view_name="Isometric", width=None, height=None, focus_object=None, doc_name=None
     ):
-        self._record("get_active_screenshot", view_name, width, height, focus_object)
+        self._record(
+            "get_active_screenshot", view_name, width, height, focus_object, doc_name=doc_name
+        )
         return self.SCREENSHOT
 
     def get_objects(self, doc_name):

@@ -85,20 +85,45 @@ def apply_view_orientation(view: Any, view_name: str) -> None:
             )
 
 
+def _send_viewselection(gdoc) -> None:
+    """Frame the selection in the RIGHT view: without a binding the foreground
+    view; with one, the bound document's own views — ``SendMsgToActiveView``
+    would hit whatever tab a concurrent agent holds in front."""
+    if gdoc is not None:
+        gdoc.sendMsgToViews("ViewSelection")
+    else:
+        FreeCADGui.SendMsgToActiveView("ViewSelection")
+
+
 def save_active_screenshot(
     save_path: str,
     view_name: str = "Isometric",
     width: int | None = None,
     height: int | None = None,
     focus_object: str | None = None,
+    doc_name: str | None = None,
 ):
-    """Save a PNG of the active view to ``save_path``.
+    """Save a PNG of the DOCUMENT's active view to ``save_path``.
+
+    With ``doc_name`` the capture targets THAT document's view; without it,
+    the foreground view. saveImage() renders OFFSCREEN, so a background
+    document (another agent's foreground tab) captures without stealing MDI
+    focus — no tab flip, the other agent never notices. ``Gui activation``
+    is deliberately absent: FreeCADGui.activateDocument does not even exist
+    on 1.1.x, and flipping the foreground tab would yank the MDI focus out
+    from under a concurrent agent.
 
     Returns ``True`` on success, or an error string on failure (preserves the
     legacy GUI-handler return contract).
     """
     try:
-        view = FreeCADGui.ActiveDocument.ActiveView
+        doc = FreeCAD.getDocument(doc_name) if doc_name else FreeCAD.ActiveDocument
+        if doc_name:
+            gdoc = FreeCADGui.getDocument(doc_name)
+            view = gdoc.activeView()
+        else:
+            gdoc = None
+            view = FreeCADGui.ActiveDocument.ActiveView
         if not hasattr(view, "saveImage"):
             return "Current view does not support screenshots"
 
@@ -110,12 +135,11 @@ def save_active_screenshot(
         focus_target = None
 
         if focus_object:
-            doc = FreeCAD.ActiveDocument
             obj = doc.getObject(focus_object) if doc else None
             if obj:
                 FreeCADGui.Selection.clearSelection()
                 FreeCADGui.Selection.addSelection(obj)
-                FreeCADGui.SendMsgToActiveView("ViewSelection")
+                _send_viewselection(gdoc)
                 focused_selection = True
                 focus_target = obj
                 _flush_gui_events()
@@ -133,7 +157,7 @@ def save_active_screenshot(
         # fix (#51/#53).
         if focused_selection and focus_target is not None:
             FreeCADGui.Selection.addSelection(focus_target)
-            FreeCADGui.SendMsgToActiveView("ViewSelection")
+            _send_viewselection(gdoc)
             FreeCADGui.Selection.clearSelection()
         else:
             view.fitAll()

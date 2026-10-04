@@ -921,13 +921,23 @@ class FreeCADRPC:
                 return {"success": False, "error": f"unknown task_id: {task_id!r}"}
             return {"success": True, "task_id": task_id, **entry}
 
-    def execute_code(self, code: str, screenshot: dict | None = None) -> dict[str, Any]:
+    def execute_code(
+        self, code: str, screenshot: dict | None = None, doc_name: str | None = None
+    ) -> dict[str, Any]:
         """Execute Python code on the GUI thread and wait for the result.
 
         Runs on the GUI thread so that FreeCAD document operations
         (addObject, recompute, save) are safe and correctly ordered.
         Use execute_code_async for heavy OCCT boolean ops (fuse/cut)
         that would block the GUI thread too long.
+
+        With ``doc_name`` the run is BOUND to that document: it becomes the
+        active document (so ``App.ActiveDocument`` inside the snippet
+        resolves there), the wrapper transaction and the journal step land
+        on it. Without it the active document at call time is used — which
+        under two concurrent agents is whichever document the OTHER agent's
+        call left active, so always pass doc_name (or work in a session,
+        which binds it automatically).
 
         The snippet is wrapped in a FreeCAD transaction, so a document change
         it makes becomes a single undo entry the step journal can roll back,
@@ -947,8 +957,22 @@ class FreeCADRPC:
 
         def combined_task():
             doc = None
-            with contextlib.suppress(Exception):
-                doc = FreeCAD.ActiveDocument
+            if doc_name:
+                # Bind first, fail fast: an unknown document must be an error,
+                # not a silent fall-through to whatever else is active.
+                try:
+                    doc = FreeCAD.getDocument(doc_name)
+                except Exception as e:
+                    raise ValueError(f"unknown document {doc_name!r}: {e}") from e
+                # App.setActiveDocument makes App.ActiveDocument resolve to the
+                # bound document inside the snippet. There is no
+                # Gui.activateDocument on 1.1.x, and flipping the foreground MDI
+                # tab is deliberately NOT done — a concurrent agent holds it.
+                with contextlib.suppress(Exception):
+                    FreeCAD.setActiveDocument(doc_name)
+            else:
+                with contextlib.suppress(Exception):
+                    doc = FreeCAD.ActiveDocument
             # Wrap the snippet in a transaction so its document changes become
             # exactly one undo entry (a bare property write is otherwise NOT
             # undoable at all). An empty commit adds no undo entry, so a
@@ -1025,6 +1049,7 @@ class FreeCADRPC:
                     screenshot.get("width"),
                     screenshot.get("height"),
                     screenshot.get("focus_object"),
+                    doc_name=doc_name,
                 )
                 return (
                     True,
@@ -1131,8 +1156,13 @@ class FreeCADRPC:
         width: int | None = None,
         height: int | None = None,
         focus_object: str | None = None,
+        doc_name: str | None = None,
     ) -> str | None:
         """Get a screenshot of the active view as a base64-encoded PNG string.
+
+        With ``doc_name`` the capture activates that document first, so a
+        concurrent agent holding another tab in the foreground cannot swap
+        the framed model.
 
         Returns None if the active view does not support screenshots
         (e.g., TechDraw or Spreadsheet workbench).
@@ -1150,7 +1180,9 @@ class FreeCADRPC:
                     f"CADPilot: view type '{view_type}' does not support screenshots\n"
                 )
                 return False
-            return save_active_screenshot(tmp_path, view_name, width, height, focus_object)
+            return save_active_screenshot(
+                tmp_path, view_name, width, height, focus_object, doc_name=doc_name
+            )
 
         try:
             res = dispatch_to_gui(task)

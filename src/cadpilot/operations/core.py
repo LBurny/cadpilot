@@ -154,9 +154,20 @@ def execute_code_operation(
     with_screenshot: bool,
     code: str,
     screenshot_mode: str | None = None,
+    doc_name: str | None = None,
 ) -> ToolResponse:
+    # Bind the run to ONE document up front: under two concurrent agents the
+    # active document is whichever the OTHER agent's call left active, so an
+    # unbound run opens its transaction and files its journal step there. An
+    # active session binds automatically (the modeling flow never has to pass
+    # anything); an explicit doc_name wins over the session.
+    sess = get_current_session()
+    if doc_name is None and sess is not None and sess.status == "active":
+        doc_name = sess.doc_name
     try:
-        res = freecad.execute_code(code, screenshot=_shot_params(with_screenshot))
+        res = freecad.execute_code(
+            code, screenshot=_shot_params(with_screenshot), doc_name=doc_name
+        )
         if res["success"]:
             # The addon wraps the snippet in a FreeCAD transaction; ``changed``
             # says whether it produced an undo entry. A mutating snippet is an
@@ -173,7 +184,6 @@ def execute_code_operation(
             # read as "no document change" AND filed the step in the wrong log.
             attributed = bool(res.get("attributed", True))
             foreign = [n for n in (res.get("foreign_changes") or []) if n]
-            sess = get_current_session()
             step_note = ""
             if changed and attributed and sess is not None and sess.status == "active":
                 # A session step must own a transaction on the SESSION's
@@ -313,9 +323,12 @@ def get_view_operation(
     height: int | None = None,
     focus_object: str | None = None,
     screenshot_mode: str | None = None,
+    doc_name: str | None = None,
 ) -> ToolResponse:
     try:
-        screenshot = freecad.get_active_screenshot(view_name, width, height, focus_object)
+        screenshot = freecad.get_active_screenshot(
+            view_name, width, height, focus_object, doc_name=doc_name
+        )
         if screenshot is not None:
             return [screenshot_content(screenshot, screenshot_mode)]
         return text_response(
@@ -334,7 +347,7 @@ def get_objects_operation(
 ) -> ToolResponse:
     try:
         response = json_response(freecad.get_objects(doc_name))
-        screenshot = freecad.get_active_screenshot() if with_screenshot else None
+        screenshot = freecad.get_active_screenshot(doc_name=doc_name) if with_screenshot else None
         return add_screenshot_if_available(
             response, screenshot, not with_screenshot, screenshot_mode
         )
@@ -352,7 +365,7 @@ def get_object_operation(
 ) -> ToolResponse:
     try:
         response = json_response(freecad.get_object(doc_name, obj_name))
-        screenshot = freecad.get_active_screenshot() if with_screenshot else None
+        screenshot = freecad.get_active_screenshot(doc_name=doc_name) if with_screenshot else None
         return add_screenshot_if_available(
             response, screenshot, not with_screenshot, screenshot_mode
         )
