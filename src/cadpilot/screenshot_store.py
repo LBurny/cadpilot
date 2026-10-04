@@ -1,8 +1,9 @@
 """File-mode screenshot storage: decode base64 PNGs to disk, prune old ones.
 
-Used when the server runs with ``--screenshot-mode file``: the LLM client then
-reads the file with its own file tool (multimodal), and the tool result stays
-a tiny path string instead of a permanent base64 blob in the conversation.
+File mode is the default delivery: the LLM client reads the file with its own
+file tool (multimodal), and the tool result stays a tiny path string instead
+of a permanent base64 blob in the conversation. ``--screenshot-mode image``
+or a per-call ``screenshot_mode="image"`` restores inline delivery.
 """
 
 import base64

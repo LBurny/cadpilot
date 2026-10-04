@@ -118,7 +118,7 @@ Tool responses are text-only by default. Screenshots are opt-in per call (`with_
 
 * `--with-screenshots`: attach a screenshot to every mutation/read tool response (for multimodal models)
 * `--only-text-feedback`: never return screenshots, even when requested (hard guarantee for text-only models)
-* `--screenshot-mode file`: save screenshots under `~/.cadpilot/screenshots/` and return only the file path instead of an inline base64 image (much cheaper for agentic clients with a file-reading tool; default is `image`)
+* `--screenshot-mode`: `file` (default) saves screenshots under `~/.cadpilot/screenshots/` and returns only the file path, keeping base64 out of the model's context; `image` inlines base64 image blocks (for clients without a file-reading tool)
 * `--host <ip>`: connect to a FreeCAD instance on another machine
 * `--no-auto-audit`: skip the connectivity audit after each mutation (for very large models)
 

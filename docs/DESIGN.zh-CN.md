@@ -179,7 +179,7 @@ docstring 在每场对话中都消耗 token，因此每个 `@mcp.tool()` 的 doc
 
 ## 9. 截图策略
 
-截图是可选项，默认关闭。单次调用可按需请求；`--with-screenshots` 将默认改为开启；`--only-text-feedback` 则彻底禁止，为纯文本模型提供硬保证；`--screenshot-mode file` 会把截图写入 `$CADPILOT_HOME/screenshots/` 并只返回路径，而不是内联 base64 图片。改动类工具在与操作相同的请求内完成截图，单次往返即可；对旧版插件则回退为第二次单独调用。长边默认不超过 512 像素，除非显式给出尺寸。少数视图类型（如 TechDraw、Spreadsheet）无法截图，返回空。
+截图是可选项，默认关闭。单次调用可按需请求；`--with-screenshots` 将默认改为开启；`--only-text-feedback` 则彻底禁止，为纯文本模型提供硬保证；默认的 `file` 投递方式会把截图写入 `$CADPILOT_HOME/screenshots/` 并只返回路径，避免 base64 占用上下文，`--screenshot-mode image` 恢复内联 base64 图片。改动类工具在与操作相同的请求内完成截图，单次往返即可；对旧版插件则回退为第二次单独调用。长边默认不超过 512 像素，除非显式给出尺寸。少数视图类型（如 TechDraw、Spreadsheet）无法截图，返回空。
 
 ## 10. 长时间计算
 

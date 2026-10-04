@@ -9,13 +9,14 @@ logger = logging.getLogger("CADPilot")
 
 type ToolResponse = list[TextContent | ImageContent]
 
-# How screenshots are returned: "image" inlines base64 ImageContent (default,
-# works with every MCP client); "file" writes the PNG to disk and returns only
-# the path, so agentic clients with a file-reading tool keep base64 out of the
-# conversation (permanent, cache-busting text). The global default is set once
-# at startup from the --screenshot-mode CLI flag via set_screenshot_mode();
-# callers (e.g. get_view) can override it per call with an explicit mode.
-_SCREENSHOT_MODE = "image"
+# How screenshots are returned: "file" (default) writes the PNG to disk and
+# returns only the path, so agentic clients with a file-reading tool keep
+# base64 out of the conversation (permanent, cache-busting text); "image"
+# inlines base64 ImageContent for clients that cannot read files. The global
+# default is set once at startup from the --screenshot-mode CLI flag via
+# set_screenshot_mode(); callers (e.g. get_view) can override it per call with
+# an explicit mode.
+_SCREENSHOT_MODE = "file"
 
 
 def set_screenshot_mode(mode: str) -> None:

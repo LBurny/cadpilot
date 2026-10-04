@@ -153,7 +153,13 @@ def test_cad_requires_params(fake_freecad, isolated_home):
 
 def test_cad_screenshot_only_when_requested(fake_freecad, isolated_home):
     resp = cad_operation(
-        fake_freecad, True, "create_object", "Doc", obj_type="Part::Box", obj_name="Box"
+        fake_freecad,
+        True,
+        "create_object",
+        "Doc",
+        obj_type="Part::Box",
+        obj_name="Box",
+        screenshot_mode="image",
     )
     _, args, _ = fake_freecad.calls[0]
     assert args[2] == {"view_name": "Isometric"}

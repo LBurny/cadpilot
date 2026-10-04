@@ -187,7 +187,7 @@ def create_document(
 
     Args:
         name: Document name.
-        with_screenshot/screenshot_mode: screenshot (default off): "image" = inline PNG, "file" = path only.
+        with_screenshot/screenshot_mode: screenshot (default off): "file" = path only (default), "image" = inline PNG.
     """
     return create_document_operation(
         get_freecad_connection(),
@@ -246,7 +246,7 @@ def cad(
         ops: Operation dicts for batch.
         stop_on_error: batch — stop at the first failed op.
         description: Note recorded into the session step log.
-        with_screenshot/screenshot_mode: screenshot (default off): "image" = inline PNG, "file" = path only.
+        with_screenshot/screenshot_mode: screenshot (default off): "file" = path only (default), "image" = inline PNG.
     """
     return cad_operation(
         get_freecad_connection(),
@@ -303,7 +303,7 @@ def execute_code(
     Args:
         code: Python code to execute. Start with a # comment describing the step (the Steps panel shows it).
         doc_name: bind to this document — transaction, step journal and App.ActiveDocument (multi-agent safe). Defaults to the active session's doc.
-        with_screenshot/screenshot_mode: screenshot (default off): "image" = inline PNG, "file" = path only.
+        with_screenshot/screenshot_mode: screenshot (default off): "file" = path only (default), "image" = inline PNG.
     """
     return execute_code_operation(
         get_freecad_connection(),
@@ -333,7 +333,7 @@ def get_view(
         width/height: Pixels; default caps the long edge at 384, smaller saves context.
         focus_object: Object to focus on; default fits all objects.
         doc_name: frame THIS document; default is the foreground tab, which a concurrent agent may have switched (multi-agent safe).
-        screenshot_mode: "image" = inline PNG, "file" = path only.
+        screenshot_mode: "file" = path only (default), "image" = inline PNG.
     """
     if state.only_text_feedback:
         return text_response("Screenshots are disabled by --only-text-feedback.")
@@ -352,7 +352,7 @@ def get_objects(
     """Get all objects in a document.
 
     Args:
-        with_screenshot/screenshot_mode: screenshot (default off): "image" = inline PNG, "file" = path only.
+        with_screenshot/screenshot_mode: screenshot (default off): "file" = path only (default), "image" = inline PNG.
     """
     return get_objects_operation(
         get_freecad_connection(),
@@ -373,7 +373,7 @@ def get_object(
     """Get an object's properties from a document.
 
     Args:
-        with_screenshot/screenshot_mode: screenshot (default off): "image" = inline PNG, "file" = path only.
+        with_screenshot/screenshot_mode: screenshot (default off): "file" = path only (default), "image" = inline PNG.
     """
     return get_object_operation(
         get_freecad_connection(),
@@ -805,7 +805,7 @@ def set_anchors(
         replace: Replace all existing anchors instead of merging.
         coord_frame: "local" (stored as-is) or "global" (converted — use
             whenever your source coordinates are global).
-        with_screenshot/screenshot_mode: screenshot (default off): "image" = inline PNG, "file" = path only.
+        with_screenshot/screenshot_mode: screenshot (default off): "file" = path only (default), "image" = inline PNG.
     """
     return set_anchors_operation(
         get_freecad_connection(),
@@ -837,7 +837,7 @@ def assemble(
         mates: Non-empty list of mate dicts.
         tolerance: Max allowed post-move residual in mm (default 0.1).
         stop_on_error: Abort and roll back at the first failed mate.
-        with_screenshot/screenshot_mode: screenshot (default off): "image" = inline PNG, "file" = path only.
+        with_screenshot/screenshot_mode: screenshot (default off): "file" = path only (default), "image" = inline PNG.
     """
     return assemble_operation(
         get_freecad_connection(),
@@ -960,10 +960,11 @@ def main():
     parser.add_argument(
         "--screenshot-mode",
         choices=["image", "file"],
-        default="image",
-        help="How screenshots are delivered: 'image' inlines base64 image blocks (default, "
-        "works with every client); 'file' saves them under ~/.cadpilot/screenshots/ and "
-        "returns only the path — much cheaper for agentic clients with a file-reading tool",
+        default="file",
+        help="How screenshots are delivered: 'file' (default) saves them under "
+        "~/.cadpilot/screenshots/ and returns only the path, keeping base64 out of the "
+        "model's context; 'image' inlines base64 image blocks (for clients without a "
+        "file-reading tool)",
     )
     parser.add_argument(
         "--host",

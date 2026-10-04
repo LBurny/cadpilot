@@ -8,6 +8,7 @@ from mcp.types import ImageContent, TextContent
 
 from cadpilot.responses import (
     add_screenshot_if_available,
+    get_screenshot_mode,
     json_response,
     set_screenshot_mode,
     text_response,
@@ -44,7 +45,9 @@ def test_json_response_falls_back_to_str_for_unknown_types():
 
 
 def test_add_screenshot_appends_image_content():
-    resp = add_screenshot_if_available(text_response("ok"), "aGVsbG8=", False)
+    resp = add_screenshot_if_available(
+        text_response("ok"), "aGVsbG8=", False, screenshot_mode="image"
+    )
     assert len(resp) == 2
     assert isinstance(resp[1], ImageContent)
     assert resp[1].data == "aGVsbG8="
@@ -72,9 +75,10 @@ class StubFreeCAD:
 @pytest.fixture
 def file_mode(tmp_path, monkeypatch):
     monkeypatch.setenv("CADPILOT_HOME", str(tmp_path))
+    previous = get_screenshot_mode()
     set_screenshot_mode("file")
     yield tmp_path
-    set_screenshot_mode("image")
+    set_screenshot_mode(previous)
 
 
 def test_set_screenshot_mode_rejects_unknown():
@@ -93,6 +97,7 @@ def test_file_mode_appends_path_text_not_image(file_mode):
 
 
 def test_file_mode_falls_back_to_inline_on_write_error(monkeypatch):
+    previous = get_screenshot_mode()
     set_screenshot_mode("file")
     monkeypatch.setattr(
         "cadpilot.responses.save_screenshot", MagicMock(side_effect=OSError("disk full"))
@@ -100,7 +105,7 @@ def test_file_mode_falls_back_to_inline_on_write_error(monkeypatch):
     try:
         resp = add_screenshot_if_available(text_response("ok"), PNG_1X1, False)
     finally:
-        set_screenshot_mode("image")
+        set_screenshot_mode(previous)
     assert isinstance(resp[1], ImageContent)
 
 
@@ -116,8 +121,13 @@ def test_get_view_mode_param_overrides_server_default(tmp_path, monkeypatch):
     from cadpilot.operations.core import get_view_operation
 
     monkeypatch.setenv("CADPILOT_HOME", str(tmp_path))
-    # global default stays "image"; the per-call mode wins
-    resp = get_view_operation(StubFreeCAD(), "Isometric", screenshot_mode="file")
+    previous = get_screenshot_mode()
+    set_screenshot_mode("image")
+    try:
+        # global default is "image"; the per-call mode wins
+        resp = get_view_operation(StubFreeCAD(), "Isometric", screenshot_mode="file")
+    finally:
+        set_screenshot_mode(previous)
     assert isinstance(resp[0], TextContent)
     assert "Screenshot saved to" in resp[0].text
 
@@ -131,6 +141,23 @@ def test_get_view_mode_image_overrides_file_default(file_mode):
 
 def test_add_screenshot_mode_param_overrides_default(tmp_path, monkeypatch):
     monkeypatch.setenv("CADPILOT_HOME", str(tmp_path))
-    resp = add_screenshot_if_available(text_response("ok"), PNG_1X1, False, screenshot_mode="file")
+    previous = get_screenshot_mode()
+    set_screenshot_mode("image")
+    try:
+        resp = add_screenshot_if_available(
+            text_response("ok"), PNG_1X1, False, screenshot_mode="file"
+        )
+    finally:
+        set_screenshot_mode(previous)
     assert isinstance(resp[1], TextContent)
     assert "Screenshot saved to" in resp[1].text
+
+
+def test_file_is_the_default_screenshot_mode(tmp_path, monkeypatch):
+    """No CLI flag and no per-call mode: screenshots go to disk, not inline."""
+    monkeypatch.setenv("CADPILOT_HOME", str(tmp_path))
+    assert get_screenshot_mode() == "file"
+    resp = add_screenshot_if_available(text_response("ok"), PNG_1X1, False)
+    assert isinstance(resp[1], TextContent)
+    assert "Screenshot saved to" in resp[1].text
+    assert len(list((tmp_path / "screenshots").glob("view-*.png"))) == 1

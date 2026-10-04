@@ -118,7 +118,7 @@ uv sync
 
 * `--with-screenshots`：每个变更/读取类工具响应都附带截图（适合多模态模型）
 * `--only-text-feedback`：永不返回截图，即使调用方请求（纯文本模型的硬保证）
-* `--screenshot-mode file`：把截图保存到 `~/.cadpilot/screenshots/` 下，只返回文件路径而不是内联 base64 图片（对具备文件读取工具的 agent 客户端省得多；默认为 `image`）
+* `--screenshot-mode`：默认 `file`，截图保存到 `~/.cadpilot/screenshots/` 下，只返回文件路径，避免 base64 占用模型上下文；`image` 恢复内联 base64 图片（适用于没有文件读取工具的客户端）
 * `--host <ip>`：连接另一台机器上的 FreeCAD 实例
 * `--no-auto-audit`：跳过每次变更后的连通性审计（超大模型用）
 

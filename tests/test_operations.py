@@ -44,6 +44,7 @@ def test_create_object_with_screenshot_single_rpc(fake_freecad):
         obj_type="Part::Box",
         obj_name="Box",
         auto_audit=False,
+        screenshot_mode="image",
     )
     # exactly one RPC; screenshot is requested inline, no second call
     assert fake_freecad.called_methods() == ["create_object"]
@@ -108,6 +109,7 @@ def test_edit_object_with_screenshot_single_rpc(fake_freecad):
         obj_name="Box",
         obj_properties={"Length": 5},
         auto_audit=False,
+        screenshot_mode="image",
     )
     assert fake_freecad.called_methods() == ["edit_object"]
     _, args, _ = fake_freecad.calls[0]
@@ -127,7 +129,13 @@ def test_edit_object_failure_no_screenshot(fake_freecad):
 
 def test_delete_object_with_screenshot_single_rpc(fake_freecad):
     resp = cad_operation(
-        fake_freecad, True, "delete_object", "Doc", obj_name="Box", auto_audit=False
+        fake_freecad,
+        True,
+        "delete_object",
+        "Doc",
+        obj_name="Box",
+        auto_audit=False,
+        screenshot_mode="image",
     )
     assert fake_freecad.called_methods() == ["delete_object"]
     assert _has_image(resp)
@@ -138,7 +146,7 @@ def test_delete_object_with_screenshot_single_rpc(fake_freecad):
 
 def test_execute_code_with_screenshot_uses_inline(fake_freecad):
     """execute_code now uses inline screenshot (single RPC), not a second call."""
-    resp = execute_code_operation(fake_freecad, True, "print(1)")
+    resp = execute_code_operation(fake_freecad, True, "print(1)", screenshot_mode="image")
     assert fake_freecad.called_methods() == ["execute_code"]
     _, _args, kwargs = fake_freecad.calls[0]
     # screenshot params should be passed to execute_code
@@ -205,7 +213,7 @@ def test_execute_operations_passes_ops_and_single_screenshot(fake_freecad):
         {"action": "edit_object", "obj_name": "Box", "obj_properties": {"Length": 5}},
         {"action": "delete_object", "obj_name": "Box"},
     ]
-    resp = execute_operations_operation(fake_freecad, True, "Doc", ops)
+    resp = execute_operations_operation(fake_freecad, True, "Doc", ops, screenshot_mode="image")
     assert fake_freecad.called_methods() == ["execute_operations"]
     _, args, _ = fake_freecad.calls[0]
     assert args[0] == "Doc"
@@ -246,7 +254,7 @@ def test_execute_operations_reports_per_op_results(fake_freecad):
 
 def test_get_objects_returns_compact_json_and_screenshot(fake_freecad):
     fake_freecad.objects_by_doc["Doc"] = ["Box"]
-    resp = get_objects_operation(fake_freecad, True, "Doc")
+    resp = get_objects_operation(fake_freecad, True, "Doc", screenshot_mode="image")
     assert fake_freecad.called_methods() == ["get_objects", "get_active_screenshot"]
     data = json.loads(resp[0].text)
     assert data[0]["Name"] == "Box"
@@ -281,7 +289,7 @@ def test_create_document_with_screenshot(fake_freecad):
 
 
 def test_get_view_returns_image(fake_freecad):
-    resp = get_view_operation(fake_freecad, "Front")
+    resp = get_view_operation(fake_freecad, "Front", screenshot_mode="image")
     assert _has_image(resp)
 
 
