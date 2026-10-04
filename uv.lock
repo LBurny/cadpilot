@@ -36,7 +36,7 @@ wheels = [
 
 [[package]]
 name = "cadpilot"
-version = "0.5.6"
+version = "0.5.7"
 source = { editable = "." }
 dependencies = [
     { name = "mcp", extra = ["cli"] },

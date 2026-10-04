@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.5.7 (2026-10-04)
+
+### Fixed
+
+- **The mouse guard no longer freezes you out of FreeCAD while a model is
+  being built** (`gui_dispatch.py`). The guard is supposed to hold back queued
+  MCP work while you drag the mouse, but a full morning's addon log showed it
+  had not deferred once, while single tasks blocked the GUI thread for up to
+  20 s. Three stacked races: Qt's `mouseButtons()` is event-delivered state —
+  stale exactly while the event loop is busy — and the win32 physical state
+  (`GetAsyncKeyState`) was only used to *veto* phantom holds, never to
+  *detect* fresh ones, so a press that began mid-task stayed invisible and
+  the next task started mid-drag; the drain loop checked the guards once
+  before its first task, so a mid-drain press could not pause the backlog;
+  and the 15 s hold cap punched a task straight through long inspection
+  drags. On Windows the OS physical state is now authoritative in both
+  directions (press → hold the queue, release → resume, never capped), the
+  drain loop re-checks the mouse/popup/modal guards between tasks, and the
+  phantom caps — time-based now, not heartbeat ticks — apply only to the
+  non-Windows heuristic path. A call that does time out tells the model why
+  and to simply retry.
+
 ## v0.5.6 (2026-10-04)
 
 ### Added
