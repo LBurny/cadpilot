@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.5.8 (2026-10-04)
+
+### Added
+
+- **Every screenshot tool now lets the model choose `image` or `file` per
+  call** (`server.py`, `responses.py`, `operations/core.py`). v0.5.6 added
+  `--screenshot-mode file`, but it is a server-startup switch the model cannot
+  reach — and on hosted clients nobody can. All eight screenshot-capable tools
+  (`get_view`, `cad`, `execute_code`, `create_document`, `get_objects`,
+  `get_object`, `set_anchors`, `assemble`) now take
+  `screenshot_mode="image"|"file"`: return the inline base64 PNG, or write the
+  PNG to `$CADPILOT_HOME/screenshots/` and return only the path. Omitting the
+  parameter keeps the server's `--screenshot-mode` default, so nothing changes
+  for existing setups. The default long edge drops from 512px to 384px —
+  roughly half the pixels, cheaper in context — and an explicit
+  `width`/`height` still overrides.
+
+### Fixed
+
+- **`get_view` honors `--only-text-feedback`** (`server.py`). It was the one
+  tool that bypassed `ServerState.resolve_screenshot()`, so the "never return
+  a screenshot" guarantee leaked through exactly the tool whose only job is
+  screenshots; it now answers with a text notice instead.
+- **Tool-description consistency pass** (`server.py`). All screenshot tools
+  document `with_screenshot`/`screenshot_mode` with one shared Args line —
+  most never documented them at all. `session_start` no longer claims a
+  read-only `execute_code` run blocks rollback without force; such runs are
+  simply not recorded. And the knowledge-hierarchy paragraph triplicated
+  across `save_pattern`/`recall_patterns`/`inspect_freecad` now lives only at
+  the two entry points. The docstring budget stays under 11,000 chars.
+
 ## v0.5.7 (2026-10-04)
 
 ### Fixed
