@@ -61,7 +61,9 @@ def create_document_operation(
         res = freecad.create_document(name, screenshot=shot)
         if res["success"]:
             response = text_response(f"Document '{res['document_name']}' created successfully")
-            return add_screenshot_if_available(response, res.get("screenshot"), not with_screenshot, screenshot_mode)
+            return add_screenshot_if_available(
+                response, res.get("screenshot"), not with_screenshot, screenshot_mode
+            )
         return text_response(f"Failed to create document: {res['error']}")
     except Exception as e:
         logger.error(f"Failed to create document: {e!s}")
@@ -91,7 +93,9 @@ def create_object_operation(
             response = text_response(f"Object '{res['object_name']}' created successfully")
         else:
             return text_response(f"Failed to create object: {res['error']}")
-        return add_screenshot_if_available(response, res.get("screenshot"), not with_screenshot, screenshot_mode)
+        return add_screenshot_if_available(
+            response, res.get("screenshot"), not with_screenshot, screenshot_mode
+        )
     except Exception as e:
         logger.error(f"Failed to create object: {e!s}")
         return text_response(f"Failed to create object: {e!s}")
@@ -116,7 +120,9 @@ def edit_object_operation(
             response = text_response(f"Object '{res['object_name']}' edited successfully")
         else:
             return text_response(f"Failed to edit object: {res['error']}")
-        return add_screenshot_if_available(response, res.get("screenshot"), not with_screenshot, screenshot_mode)
+        return add_screenshot_if_available(
+            response, res.get("screenshot"), not with_screenshot, screenshot_mode
+        )
     except Exception as e:
         logger.error(f"Failed to edit object: {e!s}")
         return text_response(f"Failed to edit object: {e!s}")
@@ -135,7 +141,9 @@ def delete_object_operation(
             response = text_response(f"Object '{res['object_name']}' deleted successfully")
         else:
             return text_response(f"Failed to delete object: {res['error']}")
-        return add_screenshot_if_available(response, res.get("screenshot"), not with_screenshot, screenshot_mode)
+        return add_screenshot_if_available(
+            response, res.get("screenshot"), not with_screenshot, screenshot_mode
+        )
     except Exception as e:
         logger.error(f"Failed to delete object: {e!s}")
         return text_response(f"Failed to delete object: {e!s}")
@@ -194,7 +202,9 @@ def execute_code_operation(
             elif not changed:
                 step_note = " (read-only: no document change, not recorded as a step)"
             response = text_response(f"Code executed successfully: {res['message']}{step_note}")
-            return add_screenshot_if_available(response, res.get("screenshot"), not with_screenshot, screenshot_mode)
+            return add_screenshot_if_available(
+                response, res.get("screenshot"), not with_screenshot, screenshot_mode
+            )
         return text_response(f"Failed to execute code: {res['error']}")
     except Exception as e:
         logger.error(f"Failed to execute code: {e!s}")
@@ -265,7 +275,9 @@ def execute_operations_operation(
                 **res,
             }
         )
-        return add_screenshot_if_available(response, res.get("screenshot"), not with_screenshot, screenshot_mode)
+        return add_screenshot_if_available(
+            response, res.get("screenshot"), not with_screenshot, screenshot_mode
+        )
     except Exception as e:
         logger.error(f"Failed to execute operations: {e!s}")
         hint = (
@@ -304,7 +316,9 @@ def get_objects_operation(
     try:
         response = json_response(freecad.get_objects(doc_name))
         screenshot = freecad.get_active_screenshot() if with_screenshot else None
-        return add_screenshot_if_available(response, screenshot, not with_screenshot, screenshot_mode)
+        return add_screenshot_if_available(
+            response, screenshot, not with_screenshot, screenshot_mode
+        )
     except Exception as e:
         logger.error(f"Failed to get objects: {e!s}")
         return text_response(f"Failed to get objects: {e!s}")
@@ -320,7 +334,9 @@ def get_object_operation(
     try:
         response = json_response(freecad.get_object(doc_name, obj_name))
         screenshot = freecad.get_active_screenshot() if with_screenshot else None
-        return add_screenshot_if_available(response, screenshot, not with_screenshot, screenshot_mode)
+        return add_screenshot_if_available(
+            response, screenshot, not with_screenshot, screenshot_mode
+        )
     except Exception as e:
         logger.error(f"Failed to get object: {e!s}")
         return text_response(f"Failed to get object: {e!s}")
@@ -570,7 +586,9 @@ def cad_operation(
         response = text_response(summary + step_note)
     else:
         return text_response(summary)
-    return add_screenshot_if_available(response, res.get("screenshot"), not with_screenshot, screenshot_mode)
+    return add_screenshot_if_available(
+        response, res.get("screenshot"), not with_screenshot, screenshot_mode
+    )
 
 
 # --- modeling sessions --------------------------------------------------------
@@ -1291,7 +1309,9 @@ def set_anchors_operation(
             res,
         )
     response = json_response({"summary": summary, **res})
-    return add_screenshot_if_available(response, res.get("screenshot"), not with_screenshot, screenshot_mode)
+    return add_screenshot_if_available(
+        response, res.get("screenshot"), not with_screenshot, screenshot_mode
+    )
 
 
 def assemble_operation(
@@ -1332,7 +1352,9 @@ def assemble_operation(
             res,
         )
     response = json_response({"summary": summary, **res})
-    return add_screenshot_if_available(response, res.get("screenshot"), not with_screenshot, screenshot_mode)
+    return add_screenshot_if_available(
+        response, res.get("screenshot"), not with_screenshot, screenshot_mode
+    )
 
 
 def verify_assembly_operation(

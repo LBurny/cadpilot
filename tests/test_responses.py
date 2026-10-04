@@ -131,8 +131,6 @@ def test_get_view_mode_image_overrides_file_default(file_mode):
 
 def test_add_screenshot_mode_param_overrides_default(tmp_path, monkeypatch):
     monkeypatch.setenv("CADPILOT_HOME", str(tmp_path))
-    resp = add_screenshot_if_available(
-        text_response("ok"), PNG_1X1, False, screenshot_mode="file"
-    )
+    resp = add_screenshot_if_available(text_response("ok"), PNG_1X1, False, screenshot_mode="file")
     assert isinstance(resp[1], TextContent)
     assert "Screenshot saved to" in resp[1].text
