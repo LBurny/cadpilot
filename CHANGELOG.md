@@ -1,5 +1,89 @@
 # Changelog
 
+## v0.5.6 (2026-10-04)
+
+### Added
+
+- **`--screenshot-mode file`** (`responses.py`, `screenshot_store.py`).
+  MCP transports images as base64, and a client that echoes the raw tool result
+  injects that blob into the conversation permanently — tens of thousands of
+  tokens per screenshot, and it breaks the prompt cache. The server now offers
+  a mode that writes the PNG to `$CADPILOT_HOME/screenshots/` (keeping the last
+  20) and returns only the file path, so an agentic client can read it with its
+  own file tool. The default stays `image`, and a failed write falls back to
+  the inline image. `screenshot_content()` is now the single entry point for
+  every screenshot content block, and the default screenshot long edge drops
+  from 768px to 512px.
+
+### Fixed
+
+- **A PartDesign transform no longer leaves the Body one feature behind**
+  (`feature_ops.py`, `tip_policy.py`). FreeCAD advances `Body.Tip` by itself for
+  a pad/pocket but NOT for a transform: a polar pattern on a flange was correct
+  in itself (15246 mm³, six holes) while the Body still showed one hole
+  (15874 mm³) and the op reported success. The tip is now pushed explicitly
+  after the feature is built, and only a successor of the current tip may claim
+  it — judged by FreeCAD's own `OutList` — so a dress-up on a mid-chain feature
+  cannot hide what follows it.
+- **fillet/chamfer inside a Body build the PartDesign dress-up**
+  (`feature_ops.py`). They previously produced a document-root `Part::Fillet`,
+  which is not in `Body.Group`, does not follow the Body's Placement, and leaves
+  the Body Invalid when assigned to `Tip`. Dressing a feature that is NOT the
+  tip is now refused outright: FreeCAD moves the tip onto the new feature and
+  silently drops every later one (measured: 15999 mm³ with the six bolt holes
+  gone), and `Body.insertObject` is not a safe API for a mid-chain insert (it
+  duplicated the Group entry and left the tip wrong). `thickness`/`draft` share
+  the hazard and get the same gate.
+- **GUI-dispatch timeouts name the real cause** (`gui_dispatch.py`). An open
+  modal dialog, an open menu or a real drag now says so, instead of the
+  misleading "the waker/heartbeat chain may be dead" — which is what a human
+  operating FreeCAD alongside the model produces. A deferral lasting over 10 s
+  is logged once so `get_addon_log` shows the stall.
+- **Invalid-Shape errors name the object** (`feature_ops.py`): the message now
+  carries the object's name and FreeCAD's `StatusString` with the likely causes
+  instead of "<op> produced an invalid Shape" alone.
+- **`execute_code` no longer reports a successful snippet as a failure**
+  (`rpc_server.py`) when the snippet closed or replaced the document the call
+  was bound to — reading `doc.Name` off the deleted reference raised
+  `ReferenceError`.
+
+## v0.5.5 (2026-10-04)
+
+### Fixed
+
+- **`cad()` feature ops reject reserved spec keys** (`feature_ops.py`): user
+  `obj_properties` could clobber the internal `type`/`base` keys and silently
+  break the feature; they are now rejected up front and internal keys always
+  win.
+- **`session_status` no longer cries "out of sync"** (`operations/core.py`) when
+  the addon journal and the session step count differ — they legitimately do
+  (the journal is document-lifetime, the session is session-lifetime); only
+  undo-stack drift is reported.
+- **`execute_code` on a foreign document is not recorded as a session step**
+  (`rpc_server.py`, `operations/core.py`): the addon now reports which document
+  changed, so `session_rollback` can no longer pop the wrong document's undo
+  stack.
+- **`step_control insert` wraps a single step dict into a list** and rejects
+  empty/malformed input before the RPC, instead of failing opaquely addon-side.
+- **`move` accepts plain `[x, y, z]` vectors** (`operations/core.py`): the
+  dict-only form crashed with `'list' object has no attribute 'get'` on the
+  natural input, even though the rest of the API takes lists.
+- **`datum_plane`'s `plane.face` resolves direction tokens** (`+Z`, `top`, …)
+  like a sketch's does, instead of stuffing `'+Z'` into the attachment and
+  recomputing Invalid; recompute failures now include FreeCAD's `StatusString`.
+- **Assembly mate refs report `landing`** (`joint_ops.py`): a mate result names
+  the actual face/vertex per side and warns when that landing vertex sits far
+  from the ref's intent point — face center, anchor position, or the point
+  itself — because nearest-vertex choice is arbitrary on symmetric faces and a
+  zero residual does not mean the part landed where the user meant.
+  `point_on_face` is documented as the landing control, and anchor refs are now
+  mapped into the link frame before nearest-vertex matching (they were compared
+  in the wrong frame). `point_on_face` without a face is rejected instead of
+  silently ignored.
+- **Assembly rollback restores link placements BEFORE removing links**
+  (`joint_ops.py`): removal hands the link's placement back to the part, so
+  restoring after deletion silently leaked the post-mate placement.
+
 ## v0.5.4 (2026-10-04)
 
 ### Fixed
