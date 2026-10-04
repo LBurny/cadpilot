@@ -166,9 +166,16 @@ def execute_code_operation(
             # per-step invariant (and block rollback). Older addons send no
             # flag; treat that as read-only, the conservative default.
             changed = bool(res.get("changed"))
+            # The addon reports the document that ACTUALLY changed and whether
+            # that change was inside the transaction it opened for us. A snippet
+            # may switch documents mid-run (a documented move), so neither can be
+            # assumed from the argument list — assuming it made a foreign change
+            # read as "no document change" AND filed the step in the wrong log.
+            attributed = bool(res.get("attributed", True))
+            foreign = [n for n in (res.get("foreign_changes") or []) if n]
             sess = get_current_session()
             step_note = ""
-            if changed and sess is not None and sess.status == "active":
+            if changed and attributed and sess is not None and sess.status == "active":
                 # A session step must own a transaction on the SESSION's
                 # document — a snippet that mutated another document (its undo
                 # entry lives on that document's stack) must never be recorded
@@ -199,8 +206,20 @@ def execute_code_operation(
                     step_note = (
                         f" (recorded as atomic step #{step.step_number} of session '{sess.name}')"
                     )
+            elif changed and not attributed:
+                step_note = (
+                    " (a transaction was already open when the snippet ran, so its change "
+                    "cannot be attributed to a step of ours — not recorded)"
+                )
             elif not changed:
                 step_note = " (read-only: no document change, not recorded as a step)"
+            if foreign:
+                step_note += (
+                    " WARNING: the snippet also changed "
+                    + ", ".join(f"'{n}'" for n in foreign)
+                    + " — that change happened outside this document's transaction, so it is "
+                    "not part of any session step (it owns its own undo entry on that document)"
+                )
             response = text_response(f"Code executed successfully: {res['message']}{step_note}")
             return add_screenshot_if_available(
                 response, res.get("screenshot"), not with_screenshot, screenshot_mode
@@ -376,6 +395,39 @@ CAD_OPERATIONS = ("create_object", "edit_object", "delete_object", "batch", *CAD
 
 _AUTO_AUDIT_MAX_OBJECTS = 300
 _ISLAND_OBJECTS_PREVIEW = 4
+
+# Result keys that are transport bookkeeping rather than findings: `objects` is
+# the whole document's object-name fingerprint (hundreds of names on a real
+# model), `screenshot` is consumed by add_screenshot_if_available, and
+# success/object_name are already spelled out in the summary text.
+_RESULT_BOOKKEEPING = frozenset({"success", "object_name", "screenshot", "objects", "transaction"})
+
+
+def _format_feature_warnings(warnings: list[Any]) -> str:
+    """Render the addon's warnings as extra summary lines.
+
+    Same "WARNING - ..." shape the connectivity audit uses, so a warning reads
+    as a warning whatever produced it.
+    """
+    return "".join(f"\nWARNING - {w}" for w in warnings)
+
+
+def _success_response(summary: str, res: dict[str, Any]) -> ToolResponse:
+    """Render a successful mutation's reply WITHOUT dropping the addon's findings.
+
+    Only ``batch`` used to merge the RPC result, so a single feature op threw
+    away everything the addon had just measured: a ``pocket`` reported "created
+    successfully" while its cut removed no material, and ``sketch`` never
+    reported the ``dof``/``fully_constrained`` that operation_help promises
+    (``describe_feature`` computes both, ``sketcher_ops`` fills them in).
+    Warnings go into the summary text so a silent no-op cannot read as plain
+    success; the remaining fields (dof, fully_constrained, volume_mm3, solids)
+    ride along as a JSON payload. An op with nothing to report keeps returning
+    its plain summary line.
+    """
+    extras = {k: v for k, v in res.items() if k not in _RESULT_BOOKKEEPING}
+    text = summary + _format_feature_warnings(extras.pop("warnings", None) or [])
+    return json_response({"summary": text, **extras}) if extras else text_response(text)
 
 
 def _format_connectivity_warning(audit: dict[str, Any]) -> str:
@@ -583,7 +635,7 @@ def cad_operation(
     if operation == "batch":
         response = json_response({"summary": summary + step_note, **res})
     elif success:
-        response = text_response(summary + step_note)
+        response = _success_response(summary + step_note, res)
     else:
         return text_response(summary)
     return add_screenshot_if_available(
@@ -608,7 +660,23 @@ def session_start_operation(
             doc_name = res["document_name"]  # FreeCAD may sanitize the name
     except Exception as e:
         return text_response(f"Failed to prepare document: {e!s}")
-    sess = new_session(name or f"Modeling {doc_name}", doc_name)
+    # The starting object set is what session_rollback(to_step=0) must restore.
+    # Without it that rollback had nothing to verify against and reported
+    # success even when objects were left behind.
+    initial: list[str] | None = None
+    try:
+        objs = freecad.get_objects(doc_name)
+        # The addon answers {"success":..., "objects":[...]}; older/other paths
+        # answer a bare list. Accept both.
+        if isinstance(objs, dict):
+            names = objs.get("objects") if objs.get("success", True) else None
+        else:
+            names = objs
+        if names is not None:
+            initial = _normalize_object_names(names)
+    except Exception as e:
+        logger.warning(f"session_start: could not read the document's objects: {e!s}")
+    sess = new_session(name or f"Modeling {doc_name}", doc_name, initial_objects=initial)
     set_current_session(sess)
     save_session(sess)
     return json_response(
@@ -768,15 +836,32 @@ def session_rollback_operation(
     removed = sess.truncate_to(sess.step_count - undone)
     save_session(sess)
 
+    # Verify what the undo actually did instead of trusting the count. The
+    # target state is the fingerprint of the step we rolled back TO, or the
+    # session's starting object set at to_step=0 — which is exactly the case
+    # that used to be skipped (`if sess.steps:`), so a rollback that left
+    # objects behind reported success with an empty warning list.
     state_matches = None
-    if sess.steps:
+    expected = None
+    if to_step > 0:
+        expected = list(sess.steps[to_step - 1].objects_after)
+    elif sess.initial_objects is not None:
+        expected = list(sess.initial_objects)
+    if expected is not None:
         current_names = _normalize_object_names(res.get("objects", []))
-        state_matches = current_names == sess.steps[-1].objects_after
+        state_matches = current_names == expected
         if not state_matches:
+            created = sorted(set(current_names) - set(expected))
             warnings.append(
-                "Post-rollback object list differs from the recorded step fingerprint — "
-                "the document was likely edited outside cad()."
+                "Post-rollback object list differs from the recorded step fingerprint — the "
+                "document was likely edited outside cad(), or undo did not reach the target "
+                f"state. Still present but not expected: {created}."
             )
+    elif to_step == 0:
+        warnings.append(
+            "The session has no recorded starting object set (it predates that field, or the "
+            "addon could not be queried), so the rollback to step 0 could not be verified."
+        )
     return json_response(
         {
             "success": True,

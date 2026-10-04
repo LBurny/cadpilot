@@ -1,9 +1,12 @@
-"""Declarative priority trimming: non-destructive Part::Cut.
+"""Declarative priority trimming: a non-destructive baked cut.
 
-The loser part is cut by a Part::Cut feature (winner keeps its shape and
-dimensions); the loser's assembly Link is re-pointed to the cut result, so
-joints referencing the link survive. Rollback = delete the Cut + re-point
-the link back (handled by joint_ops rollback_step).
+The loser is cut by a separate ``TrimCut_<loser>`` object — a static
+Part::Feature holding the baked boolean, NOT a live Part::Cut (frozen so it
+composes correctly with the link's placement for the solver and the viewer).
+The winner keeps its shape and dimensions; the loser's assembly Link is
+re-pointed to the cut result, so joints referencing the link survive.
+Rollback = delete the TrimCut + re-point the link back (handled by
+joint_ops rollback_step).
 """
 
 from .joint_ops import _global_shape, _local_shape

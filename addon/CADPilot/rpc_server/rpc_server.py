@@ -176,10 +176,10 @@ class FreeCADRPC:
                         in_transaction = True
                     except Exception as e:
                         FreeCAD.Console.PrintWarning(f"CADPilot: cannot open transaction: {e}\n")
-            undo_before = 0
+            token_before = None
             if in_transaction:
                 with contextlib.suppress(Exception):
-                    undo_before = doc.UndoCount
+                    token_before = step_engine.undo_token(doc)
             objects_before = sorted(o.Name for o in doc.Objects) if doc is not None else []
             try:
                 # Machine-driven writes stay silent for the manual-edit sync
@@ -210,7 +210,7 @@ class FreeCADRPC:
                             objects_after=objects,
                         )
                     doc.commitTransaction()
-                    step_engine.downgrade_if_no_undo(doc, rec, undo_before)
+                    step_engine.downgrade_if_no_undo(doc, rec, token_before)
                     dbglog.get_logger("tx").info("committed transaction %r", transaction)
                 else:
                     doc.abortTransaction()
@@ -957,8 +957,22 @@ class FreeCADRPC:
             # ALREADY open we leave it untouched — we cannot attribute its
             # changes — and record the step conservatively.
             wrapped = doc is not None and not doc.HasPendingTransaction
-            undo_before = doc.UndoCount if wrapped else 0
+            tx_name = None
+            with contextlib.suppress(Exception):
+                tx_name = doc.Name if doc is not None else None
+            token_before = None
+            if wrapped:
+                with contextlib.suppress(Exception):
+                    token_before = step_engine.undo_token(doc)
             before = step_engine.object_names(doc)
+            # The snippet is free to switch documents (a documented move: set the
+            # active document so the step lands on the right one) or to close
+            # one, so "what changed" must come from the whole open set — the old
+            # code attributed every change to whatever document was active when
+            # the call ARRIVED, which both lied in the reply ("read-only: no
+            # document change" for a run that did mutate) and filed the step
+            # into the wrong document's journal.
+            docs_before = step_engine.document_tokens()
             if wrapped:
                 doc.openTransaction("CADPilot: execute_code")
             try:
@@ -972,11 +986,19 @@ class FreeCADRPC:
                     with contextlib.suppress(Exception):
                         doc.abortTransaction()
                 raise
-            changed = False
+            tx_changed = False
             if wrapped:
                 with contextlib.suppress(Exception):
                     doc.commitTransaction()  # empty -> no undo entry
-                    changed = doc.UndoCount > undo_before
+                    tx_changed = step_engine.undo_token(doc) != token_before
+            changed_docs = step_engine.changed_documents(docs_before)
+            # The step belongs to the document whose transaction we own, and is
+            # atomic only when THAT document changed. A change made to another
+            # document happened outside our transaction: it owns its own undo
+            # entry there, so it must not be recorded as this step (nor as this
+            # document's session step).
+            foreign = [n for n in changed_docs if n != tx_name]
+            document = tx_name if (tx_name in changed_docs or not changed_docs) else changed_docs[0]
             # A snippet that changed the document is ATOMIC and replayable;
             # a read-only one stays non-atomic, so rollback neither stops at it
             # nor re-runs it.
@@ -985,7 +1007,7 @@ class FreeCADRPC:
                     step_engine.append_execute_code(
                         doc,
                         code=code,
-                        changed=changed,
+                        changed=tx_changed,
                         objects_before=before,
                     )
             except Exception:
@@ -996,9 +1018,6 @@ class FreeCADRPC:
             # the step lands on the right one) — reading .Name off the deleted
             # reference raises ReferenceError and would report a snippet that
             # SUCCEEDED as a failure.
-            doc_name = None
-            with contextlib.suppress(Exception):
-                doc_name = doc.Name if doc is not None else None
             if tmp_path is not None:
                 shot = save_active_screenshot(
                     tmp_path,
@@ -1007,18 +1026,26 @@ class FreeCADRPC:
                     screenshot.get("height"),
                     screenshot.get("focus_object"),
                 )
-                return True, tmp_path if shot is True else None, changed, doc_name
-            return True, None, changed, doc_name
+                return (
+                    True,
+                    tmp_path if shot is True else None,
+                    bool(changed_docs),
+                    document,
+                    wrapped,
+                    foreign,
+                )
+            return True, None, bool(changed_docs), document, wrapped, foreign
 
         try:
             out = dispatch_to_gui(combined_task, timeout=self.EXECUTE_CODE_TIMEOUT)
             if isinstance(out, tuple) and len(out) >= 2:
                 res, shot_path = out[0], out[1]
                 changed = out[2] if len(out) > 2 else False
-                # Which document owns the transaction — a mutating run whose
-                # doc differs from the caller's active session must NOT be
-                # recorded there, or session_rollback pops the wrong stack.
+                # Which document actually changed (not "which was active"), and
+                # whether the change was inside OUR transaction.
                 changed_doc = out[3] if len(out) > 3 else None
+                attributed = out[4] if len(out) > 4 else True
+                foreign = out[5] if len(out) > 5 else []
             else:
                 # Timeout or error from dispatch layer
                 code_preview = code if len(code) <= 800 else code[:800] + "\n...(truncated)"
@@ -1033,6 +1060,11 @@ class FreeCADRPC:
                     "success": True,
                     "changed": bool(changed),
                     "document": changed_doc,
+                    # False when a transaction was already open, so the change
+                    # cannot be attributed to a transaction we own: the step is
+                    # rollback-able only by whatever owns that transaction.
+                    "attributed": bool(attributed),
+                    "foreign_changes": list(foreign),
                     "message": "Python code executed successfully.\nOutput: "
                     + output_buffer.getvalue(),
                 }

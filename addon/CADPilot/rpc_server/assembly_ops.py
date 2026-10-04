@@ -13,12 +13,15 @@ import json
 import math
 
 import FreeCAD
+import Part
 
 from rpc_server.geometry_query import _face_normal, _get_obj, _r, _vec
 
 ANCHOR_PROP = "MCP_Anchors"
 _MAX_FLOATING_REPORT = 50
 _MAX_INTERFERENCE_REPORT = 20
+# How far off its own face a center has to be before we call it unusable.
+_ANCHOR_ON_FACE_TOL = 1e-6
 
 
 # ---------------------------------------------------------------------------
@@ -84,8 +87,31 @@ def _auto_anchor_map(obj):
         (f for f in shape.Faces if "Plane" in f.Surface.TypeId), key=lambda f: -(f.Area or 0)
     )[:3]
     for i, face in enumerate(planar):
-        anchors[f"face{i}_center"] = (FreeCAD.Vector(face.CenterOfMass), _face_normal(face))
+        anchors[f"face{i}_center"] = (_face_center_on_surface(face), _face_normal(face))
     return anchors
+
+
+def _face_center_on_surface(face):
+    """A point ON ``face`` near its center.
+
+    ``Face.CenterOfMass`` is the AREA centroid, which for an annular face (the
+    top of a bushing/washer/flange) lands in the hole — off the surface. Every
+    consumer then treats the anchor as floating next to the part, so a mate
+    with {"anchor": "face0_center"} died with "no planar face within 1 mm of
+    the anchor/point". When the centroid is off the face, fall back to the
+    midpoint of the longest edge, which is always on it.
+    """
+    com = FreeCAD.Vector(face.CenterOfMass)
+    try:
+        if face.distToShape(Part.Vertex(com))[0] <= _ANCHOR_ON_FACE_TOL:
+            return com
+    except Exception:
+        return com
+    edges = list(getattr(face, "Edges", None) or [])
+    if not edges:
+        return com
+    longest = max(edges, key=lambda e: e.Length or 0.0)
+    return FreeCAD.Vector(longest.valueAt((longest.FirstParameter + longest.LastParameter) / 2))
 
 
 def _auto_anchors(obj):
@@ -368,6 +394,33 @@ class _UnionFind:
             self.parent[ra] = rb
 
 
+def _auditable_shape(shape) -> bool:
+    """Whether a shape can take part in the spatial audit at all.
+
+    Origin datums (``App::Line``/``App::Plane``/``App::Point``) are VISIBLE by
+    default and carry an INFINITE bound box, and an empty sketch has no faces.
+    Feeding either to OCC raised straight out of ``distToShape``/``common`` and
+    killed the entire audit — on every default PartDesign document, since its
+    origin datums are visible. The connectivity auto-audit swallowed that
+    exception, so it silently stopped running on normal models.
+    """
+    bb = shape.BoundBox
+    for v in (bb.XMin, bb.XMax, bb.YMin, bb.YMax, bb.ZMin, bb.ZMax):
+        if not math.isfinite(v) or abs(v) >= 1e90:
+            return False
+    return bool(shape.Faces)
+
+
+def _is_body_member(obj) -> bool:
+    """True when ``obj`` is a feature inside a PartDesign Body.
+
+    A body member is not a separate solid: ``Body.Shape`` IS the tip's result,
+    so auditing both reports the feature overlapping its own body — 6283 mm^3 of
+    pure noise on a plain plate-with-hole. The Body stands in for the group.
+    """
+    return any(getattr(o, "TypeId", "") == "PartDesign::Body" for o in getattr(obj, "InList", []))
+
+
 def verify_assembly(doc_name, checks=None, float_threshold=1.0, interference_min_volume=1.0):
     try:
         doc = FreeCAD.getDocument(doc_name)
@@ -381,12 +434,17 @@ def verify_assembly(doc_name, checks=None, float_threshold=1.0, interference_min
         # everything counts as visible.
         shaped = []
         skipped_hidden = 0
+        skipped_body_members = 0
+        skipped_unmeasurable = 0
         for o in doc.Objects:
             shape = getattr(o, "Shape", None)
-            if shape is None or shape.isNull():
+            if shape is None or shape.isNull() or not _auditable_shape(shape):
                 continue
             if not getattr(getattr(o, "ViewObject", None), "Visibility", True):
                 skipped_hidden += 1
+                continue
+            if _is_body_member(o):
+                skipped_body_members += 1
                 continue
             shaped.append((o.Name, shape))
         float_threshold = float(float_threshold)
@@ -413,11 +471,20 @@ def verify_assembly(doc_name, checks=None, float_threshold=1.0, interference_min
                 if d <= scan_range:
                     near.append((other_name, other))
             if near:
-                dists = [(on, shape.distToShape(o)[0]) for on, o in near]
-                best_name, best_exact = min(dists, key=lambda t: t[1])
-                for on, d in dists:
-                    if d <= _CONTACT_TOLERANCE:
-                        edges.append((i, name_index[on]))
+                # One unmeasurable pair must not abort the whole audit (a bad
+                # face threw StdFail_NotDone out of a Draft Array vs sphere
+                # comparison); it is counted and reported instead.
+                dists = []
+                for on, o in near:
+                    try:
+                        dists.append((on, shape.distToShape(o)[0]))
+                    except Exception:
+                        skipped_unmeasurable += 1
+                if dists:
+                    best_name, best_exact = min(dists, key=lambda t: t[1])
+                    for on, d in dists:
+                        if d <= _CONTACT_TOLERANCE:
+                            edges.append((i, name_index[on]))
             nearest = best_exact if best_exact is not None else best_bbox
             if nearest > float_threshold:
                 floating.append({"obj": name, "nearest": best_name, "distance_mm": _r(nearest)})
@@ -431,7 +498,11 @@ def verify_assembly(doc_name, checks=None, float_threshold=1.0, interference_min
                 name_b, shape_b = shaped[j]
                 if _bbox_dist(shape_a.BoundBox, shape_b.BoundBox) > 0:
                     continue
-                vol = shape_a.common(shape_b).Volume
+                try:
+                    vol = shape_a.common(shape_b).Volume
+                except Exception:
+                    skipped_unmeasurable += 1
+                    continue
                 if vol > interference_min_volume:
                     interferences.append({"a": name_a, "b": name_b, "common_volume_mm3": _r(vol)})
                     edges.append((i, j))
@@ -463,7 +534,10 @@ def verify_assembly(doc_name, checks=None, float_threshold=1.0, interference_min
             best_gap, best_main = None, None
             if best_pair is not None:
                 best_main, s1, s2 = best_pair
-                best_gap = s1.distToShape(s2)[0]
+                try:
+                    best_gap = s1.distToShape(s2)[0]
+                except Exception:
+                    skipped_unmeasurable += 1
             islands.append(
                 {
                     "objects": sorted(comp)[:_MAX_ISLAND_OBJECTS],
@@ -516,6 +590,12 @@ def verify_assembly(doc_name, checks=None, float_threshold=1.0, interference_min
                 "island_count": len(islands),
                 "component_count": len(components),
                 "skipped_hidden": skipped_hidden,
+                # PartDesign features are represented by their Body (they share
+                # its Shape), so they are not audited individually.
+                "skipped_body_members": skipped_body_members,
+                # Pairs OCC could not measure: the audit is PARTIAL, and a
+                # caller must not read "no interference" as proof.
+                "skipped_unmeasurable": skipped_unmeasurable,
                 "checks_failed": sum(1 for c in check_results if not c.get("passed")),
             },
         }

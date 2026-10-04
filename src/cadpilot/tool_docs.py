@@ -76,7 +76,7 @@ mirror — parametric mirror (obj_name = base object).
 Optional in obj_properties: plane (XY/XZ/YZ, default XY) or face (selector item), name.""",
     "pattern": """\
 pattern — repeat a feature or solid (obj_name = base object).
-Required in obj_properties: count (>= 2).
+Required in obj_properties: count (>= 2, or an expression, e.g. "=Vars.n_holes").
 Optional: pattern_type (linear/polar, default linear), spacing, axis (X/Y/Z or
   a direction vector), angle, center, reversed, name.
 
@@ -242,6 +242,10 @@ A mate ref is {"part": <name>} plus exactly ONE of:
   "face": "FaceN"   — direct face reference
   "anchor": <name>  — resolve a named anchor (get_anchors/set_anchors)
   "point": [x,y,z]  — global point; nearest planar face is used
+Anchors and points must sit ON the part: the ref resolves to the nearest
+PLANAR FACE within 1 mm. The auto faceN_center anchors lie on their face;
+the axis_*/bbox_* anchors do not, so use those for assemble/verify checks
+rather than as mate refs.
 The contact point maps to the nearest VERTEX of the face, which decides WHERE
 on the face the mate lands (GUI click semantics). On a symmetric face the
 nearest vertex to the center is arbitrary (a square face lands at a corner),
@@ -253,9 +257,9 @@ or a point ref.
 joint_type: fixed (default) / revolute / cylindrical / slider / ball /
 distance / parallel / perpendicular / angle.
 
-trim={"winner": "inserted"|"base"} declares priority trimming: the loser is
-cut by a non-destructive Part::Cut (the winner keeps its shape and dims);
-rolled back together with the mate.""",
+trim={"winner": "inserted"|"base"} declares priority trimming: the loser gets a
+non-destructive baked cut (a separate TrimCut object built from the winner's
+volume; the winner keeps its shape and dims); rolled back with the mate.""",
     "assemble": """\
 assemble — one-shot anchor snapping (ONE transaction).
 Each mate: {"obj", "anchor", "target", "target_anchor",
@@ -344,8 +348,8 @@ transaction and counts as atomic AND re-runnable (its code is stored, so replay
 re-executes it); only a read-only execute_code run stays non-atomic and is
 skipped by replay. Re-execution is available for modeling steps (create_object /
 edit_object / delete_object / batch / execute_code / PartDesign & Part
-features); assembly and anchor steps are logged and rollback-able but not
-re-runnable.""",
+features) and for the assembly toolchain (assembly / assemble / align_shapes /
+set_anchors), which journals its full payload and re-runs for real.""",
     "get_addon_log": """\
 get_addon_log — read the FreeCAD addon's in-memory debug log.
 

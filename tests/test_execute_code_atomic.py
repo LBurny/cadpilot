@@ -69,12 +69,18 @@ def test_execute_code_wraps_snippet_in_a_transaction():
     )
     assert _attr_calls(body, "openTransaction"), "snippet must run inside a transaction"
     assert _attr_calls(body, "abortTransaction"), "a failing snippet must roll back cleanly"
-    # Atomicity is decided by whether the transaction produced an undo entry.
-    assert any(
-        isinstance(n, ast.Compare)
-        and any(isinstance(m, ast.Attribute) and m.attr == "UndoCount" for m in ast.walk(n))
-        for n in ast.walk(body)
-    ), "changed must be derived from the undo count"
+    # Atomicity is decided by whether the commit produced an undo entry — via
+    # undo_token, NOT the raw UndoCount: FreeCAD caps the undo stack, so at the
+    # cap a REAL commit leaves UndoCount pinned and every later mutation was
+    # misclassified as read-only.
+    assert _attr_calls(body, "undo_token"), "changed must come from the commit probe"
+    assert not any(
+        isinstance(n, ast.Attribute) and n.attr == "UndoCount" for n in ast.walk(body)
+    ), "UndoCount alone saturates at FreeCAD's undo cap — probe with undo_token"
+    # Which document changed is answered from every open document, not from the
+    # one that happened to be active when the call arrived.
+    assert _attr_calls(body, "document_tokens"), "compare every open document"
+    assert _attr_calls(body, "changed_documents")
 
 
 def test_execute_code_result_reports_changed():

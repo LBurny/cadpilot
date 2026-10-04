@@ -89,6 +89,12 @@ class ModelingSession:
     redo_buffer: list[Step] = field(
         default_factory=list
     )  # truncated steps, restorable until a new step
+    # The document's object set when the session BEGAN: rolling back to step 0
+    # must restore exactly this, and without it the post-rollback check had
+    # nothing to compare against (so a rollback that left objects behind still
+    # reported success). None = unknown (session resumed from an older file),
+    # reported as "unverified" rather than guessed.
+    initial_objects: list[str] | None = None
     created_at: str = field(default_factory=_now)
     updated_at: str = field(default_factory=_now)
 
@@ -166,12 +172,14 @@ class ModelingSession:
             "steps": [s.to_dict() for s in self.steps],
             "notes": self.notes,
             "redo_buffer": [s.to_dict() for s in self.redo_buffer],
+            "initial_objects": self.initial_objects,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ModelingSession:
+        initial = data.get("initial_objects")
         return cls(
             session_id=data["session_id"],
             name=data["name"],
@@ -180,6 +188,7 @@ class ModelingSession:
             steps=[Step.from_dict(s) for s in data.get("steps", [])],
             notes=list(data.get("notes", [])),
             redo_buffer=[Step.from_dict(s) for s in data.get("redo_buffer", [])],
+            initial_objects=None if initial is None else sorted(initial),
             created_at=data.get("created_at", ""),
             updated_at=data.get("updated_at", ""),
         )
@@ -188,8 +197,21 @@ class ModelingSession:
 # --- persistence ------------------------------------------------------------
 
 
-def new_session(name: str, doc_name: str) -> ModelingSession:
-    return ModelingSession(session_id=uuid.uuid4().hex[:12], name=name, doc_name=doc_name)
+def new_session(
+    name: str, doc_name: str, initial_objects: list[str] | None = None
+) -> ModelingSession:
+    """Bind a session to a document; ``initial_objects`` is its starting state.
+
+    Pass the document's current object names: they are the target of
+    ``session_rollback(to_step=0)``, which otherwise has nothing to verify
+    against. ``None`` means "unknown" (the addon could not be asked).
+    """
+    return ModelingSession(
+        session_id=uuid.uuid4().hex[:12],
+        name=name,
+        doc_name=doc_name,
+        initial_objects=None if initial_objects is None else sorted(initial_objects),
+    )
 
 
 def save_session(session: ModelingSession) -> Path:

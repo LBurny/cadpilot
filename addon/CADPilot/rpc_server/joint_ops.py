@@ -22,6 +22,10 @@ logger = dbglog.get_logger("assembly")
 
 ASSEMBLY_NAME = "MCP_Assembly"
 
+# Joint types that need an AXIS; see _axis_ref_refusal for why a non-planar ref
+# cannot express one through this API.
+_AXIS_JOINTS = frozenset({"revolute", "cylindrical", "slider"})
+
 _JOINT_MODS = None
 
 
@@ -327,10 +331,44 @@ def _landing_warnings(doc, spec: dict, ref_a, ref_b) -> list[str]:
     return warnings
 
 
+def _axis_ref_refusal(ref_a, ref_b, joint_type: str) -> str:
+    """Refuse an axis-requiring joint whose refs cannot express an axis.
+
+    A resolved ref is ``(link, ["FaceN", "VertexM"])`` and the JCS is placed at
+    that vertex landmark. On a CYLINDRICAL face that lands the parts TANGENT:
+    measured live on 1.1.4, a revolute pin/bore mate put the pin 2.1 mm off the
+    bore axis (exactly bore_r - pin_r) and 42 mm axially displaced, while the
+    joint reported ``residual 0.0`` and verify found no interference. No ref
+    form here carries an axis, so refusing BEFORE anything moves is the honest
+    outcome — a wrong assembly reported as success is worse.
+    """
+    if str(joint_type).lower() not in _AXIS_JOINTS:
+        return ""
+    for side, ref in (("a", ref_a), ("b", ref_b)):
+        link, names = ref
+        try:
+            surf = link.Shape.getElement(names[0]).Surface
+        except Exception:
+            continue
+        if surf.TypeId != "Part::GeomPlane":
+            return (
+                f"{joint_type} joint: side {side} resolves to a non-planar face "
+                f"({names[0]}: {surf.TypeId.rsplit('::', 1)[-1]}), and an axis-based joint "
+                "needs an axis. This API places a joint by the face's nearest VERTEX, which "
+                "lands the parts tangent instead of coaxial — the mate would report success "
+                "with a wrong assembly. Use assemble(mode='axis') with anchors "
+                "(get_anchors/set_anchors) for axle-in-hole fits, or mate planar faces."
+            )
+    return ""
+
+
 def _op_mate(doc, spec: dict) -> dict:
     asm = _get_assembly(doc)
     ref_a = _resolve_ref(doc, spec["a"])
     ref_b = _resolve_ref(doc, spec["b"])
+    refusal = _axis_ref_refusal(ref_a, ref_b, spec["joint"])
+    if refusal:
+        raise ValueError(refusal)
     landing_warnings = _landing_warnings(doc, spec, ref_a, ref_b)
     moved_link = ref_a[0]
     pre_placement = _placement_to_dict(moved_link.Placement)

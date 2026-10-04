@@ -252,6 +252,50 @@ def test_rollback_invalid_step(fake_freecad, isolated_home):
     assert "Invalid step" in _text(resp)
 
 
+def test_session_start_captures_the_starting_object_set(fake_freecad, isolated_home):
+    """Rolling back to step 0 must restore the state the session began with, so
+    that state has to be recorded — otherwise the post-rollback check had
+    nothing to compare against and reported success with objects left behind."""
+    fake_freecad.objects_by_doc["Doc"] = ["Preexisting"]
+    sess = _start_session(fake_freecad)
+    assert sess.initial_objects == ["Preexisting"]
+
+
+def test_rollback_to_zero_verifies_against_the_starting_state(fake_freecad, isolated_home):
+    fake_freecad.objects_by_doc["Doc"] = ["Preexisting"]
+    sess = _start_session(fake_freecad)
+    sess.add_step("create_object", "a", objects_after=["Preexisting", "A"])
+    sess.add_step("create_object", "b", objects_after=["Preexisting", "A", "B"])
+    fake_freecad.objects_by_doc["Doc"] = ["Preexisting"]  # undo really restored it
+    data = _json(session_rollback_operation(fake_freecad, 0))
+    assert data["success"] is True
+    assert data["state_matches_log"] is True, "to_step=0 used to skip the check entirely"
+    assert not data["warnings"]
+
+
+def test_rollback_to_zero_reports_objects_left_behind(fake_freecad, isolated_home):
+    """The regression: a rollback whose undo came up short reported success with
+    an empty warning list, because the verification was skipped at to_step=0."""
+    fake_freecad.objects_by_doc["Doc"] = ["Preexisting"]
+    sess = _start_session(fake_freecad)
+    sess.add_step("create_object", "a", objects_after=["Preexisting", "A"])
+    fake_freecad.objects_by_doc["Doc"] = ["Preexisting", "A"]  # A survived the undo
+    data = _json(session_rollback_operation(fake_freecad, 0))
+    assert data["success"] is True
+    assert data["state_matches_log"] is False
+    assert any("A" in w for w in data["warnings"])
+
+
+def test_rollback_to_zero_says_so_when_it_cannot_verify(fake_freecad, isolated_home):
+    """A session resumed from an older file has no starting object set."""
+    sess = _start_session(fake_freecad)
+    sess.initial_objects = None
+    sess.add_step("create_object", "a", objects_after=["A"])
+    data = _json(session_rollback_operation(fake_freecad, 0))
+    assert data["state_matches_log"] is None
+    assert any("could not be verified" in w for w in data["warnings"])
+
+
 def test_redo_restores_steps(fake_freecad, isolated_home):
     sess = _three_step_session(fake_freecad)
     fake_freecad.objects_by_doc["Doc"] = ["A"]

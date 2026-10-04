@@ -196,7 +196,10 @@ def _build_loft(doc, spec):
     profiles = [_get_obj(doc, n, "profile") for n in spec["profiles"]]
     if len(profiles) < 2:
         raise ValueError("loft requires at least 2 profiles.")
-    feat = doc.addObject("Part::Loft", spec.get("name") or "Loft")
+    # Loft has no base object (CAD_NO_BASE_OPERATIONS), so cad()'s obj_name
+    # arrives as spec["base"] — that is the documented name of the NEW loft.
+    # Reading only spec["name"] silently named every loft "Loft".
+    feat = doc.addObject("Part::Loft", spec.get("name") or spec.get("base") or "Loft")
     feat.Sections = profiles
     feat.Solid = bool(spec.get("solid", True))
     feat.Ruled = bool(spec.get("ruled", False))
@@ -316,10 +319,73 @@ def _build_pd_pattern(doc, body, base, spec, ptype: str, count: int):
     return feat
 
 
+@contextlib.contextmanager
+def _active_document(doc):
+    """Make ``doc`` FreeCAD's ACTIVE document for the duration of the block.
+
+    Draft's array helpers create their Array in ``FreeCAD.ActiveDocument``, so
+    patterning a document that is merely OPEN raised "PropertyLink does not
+    support external object" — multi-document sessions (the norm, and what a
+    parallel test run produces) failed on a call that works when the document
+    happens to be active. The previous active document is restored afterwards
+    so driving another document does not yank the user's view away.
+    """
+    previous = None
+    with contextlib.suppress(Exception):
+        active = FreeCAD.ActiveDocument
+        previous = active.Name if active is not None else None
+    if previous != doc.Name:
+        FreeCAD.setActiveDocument(doc.Name)
+    try:
+        yield
+    finally:
+        if previous and previous != doc.Name:
+            with contextlib.suppress(Exception):
+                FreeCAD.setActiveDocument(previous)
+
+
+def _pattern_count(doc, raw) -> int:
+    """Resolve the pattern count, which may be an expression binding.
+
+    ``count="=Vars.n_holes"`` used to die inside ``int()`` ("invalid literal
+    for int() with base 10"), so a Spreadsheet could not drive an array even
+    though every other op accepts "=expr". A throwaway object borrows FreeCAD's
+    expression engine to evaluate it up front; it is created and removed inside
+    the op's own transaction, so it leaves no trace in the document.
+    """
+    if isinstance(raw, str) and raw.startswith("="):
+        probe = doc.addObject("App::FeaturePython", "_CADPilotExprProbe")
+        invalid = False
+        value = 0.0
+        try:
+            probe.addProperty("App::PropertyFloat", "Value")
+            probe.setExpression("Value", raw[1:])
+            doc.recompute()
+            # An alias that does not exist does NOT raise: the property simply
+            # stays 0 and goes Invalid, which then surfaced as a baffling
+            # "pattern count must be >= 2" instead of naming the bad expression.
+            invalid = "Invalid" in [str(s) for s in getattr(probe, "State", [])]
+            value = float(probe.Value)
+        except Exception as e:
+            raise ValueError(
+                f"pattern count expression {raw!r} could not be evaluated ({e})."
+            ) from None
+        finally:
+            with contextlib.suppress(Exception):
+                doc.removeObject(probe.Name)
+        if invalid:
+            raise ValueError(
+                f"pattern count expression {raw!r} did not resolve to a number — check the "
+                "spreadsheet alias/object name (a misspelled alias evaluates to 0, not an error)."
+            )
+        return round(value)
+    return int(raw)
+
+
 def _build_pattern(doc, spec):
     _require(spec, "base", "count")
     base = _get_obj(doc, spec["base"], "base")
-    count = int(spec["count"])
+    count = _pattern_count(doc, spec["count"])
     if count < 2:
         raise ValueError("pattern count must be >= 2.")
     ptype = str(spec.get("pattern_type", "linear"))
@@ -332,19 +398,20 @@ def _build_pattern(doc, spec):
     import Draft
 
     make_array = getattr(Draft, "make_array", None) or Draft.makeArray
-    if ptype == "linear":
-        _require(spec, "spacing")
-        direction = _axis_vec(spec.get("axis"), default="X")
-        feat = make_array(
-            base, direction * float(spec["spacing"]), FreeCAD.Vector(0, 0, 0), count, 1
-        )
-    else:
-        center = spec.get("center", [0, 0, 0])
-        angle = float(spec.get("angle", 360.0))
-        feat = make_array(base, FreeCAD.Vector(*center), angle, count)
-        axis = str(spec.get("axis", "Z")).upper()
-        if axis != "Z" and hasattr(feat, "Axis"):
-            feat.Axis = _axis_vec(axis)
+    with _active_document(doc):
+        if ptype == "linear":
+            _require(spec, "spacing")
+            direction = _axis_vec(spec.get("axis"), default="X")
+            feat = make_array(
+                base, direction * float(spec["spacing"]), FreeCAD.Vector(0, 0, 0), count, 1
+            )
+        else:
+            center = spec.get("center", [0, 0, 0])
+            angle = float(spec.get("angle", 360.0))
+            feat = make_array(base, FreeCAD.Vector(*center), angle, count)
+            axis = str(spec.get("axis", "Z")).upper()
+            if axis != "Z" and hasattr(feat, "Axis"):
+                feat.Axis = _axis_vec(axis)
     if spec.get("name"):
         feat.Label = spec["name"]
     return feat

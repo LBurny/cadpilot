@@ -1,5 +1,7 @@
 """Tests for cad() feature operations (boolean/fillet/... pattern)."""
 
+import json
+
 from cadpilot.operations import cad_operation, session_start_operation
 from cadpilot.session_state import get_current_session
 
@@ -137,3 +139,46 @@ def test_feature_internal_spec_keys_win_over_params(fake_freecad, isolated_home)
     assert args[1]["type"] == "pad"
     assert args[1]["base"] == "Sketch"
     assert args[1]["length"] == 5
+
+
+def test_pocket_warning_reaches_the_model(fake_freecad, isolated_home):
+    """The addon's `warnings` used to be dropped for every non-batch op, so a
+    pocket that cut AIR reported plain success (describe_feature had detected
+    it). The response is the only thing the model reads."""
+    fake_freecad.result_overrides["create_feature"] = {
+        "success": True,
+        "object_name": "Pocket",
+        "warnings": ["Pocket removed no material (volume unchanged at 38603.9 mm^3): ..."],
+    }
+    resp = cad_operation(
+        fake_freecad, False, "pocket", "Doc", obj_name="Sketch", obj_properties={"length": 10}
+    )
+    text = _text(resp)
+    assert "removed no material" in text
+    assert "WARNING" in text, "a silent no-op must not read as plain success"
+
+
+def test_sketch_dof_reaches_the_model(fake_freecad, isolated_home):
+    """operation_help promises the sketch result reports fully_constrained."""
+    fake_freecad.result_overrides["create_feature"] = {
+        "success": True,
+        "object_name": "S1",
+        "dof": 0,
+        "fully_constrained": True,
+    }
+    resp = cad_operation(
+        fake_freecad, False, "sketch", "Doc", obj_name="S1", obj_properties={"geometry": []}
+    )
+    payload = json.loads(_text(resp))
+    assert payload["fully_constrained"] is True
+    assert payload["dof"] == 0
+
+
+def test_op_without_extras_keeps_its_plain_summary(fake_freecad, isolated_home):
+    """No behavior change where nothing was wrong: the transport bookkeeping
+    (objects fingerprint, transaction flag) must not leak into the reply."""
+    resp = cad_operation(
+        fake_freecad, False, "create_object", "Doc", obj_type="Part::Box", obj_name="B"
+    )
+    text = _text(resp)
+    assert text.strip() == "Object 'B' created successfully"

@@ -216,9 +216,7 @@ def test_assembly_ops_are_executable_and_recorded_with_payloads():
     }
     assert ASSEMBLY_JOURNAL_OPS <= ops
     func = next(
-        n
-        for n in ast.walk(_ENGINE)
-        if isinstance(n, ast.FunctionDef) and n.name == "_execute_one"
+        n for n in ast.walk(_ENGINE) if isinstance(n, ast.FunctionDef) and n.name == "_execute_one"
     )
     handled = {
         n.value
@@ -231,9 +229,7 @@ def test_assembly_ops_are_executable_and_recorded_with_payloads():
     # RPC side: every one of the four handlers journals a NON-EMPTY params dict
     for handler in ("assemble", "align_shapes", "set_anchors", "assembly_op"):
         func = next(
-            (n
-             for n in ast.walk(_RPC)
-             if isinstance(n, ast.FunctionDef) and n.name == handler),
+            (n for n in ast.walk(_RPC) if isinstance(n, ast.FunctionDef) and n.name == handler),
             None,
         )
         assert func is not None, f"no RPC handler {handler}"
@@ -242,12 +238,8 @@ def test_assembly_ops_are_executable_and_recorded_with_payloads():
             for f in (func,)
             for d in ast.walk(f)
             if isinstance(d, ast.Dict)
-            and any(
-                isinstance(k, ast.Constant) and k.value == "params" for k in d.keys
-            )
-            and any(
-                isinstance(v, ast.Dict) and not v.keys for v in d.values
-            )
+            and any(isinstance(k, ast.Constant) and k.value == "params" for k in d.keys)
+            and any(isinstance(v, ast.Dict) and not v.keys for v in d.values)
         ]
         assert not empties, f"{handler} still journals params={{}} (not replayable)"
 
@@ -256,7 +248,13 @@ def test_empty_commit_is_downgraded_to_read_only():
     """A committed op that produced no undo entry (a read-only assembly verify,
     an edit that set the values the object already had) must not keep claiming
     a transaction — plan_rollback counts r.transaction, and a phantom claim
-    pops an EARLIER step's transaction off the plain undo stack."""
+    pops an EARLIER step's transaction off the plain undo stack.
+
+    The probe must be ``undo_token``, not a bare ``UndoCount`` comparison:
+    FreeCAD caps the undo stack (MaxUndoSize, 20 by default), so at the cap a
+    REAL commit leaves the count pinned and the journal degraded every later
+    mutation to read-only — rollback/replay then silently skipped real steps.
+    """
     func = next(
         n
         for n in ast.walk(_RPC)
@@ -264,7 +262,8 @@ def test_empty_commit_is_downgraded_to_read_only():
     )
     attrs = {n.attr for n in ast.walk(func) if isinstance(n, ast.Attribute)}
     assert "downgrade_if_no_undo" in attrs
-    assert "UndoCount" in attrs, "the probe compares the undo count around the commit"
+    assert "undo_token" in attrs, "the probe must survive FreeCAD's undo cap"
+    assert "UndoCount" not in attrs, "UndoCount alone saturates at the cap"
 
 
 def test_rpc_mutations_are_muted_from_the_sync_observer():
@@ -282,9 +281,7 @@ def test_rpc_mutations_are_muted_from_the_sync_observer():
         for n in ast.walk(run_op)
     ), "_run_op_with_screenshot must run gui_fn inside engine_quiet()"
     execute_code = next(
-        n
-        for n in ast.walk(_RPC)
-        if isinstance(n, ast.FunctionDef) and n.name == "execute_code"
+        n for n in ast.walk(_RPC) if isinstance(n, ast.FunctionDef) and n.name == "execute_code"
     )
     assert any(
         isinstance(n, ast.With)

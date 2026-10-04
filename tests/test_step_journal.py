@@ -452,11 +452,22 @@ def test_tracked_objects_variables_claims_the_sheet_even_when_idempotent():
     """A variables re-run on an existing sheet creates nothing, so the
     before/after diff is empty — the sheet must be tracked by obj_name or its
     cells would never sync."""
-    recs = [_rec("variables", 1, "Vars", {"cells": {"A1": ["w", 10]}}, before=["Vars"], after=["Vars"])]
+    recs = [
+        _rec("variables", 1, "Vars", {"cells": {"A1": ["w", 10]}}, before=["Vars"], after=["Vars"])
+    ]
     entry = sj.tracked_objects(recs)["Vars"]
     assert entry["sheet"] == 1
     # the Body a sketch op created incidentally must NOT claim the sketch handlers
-    recs = [_rec("sketch", 1, "Sketch", {"geometry": [], "constraints": []}, before=[], after=["Body", "Sketch"])]
+    recs = [
+        _rec(
+            "sketch",
+            1,
+            "Sketch",
+            {"geometry": [], "constraints": []},
+            before=[],
+            after=["Body", "Sketch"],
+        )
+    ]
     tracked = sj.tracked_objects(recs)
     assert tracked["Sketch"]["sketch"] == 1
     assert tracked["Body"]["sketch"] is None

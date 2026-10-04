@@ -41,19 +41,21 @@ from rpc_server.property_mapper import Object
 
 logger = dbglog.get_logger("journal")
 
-EXECUTABLE_OPS = {"create_object", "edit_object", "delete_object", "batch"} | set(
-    FEATURE_TYPES
-) | {
-    # The assembly toolchain used to journal with params={} and
-    # executable=False: rollback undid them (they own transactions), but a
-    # replay/rebuild SKIPPED them and the model came back unassembled, and
-    # their unrecoverable flag degraded every rebuild across them to
-    # "partial". They carry their full payload now and re-run for real.
-    "assemble",
-    "align_shapes",
-    "set_anchors",
-    "assembly",
-}
+EXECUTABLE_OPS = (
+    {"create_object", "edit_object", "delete_object", "batch"}
+    | set(FEATURE_TYPES)
+    | {
+        # The assembly toolchain used to journal with params={} and
+        # executable=False: rollback undid them (they own transactions), but a
+        # replay/rebuild SKIPPED them and the model came back unassembled, and
+        # their unrecoverable flag degraded every rebuild across them to
+        # "partial". They carry their full payload now and re-run for real.
+        "assemble",
+        "align_shapes",
+        "set_anchors",
+        "assembly",
+    }
+)
 
 
 # --- document property -------------------------------------------------------
@@ -232,6 +234,45 @@ def object_names(doc) -> list[str]:
     return _object_names(doc)
 
 
+def undo_token(doc) -> tuple:
+    """FreeCAD's "did the last commit land" signal, without the undo-cap blind spot.
+
+    ``UndoCount`` alone is NOT that signal: FreeCAD caps the undo stack (the
+    ``MaxUndoSize`` preference — 20 by default), so once the stack is full a
+    REAL commit leaves the count pinned. Using the count as the probe made the
+    journal classify every mutation after the ~20th as read-only (no
+    transaction, not re-executable), and rollback/replay then skipped real
+    steps. Verified live on 1.1.4: at ``UndoCount == 20`` a real commit still
+    moves ``UndoNames`` (oldest evicted, newest appended) while an EMPTY commit
+    moves nothing — so the pair is decisive where the count alone is not.
+    """
+    return (int(getattr(doc, "UndoCount", 0)), tuple(getattr(doc, "UndoNames", None) or ()))
+
+
+def document_tokens() -> dict[str, tuple]:
+    """{document name: change token} for every open document.
+
+    ``execute_code`` needs this: the snippet is free to switch documents (and
+    to close one), so "which document did it change?" can only be answered by
+    comparing every document before and after the run.
+    """
+    tokens: dict[str, tuple] = {}
+    for doc in FreeCAD.listDocuments().values():
+        with contextlib.suppress(Exception):
+            tokens[doc.Name] = (*undo_token(doc), tuple(_object_names(doc)))
+    return tokens
+
+
+def changed_documents(before: dict[str, tuple]) -> list[str]:
+    """Names of the documents whose token moved since ``before`` (sorted).
+
+    A document that disappeared is not listed (there is nothing to reconcile);
+    one that appeared counts as changed.
+    """
+    after = document_tokens()
+    return sorted(name for name, token in after.items() if token != before.get(name))
+
+
 def append_execute_code(
     doc,
     *,
@@ -259,9 +300,16 @@ def append_execute_code(
         # object set invalidates the tail (see sj.invalidates_plan).
         if sj.invalidates_plan(records, after):
             del records[sj.planned_tail_start(records) :]
-        records.append(
+        # A read-only inspection (the common case) is INSERTED BEFORE the
+        # planned tail, never appended after it. Appending left a `done` record
+        # behind the pending plan, and the plan cursor walks from the first
+        # planned step — so `run_next`/`run_to` kept reporting "nothing to run"
+        # even though planned steps were waiting.
+        tail_at = sj.planned_tail_start(records)
+        records.insert(
+            tail_at,
             sj.StepRecord(
-                index=len(records) + 1,
+                index=tail_at + 1,
                 state=sj.STATE_DONE,
                 operation="execute_code",
                 # A step row should say what the snippet DID — its first line is
@@ -278,9 +326,9 @@ def append_execute_code(
                 objects_before=list(objects_before or []),
                 objects_after=after,
                 timestamp=sj.stamp(),
-            )
+            ),
         )
-        write_journal(doc, records)
+        write_journal(doc, records)  # reindexes: list position == step number
     except Exception as e:
         FreeCAD.Console.PrintWarning(f"CADPilot: step journal write failed: {e}\n")
 
@@ -288,7 +336,7 @@ def append_execute_code(
 # --- executing a record ------------------------------------------------------
 
 
-def downgrade_if_no_undo(doc, rec: sj.StepRecord | None, undo_before: int) -> bool:
+def downgrade_if_no_undo(doc, rec: sj.StepRecord | None, token_before) -> bool:
     """Reconcile a just-committed step with the undo stack.
 
     An empty commit adds no undo entry — the op changed nothing (a read-only
@@ -296,12 +344,16 @@ def downgrade_if_no_undo(doc, rec: sj.StepRecord | None, undo_before: int) -> bo
     A record that claims a transaction the stack does not have makes
     ``plan_rollback`` pop an EARLIER step's transaction, so the record is
     downgraded to read-only: no transaction, no mutation, no re-execution.
+
+    ``token_before`` is :func:`undo_token` taken before the op; comparing it to
+    the post-commit token is what makes this work at FreeCAD's undo cap, where
+    the plain count stops moving (see :func:`undo_token`).
     """
     if rec is None:
         return False
     produced = True
     with contextlib.suppress(Exception):
-        produced = doc.UndoCount > undo_before
+        produced = undo_token(doc) != token_before
     if produced:
         return False
     records = read_journal(doc)
@@ -403,8 +455,7 @@ def _execute_one(doc, operation: str, params: dict[str, Any]) -> dict[str, Any]:
             return {"success": True}
         return {
             "success": False,
-            "error": (res.get("error") if isinstance(res, dict) else str(res))
-            or "assemble failed",
+            "error": (res.get("error") if isinstance(res, dict) else str(res)) or "assemble failed",
         }
     if operation == "assembly":
         spec = params.get("spec") or {}
@@ -461,9 +512,9 @@ def run_record(doc, records: list[sj.StepRecord], rec: sj.StepRecord) -> dict[st
     """Execute ``rec`` in its own transaction, journal written inside it."""
     tx = _transaction_name(rec)
     before = _object_names(doc)
-    undo_before = 0
+    token_before = None
     with contextlib.suppress(Exception):
-        undo_before = doc.UndoCount
+        token_before = undo_token(doc)
     doc.openTransaction(tx)
     logger.info("open transaction %r (%d objects)", tx, len(before))
     started = time.monotonic()
@@ -511,15 +562,13 @@ def run_record(doc, records: list[sj.StepRecord], rec: sj.StepRecord) -> dict[st
     # the plain stack. (There is no path that upgrades in the other direction.)
     produced = True
     with contextlib.suppress(Exception):
-        produced = doc.UndoCount > undo_before
+        produced = undo_token(doc) != token_before
     if not produced and (rec.atomic or rec.transaction):
         rec.atomic = False
         rec.mutated = False
         rec.executable = False
         rec.transaction = ""
-        logger.info(
-            "step %d (%s): re-run changed nothing, downgraded", rec.index, rec.operation
-        )
+        logger.info("step %d (%s): re-run changed nothing, downgraded", rec.index, rec.operation)
         with contextlib.suppress(Exception):
             write_journal(doc, records)
     return res
@@ -798,6 +847,12 @@ def _snapshot(doc, records, note: str, accept_done: bool = False) -> dict[str, A
         label=note or "manual baseline",
         params={"note": note, "accept_done": accept_done},
         atomic=False,
+        # A snapshot is a MARKER: it changes no geometry, so it must not claim a
+        # mutation. `mutated=True` made it a rollback blocker (blocking =
+        # not atomic AND mutated), which meant a force-less rollback across it
+        # reported the non-atomic guard instead of the accepted soft-lock the
+        # step exists to impose.
+        mutated=False,
         executable=False,
         accepted=True,
         objects_before=prev,
@@ -1327,7 +1382,9 @@ class _JournalSyncObserver:
         if same(current, value):
             return
         props[hit[1]] = value
-        self._commit_sync(doc, records, rec.index, f"{obj.Name}.{prop}", brief(current), brief(value))
+        self._commit_sync(
+            doc, records, rec.index, f"{obj.Name}.{prop}", brief(current), brief(value)
+        )
 
     def _sync_cells(self, obj, doc, records, index: int) -> None:
         """Mirror spreadsheet cell edits (values, formulas, aliases) into the
@@ -1360,9 +1417,7 @@ class _JournalSyncObserver:
                 changed += 1
         if not changed:
             return
-        self._commit_sync(
-            doc, records, index, f"{obj.Name}.cells", "-", f"{changed} cell field(s)"
-        )
+        self._commit_sync(doc, records, index, f"{obj.Name}.cells", "-", f"{changed} cell field(s)")
 
     def _sync_constraints(self, obj, doc, records, index: int) -> None:
         """Mirror dimensional-constraint edits into the owning sketch step.
@@ -1439,9 +1494,7 @@ class _JournalSyncObserver:
         finally:
             self._writing = False
         logger.info("journal sync: step %d %s = %s (manual edit)", index, what, new)
-        _SYNC_EVENTS.append(
-            {"doc": doc.Name, "index": index, "prop": what, "old": old, "new": new}
-        )
+        _SYNC_EVENTS.append({"doc": doc.Name, "index": index, "prop": what, "old": old, "new": new})
         del _SYNC_EVENTS[:-50]
 
 

@@ -155,9 +155,7 @@ def params_for(step: dict[str, Any]) -> dict[str, Any]:
     a planned assemble could never run.
     """
     return {
-        k: v
-        for k, v in step.items()
-        if k not in ("operation", "action", "description", "label")
+        k: v for k, v in step.items() if k not in ("operation", "action", "description", "label")
     }
 
 

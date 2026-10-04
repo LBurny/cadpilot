@@ -1,5 +1,158 @@
 # Changelog
 
+## v0.5.9 (2026-10-04)
+
+A second round of multi-agent stress modelling (a travel mug, a lathe-turned
+vase, a multi-part cabinet hinge) went after the *scheduler-level* invariants —
+whether the step journal, rollback and the spatial audit can be trusted at all.
+Single-operation behaviour held up; how it is accounted for did not.
+
+### Fixed
+
+**Feature operations and their responses** — the first stress round (a
+parametric flange, a Part-level duct and a hinge assembly) surfaced these:
+
+- **`cad()` no longer throws the addon's findings away** (`operations/core.py`).
+  Only `batch` merged the RPC payload, so every other operation dropped what the
+  addon had just measured: a `pocket` whose cut removed no material (the profile
+  sat outside the solid, or the sketch attached to the wrong face) reported
+  plain "created successfully", and `sketch` never reported the
+  `dof`/`fully_constrained` that `operation_help` promises. Warnings now go into
+  the summary text — the same `WARNING - ...` shape the connectivity audit uses,
+  so a silent no-op cannot read as success — and the remaining fields
+  (`dof`, `fully_constrained`, `volume_mm3`, `solids`) ride along as a JSON
+  payload. An operation with nothing extra to report still answers with its plain
+  summary line.
+
+- **Part-level `pattern` works on a document that is open but not ACTIVE**
+  (`feature_ops.py`). Draft's array helpers create their result in
+  `FreeCAD.ActiveDocument`, so patterning any other open document failed with
+  "PropertyLink does not support external object" — the norm once more than one
+  document is open (and exactly what a parallel multi-agent run produces). The
+  target document is made active for the call and the user's previous active
+  document is restored afterwards.
+
+- **`pattern`'s `count` accepts an expression** (`feature_ops.py`).
+  `count="=Vars.n_holes"` died inside `int()` ("invalid literal for int() with
+  base 10") although every other operation accepts `=expr`, so a Spreadsheet
+  could not drive an array. An unresolvable expression is now reported as such
+  instead of silently evaluating to 0.
+
+- **`loft` honours `obj_name`** (`feature_ops.py`). A base-less operation
+  receives it as `spec["base"]`; reading only `spec["name"]` named every loft
+  "Loft", contradicting `operation_help`.
+
+- **Deleting a PartDesign Body's Tip leaves a usable Body**
+  (`object_factory.py`). `removeObject` left `Body.Tip` dangling, so the Body
+  reported `['Touched', 'Invalid']` and `Body.Shape` raised "shape is invalid" —
+  every later feature on it failed until the tip was set by hand. The tip is
+  re-pointed to the last surviving solid-producing member (never to a sketch:
+  that would stop the next feature from claiming the tip and silently hide it).
+
+- **The auto `faceN_center` anchor lies ON its face** (`assembly_ops.py`). A
+  face's area centroid falls in the HOLE of an annular face — a bushing, washer
+  or flange top — so an anchor-based mate died with "no planar face within 1 mm
+  of the anchor/point". When the centroid is off the face the anchor falls back
+  to the midpoint of the face's longest edge, which is always on it.
+
+- **Documentation corrections** (`tool_docs.py`, `trim_ops.py`). `trim` produces
+  a non-destructive baked cut (a static `TrimCut_*` Part::Feature), not a live
+  `Part::Cut`; the assembly toolchain IS re-runnable from the journal
+  (`EXECUTABLE_OPS` covers it); and anchor/point mate refs must resolve ON the
+  part surface (the auto `axis_*`/`bbox_*` anchors are for `assemble`/`verify`
+  checks, not mate refs).
+
+**Journal, audit and assembly accounting** — the second stress round (a travel
+mug, a lathe-turned vase, a cabinet hinge) went after the invariants that decide
+whether the journal can be trusted at all:
+
+- **The journal stops lying once a document has more than ~20 modelling steps**
+  (`step_engine.py`, `rpc_server.py`). The "did this commit actually change
+  anything?" probe compared `Document.UndoCount` before and after — but FreeCAD
+  caps the undo stack (`MaxUndoSize`, 20 by default), so at the cap a REAL
+  commit leaves the count pinned at 20. Every mutation after the twentieth was
+  rewritten as read-only (`transaction=""`, `atomic=False`, `executable=False`):
+  `step_control rollback_to`/`replay` silently skipped real steps,
+  `plan_rollback` miscounted transactions, and a mutating `execute_code`
+  reported "read-only: no document change". Measured live on 1.1.4: a real
+  commit at the cap still moves `UndoNames` (oldest entry evicted, newest
+  appended) while an EMPTY commit moves nothing — so all three commit sites
+  (`_run_op_with_screenshot`, `downgrade_if_no_undo`, `run_record`) now compare
+  `step_engine.undo_token()` (count + names), decisive where the count alone is
+  blind.
+
+- **`execute_code` attributes its work to the document that actually changed**
+  (`rpc_server.py`, `operations/core.py`). The snippet's transaction, change
+  probe and journal record were all bound to whichever document happened to be
+  ACTIVE when the call arrived — so a snippet that switched documents (a
+  documented move: set the active document so the step lands on the right one)
+  had its change filed into the wrong document's journal, and the reply claimed
+  "read-only: no document change" for a run that had in fact mutated something.
+  Worse under multi-agent use: a sibling's snippet landed as an atomic step in
+  this session's journal. The addon now fingerprints EVERY open document
+  (`document_tokens`/`changed_documents`), reports the one that really changed
+  along with `attributed` (was the change inside the transaction we own?) and
+  `foreign_changes`, and the MCP side refuses to record a change it does not own,
+  saying so instead of reporting read-only.
+
+- **The connectivity audit works again on ordinary documents**
+  (`assembly_ops.py`). Origin datums (`App::Line`/`App::Plane`/`App::Point`) are
+  VISIBLE with an INFINITE bound box, and an empty sketch has no faces; handing
+  either to OCC threw `Geom_RectangularTrimmedSurface::U parameters out of range`
+  straight out of `distToShape`/`common`, killing the whole `verify_assembly`
+  call — and the post-mutation auto-audit swallows exceptions, so it had
+  silently stopped running on every default PartDesign document. Work geometry is
+  now rejected up front (`_auditable_shape`), PartDesign features are excluded as
+  body members (a member is not a separate solid — `Body.Shape` IS its tip's
+  result, so auditing both reported the feature overlapping its own body as a
+  6283 mm³ "interference"), and an unmeasurable pair is counted in
+  `summary.skipped_unmeasurable` instead of aborting the scan.
+
+- **Deleting an object that others are built on is refused**
+  (`object_factory.py`). `removeObject` leaves the consumer behind with its base
+  link cleared: a PartDesign feature loses `BaseFeature` and a SUBTRACTIVE
+  feature turns ADDITIVE. Measured live: a plate-with-hole (6283 mm³) became the
+  pocket's own cylinder (1571 mm³) while the Body still reported
+  `['Up-to-date']` and the delete reported success. `delete_object` now lists the
+  dependents (transitively, containers excluded — FreeCAD lists the owning Body
+  in every feature's `InList`) and refuses, telling the caller to delete them in
+  reverse order first.
+
+- **`session_rollback(to_step=0)` verifies what the undo actually did**
+  (`operations/core.py`, `session_state.py`). The post-rollback fingerprint check
+  was guarded by `if sess.steps:` — and truncating to 0 leaves no steps, so the
+  check never ran and a rollback that left objects behind reported success with
+  an empty warning list. A session now records `initial_objects` at
+  `session_start` (the state step 0 must restore), the check covers to_step=0,
+  and leftovers are named. A session resumed from an older file has no recorded
+  starting state and says "could not be verified" instead of guessing.
+
+- **An axis-based joint can no longer be assembled wrongly and reported as
+  success** (`joint_ops.py`). A mate ref carries only a face plus its nearest
+  VERTEX, and the JCS is placed at that landmark — which on a CYLINDRICAL face
+  lands the parts TANGENT. Measured live: a `revolute` pin/bore mate put the pin
+  2.1 mm off the bore axis (exactly `bore_r - pin_r`) and 42 mm axially out,
+  while the joint reported `residual 0.0` and `verify` found no interference.
+  `revolute`/`cylindrical`/`slider` joints whose ref resolves to a non-planar
+  face are now refused *before* anything moves, pointing at the anchor-based
+  `assemble(mode="axis")` for axle-in-hole fits.
+
+- **A read-only `execute_code` no longer breaks a pending plan's cursor**
+  (`step_engine.py`). The record was appended AFTER the planned tail; the plan
+  cursor walks from the first planned step, so `run_next`/`run_to` kept reporting
+  "nothing to run" although planned steps were waiting. The record is now
+  inserted before the tail.
+
+- **A pattern `count` expression that does not resolve now says so**
+  (`feature_ops.py`). A misspelled spreadsheet alias does not raise — the probe
+  property simply stays 0 and goes `Invalid` — so the caller saw a baffling
+  "pattern count must be >= 2" instead of being told which alias is wrong.
+
+- **`snapshot` no longer claims a mutation** (`step_engine.py`). `mutated=True`
+  with no transaction made the marker a rollback blocker, so a force-less
+  rollback across it reported the non-atomic guard instead of the accepted
+  soft-lock the step exists to impose.
+
 ## v0.5.8 (2026-10-04)
 
 ### Added
