@@ -288,3 +288,31 @@ def test_rpc_mutations_are_muted_from_the_sync_observer():
         and any("engine_quiet" in ast.unparse(i.context_expr) for i in n.items)
         for n in ast.walk(execute_code)
     ), "execute_code must run the snippet inside engine_quiet()"
+
+
+def test_rollback_guards_undo_with_stack_check_and_replay_rewrites_doc_refs():
+    """Two reopen-safety wirings: (a) _rollback must consult _stack_holds_journal
+    before popping — after a file reopen the stack holds none of the journal, and
+    for a property-only step no object moves, so blind undo pops foreign
+    transactions undetected; (b) replayed snippets must go through
+    _replay_ready_code, else every stored getDocument('<old name>') dies with
+    "Unknown document" and the rebuild path (the only one left after a reopen)
+    cannot even start — the DeskFan.FCStd/ex-MideaDeskFan bug."""
+    func = next(
+        n for n in ast.walk(_ENGINE) if isinstance(n, ast.FunctionDef) and n.name == "_rollback"
+    )
+    assert any(
+        isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "_stack_holds_journal"
+        for n in ast.walk(func)
+    ), "_rollback must verify the undo stack holds the journal's transactions"
+    exec_one = next(
+        n for n in ast.walk(_ENGINE) if isinstance(n, ast.FunctionDef) and n.name == "_execute_one"
+    )
+    assert any(
+        isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "_replay_ready_code"
+        for n in ast.walk(exec_one)
+    ), "replayed snippets must be rewritten for document renames"

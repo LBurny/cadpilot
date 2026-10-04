@@ -507,9 +507,9 @@ def test_tracked_objects_create_claims_scalars_and_placement():
     recs = [_rec("create_object", 1, "Box", {"Length": 10, "Shape": {"nested": 1}}, after=["Box"])]
     entry = sj.tracked_objects(recs)["Box"]
     # only scalar spec keys are claimable; non-scalar structure is never invented
-    assert entry["props"]["Length"] == (1, "Length")
+    assert entry["props"]["Length"] == (1, "Length", None)
     assert "Shape" not in entry["props"]
-    assert entry["props"]["Placement"] == (1, "Placement")
+    assert entry["props"]["Placement"] == (1, "Placement", None)
     assert entry["move"] is None and entry["sheet"] is None and entry["sketch"] is None
 
 
@@ -518,7 +518,7 @@ def test_tracked_objects_later_done_step_wins_per_property():
         _rec("create_object", 1, "Box", {"Length": 10}, after=["Box"]),
         _rec("edit_object", 2, "Box", {"Length": 20}),
     ]
-    assert sj.tracked_objects(recs)["Box"]["props"]["Length"] == (2, "Length")
+    assert sj.tracked_objects(recs)["Box"]["props"]["Length"] == (2, "Length", None)
 
 
 def test_tracked_objects_ignores_planned_steps():
@@ -538,7 +538,7 @@ def test_tracked_objects_move_owns_the_final_pose():
     ]
     entry = sj.tracked_objects(recs)["Box"]
     assert "Placement" not in entry["props"]
-    assert entry["move"] == 4  # the LAST move step
+    assert entry["move"] == (4, None)  # the LAST move step, top-level
 
 
 def test_tracked_objects_feature_claims_builder_keys_even_when_unpassed():
@@ -547,9 +547,9 @@ def test_tracked_objects_feature_claims_builder_keys_even_when_unpassed():
     the caller's."""
     recs = [_rec("pad", 1, "Sketch", {}, before=["Sketch"], after=["Sketch", "Pad"])]
     props = sj.tracked_objects(recs)["Pad"]["props"]
-    assert props["Length"] == (1, "length")
-    assert props["Reversed"] == (1, "reversed")
-    assert props["Midplane"] == (1, "midplane")
+    assert props["Length"] == (1, "length", None)
+    assert props["Reversed"] == (1, "reversed", None)
+    assert props["Midplane"] == (1, "midplane", None)
 
 
 def test_tracked_objects_variables_claims_the_sheet_even_when_idempotent():
@@ -583,8 +583,8 @@ def test_tracked_objects_sketch_and_datum_claim_attachment_offset():
         _rec("datum_plane", 2, "DP", {"plane": "XY"}, before=["Sketch"], after=["Sketch", "DP"]),
     ]
     tracked = sj.tracked_objects(recs)
-    assert tracked["Sketch"]["props"]["AttachmentOffset"] == (1, "offset")
-    assert tracked["DP"]["props"]["AttachmentOffset"] == (2, "offset")
+    assert tracked["Sketch"]["props"]["AttachmentOffset"] == (1, "offset", None)
+    assert tracked["DP"]["props"]["AttachmentOffset"] == (2, "offset", None)
 
 
 def test_map_cell_value_number_text_formula():
@@ -636,3 +636,146 @@ def test_params_for_passes_assembly_payloads_through():
     assert params["mates"] == step["mates"]
     assert params["tolerance"] == 0.2
     assert "operation" not in params and "description" not in params
+
+
+def test_document_refs_extracts_getdocument_literals():
+    """Both quote styles count; a variable argument does not (nothing to
+    rewrite) — the DeskFan rename bug hid in these literals."""
+    code = (
+        "doc = App.getDocument('MideaDeskFan')\n"
+        'd2 = FreeCAD.getDocument("Other")\n'
+        "d3 = App.getDocument(name)\n"
+    )
+    assert sj.document_refs(code) == {"MideaDeskFan", "Other"}
+
+
+def test_rewrite_document_refs_repoints_only_mapped_names():
+    code = "doc = App.getDocument('Old')  # Old\nFreeCAD.getDocument(\"Old\")\ngetDocument('Keep')"
+    out = sj.rewrite_document_refs(code, {"Old": "New"})
+    assert "getDocument('New')" in out
+    assert "getDocument(\"New\")" in out
+    assert "getDocument('Keep')" in out
+    assert "App.getDocument" in out  # the accessor itself is untouched
+    # unmapped names survive; empty mapping is a no-op
+    assert sj.rewrite_document_refs(code, {"Missing": "X"}) == code
+    assert sj.rewrite_document_refs(code, {}) == code
+    assert sj.rewrite_document_refs("", {"A": "B"}) == ""
+
+
+def _done_rec(op, index, params, before=(), after=()):
+    return sj.StepRecord(
+        index=index,
+        state=sj.STATE_DONE,
+        operation=op,
+        label=op,
+        params=params,
+        atomic=True,
+        mutated=True,
+        executable=True,
+        objects_before=list(before),
+        objects_after=list(after),
+    )
+
+
+def test_tracked_objects_claims_batch_sub_ops():
+    """Manual edits on batch-created objects must sync into the SUB-OP's
+    obj_properties — the BatchA drag used to vanish from the journal, and a
+    replay of the batch silently reverted the user's correction."""
+    rec = _done_rec(
+        "batch",
+        7,
+        {"ops": [
+            {"action": "create_object", "obj_name": "BatchA",
+             "obj_properties": {"Height": 6, "Length": 10, "Width": 10}},
+            {"action": "move", "obj_name": "BatchA", "obj_properties": {"translate": [1, 0, 0]}},
+            {"operation": "pad", "obj_name": "Pad1", "obj_properties": {"length": 5}},
+        ]},
+        before=["Old"],
+        after=["Old", "BatchA", "Pad1"],
+    )
+    t = sj.tracked_objects([rec])
+    # create sub-op claims its scalars + Placement, routed to sub 0
+    assert t["BatchA"]["props"]["Height"] == (7, "Height", 0)
+    # the batch's move SUB-OP owns the final pose: create claims no
+    # Placement, the fold targets (step 7, sub 1)
+    assert "Placement" not in t["BatchA"]["props"]
+    assert t["BatchA"]["move"] == (7, 1)
+    assert "Placement" not in t["BatchA"]["props"]
+    # feature sub-ops are not claimed (no per-sub-op object attribution)
+    assert "Pad1" not in t
+    # later sub-op wins per property
+    rec2 = _done_rec(
+        "batch", 8,
+        {"ops": [{"action": "edit_object", "obj_name": "BatchA",
+                  "obj_properties": {"Length": 12}}]},
+        after=["BatchA"],
+    )
+    t2 = sj.tracked_objects([rec, rec2])
+    assert t2["BatchA"]["props"]["Length"] == (8, "Length", 0)
+
+
+def test_drop_planned_removes_by_state_not_position():
+    """Inspections append BEHIND the plan now, so the plan is not a trailing
+    run: removal must key on state — slicing from the end left a stale plan
+    alive after a commit (the snapshot-marker variant of the same bug)."""
+    recs = [
+        _done_rec("pad", 1, {}, after=["Pad"]),
+        _done_rec("create_object", 2, {}, after=["Pad", "Box"]),
+        sj.StepRecord(index=3, state=sj.STATE_PLANNED, operation="pocket"),
+        sj.StepRecord(index=4, state=sj.STATE_DONE, operation="execute_code"),
+        sj.StepRecord(index=5, state=sj.STATE_PLANNED, operation="fillet"),
+    ]
+    assert sj.drop_planned(recs) == 2
+    assert [r.state for r in recs] == [sj.STATE_DONE, sj.STATE_DONE, sj.STATE_DONE]
+
+
+def test_insert_steps_bounds_follow_the_planned_run_not_the_suffix():
+    OPS = {"pocket", "fillet"}
+
+    def fresh():
+        return [
+            _done_rec("create_object", 1, {}, after=["Box"]),
+            _done_rec("pad", 2, {}, after=["Box", "Pad"]),
+            sj.StepRecord(index=3, state=sj.STATE_PLANNED, operation="pocket"),
+            sj.StepRecord(index=4, state=sj.STATE_PLANNED, operation="fillet"),
+            sj.StepRecord(index=5, state=sj.STATE_DONE, operation="execute_code"),
+        ]
+
+    # run head (after the last done record) and run interior: fine
+    assert sj.insert_steps(fresh(), 2, [_step(name="X")], OPS) is not None
+    assert sj.insert_steps(fresh(), 4, [_step(name="X")], OPS) is not None
+    # after the trailing inspection would strand planned steps behind a done one
+    assert sj.insert_steps(fresh(), 5, [_step(name="X")], OPS) is None
+    # before the run is history
+    assert sj.insert_steps(fresh(), 1, [_step(name="X")], OPS) is None
+    # no planned records: appending at the very end stays allowed
+    done_only = [_done_rec("create_object", 1, {}, after=["Box"])]
+    assert sj.insert_steps(done_only, 1, [_step(name="X")], OPS) is not None
+    assert sj.insert_steps(done_only, 0, [_step(name="X")], OPS) is None
+
+
+def test_set_plan_drops_planned_wherever_they_sit():
+    recs = [
+        _done_rec("pad", 1, {}, after=["Pad"]),
+        sj.StepRecord(index=2, state=sj.STATE_PLANNED, operation="pocket"),
+        sj.StepRecord(index=3, state=sj.STATE_DONE, operation="execute_code"),
+        sj.StepRecord(index=4, state=sj.STATE_PLANNED, operation="fillet"),
+    ]
+    added = sj.set_plan(recs, [_step(name="New")], OPS)
+    assert [r.index for r in added] == [3]
+    assert [ (r.index, r.state, r.operation) for r in recs ] == [
+        (1, sj.STATE_DONE, "pad"),
+        (2, sj.STATE_DONE, "execute_code"),
+        (3, sj.STATE_PLANNED, "create_object"),
+    ]
+
+
+def test_next_planned_walks_by_state_behind_done_records():
+    recs = [
+        _done_rec("pad", 1, {}, after=["Pad"]),
+        sj.StepRecord(index=2, state=sj.STATE_PLANNED, operation="pocket"),
+        sj.StepRecord(index=3, state=sj.STATE_DONE, operation="execute_code"),
+        sj.StepRecord(index=4, state=sj.STATE_PLANNED, operation="fillet"),
+    ]
+    assert sj.next_planned(recs).index == 2
+    assert sj.pending_count(recs) == 2

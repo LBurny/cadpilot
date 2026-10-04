@@ -297,6 +297,28 @@ def snippet_description(code: str) -> str:
     return "\n".join(lines).strip()
 
 
+# A recorded snippet captures the document NAME it ran against
+# ("App.getDocument('MideaDeskFan')"). Save the file under a new name and
+# reopening hands FreeCAD a document named after the FILE — every reference
+# then dies with "Unknown document" and a rebuild cannot even start.
+_DOC_REF_RE = re.compile(r"\bgetDocument\(\s*(['\"])([^'\"]+)\1\s*\)")
+
+
+def document_refs(code: str) -> set[str]:
+    """Document names a snippet resolves through ``getDocument(<literal>)``."""
+    return {m.group(2) for m in _DOC_REF_RE.finditer(code or "")}
+
+
+def rewrite_document_refs(code: str, mapping: dict[str, str]) -> str:
+    """Re-point ``getDocument`` literals per ``mapping`` (old name -> new)."""
+
+    def sub(m: re.Match) -> str:
+        name = mapping.get(m.group(2), m.group(2))
+        return f"getDocument({m.group(1)}{name}{m.group(1)})"
+
+    return _DOC_REF_RE.sub(sub, code or "")
+
+
 def step_description(rec: StepRecord) -> str:
     """A step's human description — one rule for every op, so the panel has a
     single canonical text to show (row, tooltip, spotlight).
@@ -363,11 +385,27 @@ def planned_tail_start(records: list[StepRecord]) -> int:
     return n
 
 
+def drop_planned(records: list[StepRecord]) -> int:
+    """Discard every ``planned`` record, wherever it sits; returns the count.
+
+    A new commit invalidates the not-yet-executed plan, and the plan is NOT
+    guaranteed to be a trailing run: read-only inspections are appended AFTER
+    it (so index-addressed verbs see stable numbers), and a snapshot marker
+    may already sit behind it. Slicing from ``planned_tail_start`` then removes
+    nothing and a stale plan survives the commit — removal has to key on
+    STATE, not position.
+    """
+    keep = [r for r in records if r.state != STATE_PLANNED]
+    dropped = len(records) - len(keep)
+    records[:] = keep
+    return dropped
+
+
 def set_plan(
     records: list[StepRecord], steps: list[dict[str, Any]], executable_ops: set[str]
 ) -> list[StepRecord]:
-    """Replace the not-yet-executed tail with a fresh plan."""
-    del records[planned_tail_start(records) :]
+    """Replace the not-yet-executed plan with a fresh plan."""
+    drop_planned(records)
     added: list[StepRecord] = []
     for step in steps:
         rec = build_record(step, len(records) + 1, STATE_PLANNED, executable_ops)
@@ -478,13 +516,21 @@ def insert_steps(
 ) -> list[StepRecord] | None:
     """Insert planned steps after ``after_index`` (a count, like run_to).
 
-    The journal invariant "planned steps form the trailing run" means the
-    insertion point must sit at or inside the tail; None = inside history
-    (or empty steps).
+    Planned steps form ONE contiguous run, but done records may sit behind it
+    (appended inspections, a snapshot marker), so the insertion point must
+    land at or inside the run — inserting after those done records would
+    strand planned steps behind done ones. None = outside the run (or empty
+    steps).
     """
     if not steps:
         return None
-    if after_index < planned_tail_start(records):
+    planned = [r.index for r in records if r.state == STATE_PLANNED]
+    if planned:
+        # after_index == planned[0] - 1 lands at the run's head (the old
+        # tail-start rule); anything before that is executed history.
+        if not (planned[0] - 1 <= after_index <= planned[-1]):
+            return None
+    elif after_index < len(records):
         return None
     added = [build_record(s, 0, STATE_PLANNED, executable_ops) for s in steps]
     records[after_index:after_index] = added
@@ -603,6 +649,22 @@ def _num(value: float) -> int | float:
     return int(f) if f.is_integer() else f
 
 
+def _batch_sync_ops(rec: StepRecord) -> list[tuple[int, str, dict[str, Any]]]:
+    """(position, op name, sub-op dict) of a batch record's syncable sub-ops.
+
+    create/edit/move sub-ops carry the payload a manual edit maps back onto;
+    feature sub-ops are skipped (see tracked_objects).
+    """
+    out: list[tuple[int, str, dict[str, Any]]] = []
+    for i, sub in enumerate((rec.params or {}).get("ops") or []):
+        if not isinstance(sub, dict):
+            continue
+        op = sub_operation(sub)
+        if op in ("create_object", "edit_object", "move"):
+            out.append((i, op, sub))
+    return out
+
+
 def tracked_objects(records: list[StepRecord]) -> dict[str, dict[str, Any]]:
     """object name -> sync handlers, from done steps.
 
@@ -615,23 +677,58 @@ def tracked_objects(records: list[StepRecord]) -> dict[str, dict[str, Any]]:
                    move would double-apply on reexecute.
       ``sheet``  — index of the variables step owning the spreadsheet.
       ``sketch`` — index of the sketch step owning the sketch.
-      ``move``   — index of the LAST done move step targeting the object.
-                   A manual drag folds into it as an absolute placement
-                   override (placement wins over translate/rotate on re-run),
-                   which reproduces the pose no matter what came before it.
+      ``move``   — (index, sub) of the LAST done move targeting the object
+                   (top-level step or a move sub-op inside a batch). A manual
+                   drag folds into it as an absolute placement override
+                   (placement wins over translate/rotate on re-run), which
+                   reproduces the pose no matter what came before it.
+
+    Property claims are ``(step index, params key, batch sub-op position)``
+    with sub None for top-level steps; the engine routes the sync write
+    through it. Batch coverage: create/edit/move SUB-OPS sync (their payload
+    names the object and carries the scalars a manual edit maps back onto);
+    feature sub-ops do not — their created object cannot be attributed from
+    the record-level object diff.
     """
-    last_move: dict[str, int] = {}
+    last_move: dict[str, tuple[int, int | None]] = {}
     for r in records:
-        if r.state == STATE_DONE and r.operation == "move":
+        if r.state != STATE_DONE:
+            continue
+        if r.operation == "move":
             name = str((r.params or {}).get("obj_name") or "")
             if name:
-                last_move[name] = r.index
+                last_move[name] = (r.index, None)
+        elif r.operation == "batch":
+            for sub_i, sub_op, sub in _batch_sync_ops(r):
+                if sub_op == "move":
+                    name = str(sub.get("obj_name") or "")
+                    if name:
+                        last_move[name] = (r.index, sub_i)
 
     tracked: dict[str, dict[str, Any]] = {}
     for rec in records:
         if rec.state != STATE_DONE:
             continue
         params = rec.params or {}
+        if rec.operation == "batch":
+            for sub_i, sub_op, sub in _batch_sync_ops(rec):
+                if sub_op == "move":
+                    continue  # the fold handler owns move sub-ops
+                props = sub.get("obj_properties") or {}
+                claims = {
+                    k: k for k, v in props.items() if isinstance(v, (int, float, str, bool))
+                }
+                name = str(sub.get("obj_name") or "")
+                if not name:
+                    continue
+                entry = tracked.setdefault(
+                    name, {"props": {}, "sheet": None, "sketch": None, "move": None}
+                )
+                for prop, key in claims.items():
+                    entry["props"][prop] = (rec.index, key, sub_i)
+                if sub_op == "create_object" and name not in last_move:
+                    entry["props"]["Placement"] = (rec.index, "Placement", sub_i)
+            continue
         props = params.get("obj_properties") or {}
         op = rec.operation
         if op in ("create_object", "edit_object"):
@@ -652,9 +749,9 @@ def tracked_objects(records: list[StepRecord]) -> dict[str, dict[str, Any]]:
                 name, {"props": {}, "sheet": None, "sketch": None, "move": None}
             )
             for prop, key in claims.items():
-                entry["props"][prop] = (rec.index, key)
+                entry["props"][prop] = (rec.index, key, None)
             if op in ("create_object", "edit_object") and name not in last_move:
-                entry["props"]["Placement"] = (rec.index, "Placement")
+                entry["props"]["Placement"] = (rec.index, "Placement", None)
             # The sheet/sketch handlers belong to the object the step NAMES —
             # the diff can also hold incidental creations (a sketch's Body),
             # which must not answer constraint/cell lookups.
@@ -664,9 +761,9 @@ def tracked_objects(records: list[StepRecord]) -> dict[str, dict[str, Any]]:
                 elif op == "sketch":
                     entry["sketch"] = rec.index
 
-    for name, idx in last_move.items():
+    for name, (idx, sub) in last_move.items():
         entry = tracked.setdefault(name, {"props": {}, "sheet": None, "sketch": None, "move": None})
-        entry["move"] = idx
+        entry["move"] = (idx, sub)
         entry["props"].pop("Placement", None)
     return tracked
 

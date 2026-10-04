@@ -96,6 +96,26 @@ def _undo_names(doc) -> list[str]:
         return []
 
 
+def _stack_holds_journal(doc, records: list[sj.StepRecord], upto_index: int, undo_count: int) -> bool:
+    """Can the native undo be trusted to revert exactly these steps?
+
+    The undo stack is shared with the GUI, and it does not survive a reopen:
+    after one it holds NOTHING of the journal, while manual edits interleave on
+    it in every session. Popping blind then undoes the WRONG transactions — and
+    for a step that only changed properties no object moves, so the object-set
+    verification in ``_rollback`` cannot tell. The stack's own names are the
+    check: the entries about to be popped must be exactly the journal's
+    transactions for these steps, most recent first (UndoNames[0] is the next
+    entry undo() would take). Same-named entries are indistinguishable — every
+    execute_code step commits as "CADPilot: execute_code" — but any foreign
+    name in the way (or a too-short stack) downgrades to the rebuild path.
+    """
+    if undo_count <= 0:
+        return True
+    expected = [r.transaction for r in reversed(records) if r.index > upto_index and r.transaction]
+    return _undo_names(doc)[:undo_count] == expected[:undo_count]
+
+
 def _object_names(doc) -> list[str]:
     try:
         return sorted(o.Name for o in doc.Objects)
@@ -205,9 +225,13 @@ def record_commit(
     """
     try:
         records = read_journal(doc)
-        # A new commit invalidates the not-yet-executed tail: it was planned
-        # against a document state that no longer exists.
-        del records[sj.planned_tail_start(records) :]
+        # A new commit invalidates the not-yet-executed plan: it was authored
+        # against a document state that no longer exists. The plan is not
+        # necessarily a trailing run (inspections append behind it, a snapshot
+        # marker may sit there too), so the removal keys on STATE, not
+        # position — slicing from planned_tail_start would remove nothing and
+        # a stale plan would survive the commit.
+        sj.drop_planned(records)
         rec = sj.StepRecord(
             index=len(records) + 1,
             state=sj.STATE_DONE,
@@ -297,19 +321,19 @@ def append_execute_code(
         after = _object_names(doc)
         # A read-only execute_code — inspecting the model, the common case —
         # must NOT destroy a pending plan; only a call that actually moved the
-        # object set invalidates the tail (see sj.invalidates_plan).
+        # object set invalidates it (see sj.invalidates_plan).
         if sj.invalidates_plan(records, after):
-            del records[sj.planned_tail_start(records) :]
-        # A read-only inspection (the common case) is INSERTED BEFORE the
-        # planned tail, never appended after it. Appending left a `done` record
-        # behind the pending plan, and the plan cursor walks from the first
-        # planned step — so `run_next`/`run_to` kept reporting "nothing to run"
-        # even though planned steps were waiting.
-        tail_at = sj.planned_tail_start(records)
-        records.insert(
-            tail_at,
+            sj.drop_planned(records)
+        # The inspection is APPENDED at the very end, even behind a pending
+        # plan. Inserting it before the tail shifted every planned step's
+        # index, so an MCP client that read "pocket = step 11" and then called
+        # reexecute(11) hit the inspection instead (live: JTest). A done
+        # record behind the plan is harmless — the plan cursor walks by STATE
+        # and run_to's upto check is cursor-based — while stable indices are
+        # what index-addressed verbs (run_to/reexecute/rollback_to) run on.
+        records.append(
             sj.StepRecord(
-                index=tail_at + 1,
+                index=len(records) + 1,
                 state=sj.STATE_DONE,
                 operation="execute_code",
                 # A step row should say what the snippet DID — its first line is
@@ -326,7 +350,7 @@ def append_execute_code(
                 objects_before=list(objects_before or []),
                 objects_after=after,
                 timestamp=sj.stamp(),
-            ),
+            )
         )
         write_journal(doc, records)  # reindexes: list position == step number
     except Exception as e:
@@ -380,6 +404,37 @@ def _normalize(res) -> dict[str, Any]:
     if isinstance(res, dict):
         return res
     return {"success": False, "error": str(res)}
+
+
+def _replay_ready_code(doc, code: str) -> str:
+    """Point a recorded snippet's document references at this document.
+
+    The journal rides ON the document, but its snippets capture the document
+    NAME they were written against. Save the file under a new name (or move it)
+    and reopening hands FreeCAD a document named after the FILE — every re-run
+    then dies with "Unknown document" before touching a shape, which silently
+    broke rollback's rebuild path (live: DeskFan.FCStd, ex-MideaDeskFan, where
+    every rebuild step failed on the rename). A reference that no longer
+    resolves to an open document is rewritten to the host; one that DOES
+    resolve is left alone, because the snippet may genuinely mean that other
+    document.
+    """
+    if "getDocument" not in code:
+        return code
+    open_names = set(FreeCAD.listDocuments())
+    stale = {
+        name: doc.Name
+        for name in sj.document_refs(code)
+        if name != doc.Name and name not in open_names
+    }
+    if not stale:
+        return code
+    logger.warning(
+        "journal replay: getDocument(%s) no longer resolves; rewrote to %r",
+        ", ".join(repr(n) for n in sorted(stale)),
+        doc.Name,
+    )
+    return sj.rewrite_document_refs(code, stale)
 
 
 def _execute_one(doc, operation: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -480,6 +535,7 @@ def _execute_one(doc, operation: str, params: dict[str, Any]) -> dict[str, Any]:
         code = str(params.get("code") or "")
         if not code:
             return {"success": False, "error": "execute_code step has no recorded code"}
+        code = _replay_ready_code(doc, code)
         from rpc_server import rpc_server as _rs
 
         try:
@@ -643,7 +699,7 @@ def _apply_op(doc, spec: dict[str, Any]) -> dict[str, Any]:
         write_journal(doc, records, meta)
         return {"success": True, "planned": len(added), "count": len(records)}
     if operation == "clear_plan":
-        del records[sj.planned_tail_start(records) :]
+        sj.drop_planned(records)
         write_journal(doc, records)
         return {"success": True, "count": len(records)}
     if operation == "run_next":
@@ -757,12 +813,16 @@ def _run_steps(doc, records, limit: int | None, upto: int | None) -> dict[str, A
     executed: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     while True:
-        if upto is not None and sj.done_count(records) >= upto:
-            break
-        if limit is not None and len(executed) >= limit:
-            break
         rec = sj.next_planned(records)
         if rec is None:
+            break
+        # The cursor decides the upto bound, never a done-count: done records
+        # may legitimately sit BEHIND the plan (appended inspections, a
+        # snapshot marker), and a done_count >= upto comparison then broke
+        # early with planned steps still waiting.
+        if upto is not None and rec.index > upto:
+            break
+        if limit is not None and len(executed) >= limit:
             break
         if not rec.executable:
             # execute_code & co. own no transaction and cannot be re-run, and a
@@ -920,7 +980,8 @@ def _rollback(doc, records, to_index: int, force: bool) -> dict[str, Any]:
                 "pass force=true to roll back across them"
             ),
         }
-    res = undo_n(doc, plan["undo_count"])
+    trust_undo = _stack_holds_journal(doc, records, to_index, plan["undo_count"])
+    res = undo_n(doc, plan["undo_count"] if trust_undo else 0)
     # doc.undo() does NOT rewind the journal — the property is document-level and
     # FreeCAD only tracks undo for objects. This reconciliation is what makes
     # the log match the model again, so it runs on every rollback, not just as a
@@ -944,7 +1005,12 @@ def _rollback(doc, records, to_index: int, force: bool) -> dict[str, Any]:
     stranded = sj.steps_without_undo(records, to_index)
 
     triggers: list[str] = []
-    if res["count"] < plan["undo_count"]:
+    if not trust_undo:
+        triggers.append(
+            "the undo stack does not hold the journal's transactions for these steps "
+            "(the document was reopened, or edited outside the journal)"
+        )
+    elif res["count"] < plan["undo_count"]:
         triggers.append(
             f"the undo stack held only {res['count']}/{plan['undo_count']} of the "
             "journal's transactions"
@@ -1050,9 +1116,15 @@ def _reject(doc, records, index: int, force: bool, reason: str) -> dict[str, Any
                 f"{sj.blocking_text(records, plan['blocking'])}; pass force=true"
             ),
         }
-    res = undo_n(doc, plan["undo_count"])
+    trust_undo = _stack_holds_journal(doc, records, index - 1, plan["undo_count"])
+    res = undo_n(doc, plan["undo_count"] if trust_undo else 0)
     records = read_journal(doc)
     warnings: list[str] = []
+    if not trust_undo:
+        warnings.append(
+            "the undo stack does not hold the journal's transactions for these steps "
+            "(the document was reopened, or edited outside the journal)"
+        )
     # The same undo-stack problems as rollback: a rejected step with no undo
     # entry leaves its objects behind, and a manual edit interleaved on the
     # stack pops under this reject's name. The records are about to be DROPPED,
@@ -1077,7 +1149,7 @@ def _reject(doc, records, index: int, force: bool, reason: str) -> dict[str, Any
             f"object(s) {gone} that the kept steps created are missing (off-journal "
             "edits on the undo stack?); replay the journal to rebuild them"
         )
-    if res["count"] < plan["undo_count"]:
+    if trust_undo and res["count"] < plan["undo_count"]:
         warnings.append(
             f"only {res['count']}/{plan['undo_count']} transactions could be undone "
             "(the FreeCAD undo stack was shorter than the journal)"
@@ -1130,20 +1202,26 @@ def _reexecute(
                 f"{plan['accepted']}; pass force=true"
             ),
         }
-    res = undo_n(doc, plan["undo_count"])
+    trust_undo = _stack_holds_journal(doc, records, index - 1, plan["undo_count"])
+    res = undo_n(doc, plan["undo_count"] if trust_undo else 0)
     records = read_journal(doc)
     # Re-running a step is only sound on a clean base: if the undo came up
-    # short or popped the wrong transactions (off-journal edits on the stack),
-    # re-running would duplicate objects under deduplicated names instead of
-    # failing. Verify the object sets first and point at rollback_to, which
-    # can rebuild, instead.
+    # short, popped the wrong transactions (off-journal edits on the stack), or
+    # was skipped as untrustworthy, re-running would duplicate objects under
+    # deduplicated names instead of failing. Verify the stack and object sets
+    # first and point at rollback_to, which can rebuild, instead.
     if res["count"] < plan["undo_count"]:
+        why = (
+            "the undo stack does not match the journal (reopened document or "
+            "off-journal edits)"
+            if not trust_undo
+            else "the undo stack is shorter than the journal"
+        )
         return {
             "success": False,
             "error": (
                 f"only {res['count']}/{plan['undo_count']} transactions could be undone "
-                "(the undo stack is shorter than the journal); run rollback_to first, "
-                "it can rebuild the model"
+                f"({why}); run rollback_to first, it can rebuild the model"
             ),
         }
     present = set(_object_names(doc))
@@ -1294,6 +1372,20 @@ def _placement_brief(d) -> str:
     return f"pos({pos}) rot {_num(rot.get('Angle', 0))}deg@({ax})"
 
 
+def _sync_props_target(rec: sj.StepRecord, sub: int | None) -> dict[str, Any] | None:
+    """The obj_properties dict a manual-edit sync write lands in.
+
+    ``sub`` routes the write into a batch record's sub-op (tracked_objects
+    claims create/edit/move sub-ops); None is a top-level step.
+    """
+    if sub is None:
+        return rec.params.setdefault("obj_properties", {})
+    ops = (rec.params or {}).get("ops") or []
+    if isinstance(sub, int) and 0 <= sub < len(ops) and isinstance(ops[sub], dict):
+        return ops[sub].setdefault("obj_properties", {})
+    return None
+
+
 class _JournalSyncObserver:
     def __init__(self):
         self._cache: dict[str, tuple[str, dict]] = {}
@@ -1336,7 +1428,7 @@ class _JournalSyncObserver:
         if hit is None:
             # A move-owned object's pose belongs to its LAST move step.
             if prop == "Placement" and entry.get("move") is not None:
-                self._sync_move_fold(obj, doc, sj.from_json(text), entry["move"])
+                self._sync_move_fold(obj, doc, sj.from_json(text), *entry["move"])
             return
         records = sj.from_json(text)
         rec = next((r for r in records if r.index == hit[0]), None)
@@ -1377,7 +1469,9 @@ class _JournalSyncObserver:
                 if value is None:
                     return
             same, brief = _same_scalar, repr
-        props = rec.params.setdefault("obj_properties", {})
+        props = _sync_props_target(rec, hit[2])
+        if props is None:
+            return
         current = props.get(hit[1])
         if same(current, value):
             return
@@ -1462,22 +1556,34 @@ class _JournalSyncObserver:
             doc, records, index, f"{obj.Name}.Constraints", "-", f"{len(updates)} value(s)"
         )
 
-    def _sync_move_fold(self, obj, doc, records, index: int) -> None:
+    def _sync_move_fold(self, obj, doc, records, index: int, sub: int | None) -> None:
         """Fold a manual drag of a move-owned object into its last move step.
 
         A move is RELATIVE, so the drag cannot be expressed against it — the
-        step's obj_properties become an absolute placement override instead
+        owning obj_properties become an absolute placement override instead
         (the builder's placement wins over translate/rotate on re-run), which
         reproduces the current pose no matter what came before the move.
+        ``sub`` routes the fold into a batch record's move sub-op.
         """
         rec = next((r for r in records if r.index == index), None)
-        if rec is None or rec.operation != "move":
+        if rec is None:
             return
+        if sub is None:
+            if rec.operation != "move":
+                return
+            parent = rec.params
+        else:
+            ops = (rec.params or {}).get("ops") or []
+            if not (isinstance(sub, int) and 0 <= sub < len(ops) and isinstance(ops[sub], dict)):
+                return
+            if sj.sub_operation(ops[sub]) != "move":
+                return
+            parent = ops[sub]
         value = _placement_json(obj.Placement)
-        current = (rec.params.get("obj_properties") or {}).get("placement")
+        current = (parent.get("obj_properties") or {}).get("placement")
         if _same_placement(current, value):
             return
-        rec.params["obj_properties"] = {"placement": value}
+        parent["obj_properties"] = {"placement": value}
         self._commit_sync(
             doc,
             records,
