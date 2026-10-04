@@ -9,7 +9,17 @@ import os
 
 import pytest
 
+from cadpilot.operations import core as operations_core
 from cadpilot.session_state import set_current_session
+
+
+@pytest.fixture(autouse=True)
+def _reset_home_document():
+    """The per-process home document is module state; never leak it between
+    tests or an earlier cad() call would bind a later unbound execute_code."""
+    operations_core.reset_last_doc_name()
+    yield
+    operations_core.reset_last_doc_name()
 
 
 @pytest.fixture(autouse=True, scope="session")

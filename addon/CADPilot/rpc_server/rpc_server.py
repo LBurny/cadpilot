@@ -1170,8 +1170,16 @@ class FreeCADRPC:
         tmp_path = _make_tmp_png()
 
         def task():
+            # Probe the SAME view the capture will use: the bound document's
+            # own view when doc_name is given — a concurrent agent's foreground
+            # tab may be a Spreadsheet/TechDraw, which must not fail OUR
+            # capture — the foreground view otherwise.
             try:
-                active_view = FreeCADGui.ActiveDocument.ActiveView
+                if doc_name:
+                    gdoc = FreeCADGui.getDocument(doc_name)
+                    active_view = gdoc.activeView() if gdoc is not None else None
+                else:
+                    active_view = FreeCADGui.ActiveDocument.ActiveView
             except Exception:
                 return False
             if active_view is None or not hasattr(active_view, "saveImage"):

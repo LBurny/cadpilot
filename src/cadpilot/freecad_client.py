@@ -68,17 +68,35 @@ class FreeCADConnection:
             self.server = self._make_proxy(self._timeout)
             return getattr(self.server, method)(*args)
 
-    def _invoke_with_screenshot(self, method: str, *args, screenshot: dict[str, Any] | None):
+    def _invoke_with_screenshot(
+        self,
+        method: str,
+        *args,
+        screenshot: dict[str, Any] | None,
+        doc_name: str | None = None,
+    ):
         """Call a mutation RPC with an inline screenshot request.
 
+        ``doc_name`` is appended AFTER the screenshot slot, because XML-RPC is
+        positional and the addon's signature is
+        ``execute_code(code, screenshot=None, doc_name=None)`` — sending it in
+        the screenshot slot binds nothing.
+
         Falls back to the legacy two-call path (op + get_active_screenshot)
-        when the addon predates the screenshot parameter, so a new MCP server
-        keeps working against an old addon install.
+        when the addon predates the screenshot or doc_name parameter, so a new
+        MCP server keeps working against an old addon install.
         """
-        if screenshot is None:
+        if screenshot is None and doc_name is None:
             return self._invoke(method, *args)
+        if doc_name is None:
+            tail: tuple = (screenshot,)
+        elif screenshot is None:
+            # Placeholder for the screenshot slot: doc_name is positional.
+            tail = (None, doc_name)
+        else:
+            tail = (screenshot, doc_name)
         try:
-            return self._invoke(method, *args, screenshot)
+            return self._invoke(method, *args, *tail)
         except xmlrpc.client.Fault as e:
             if "TypeError" not in str(e):
                 raise
@@ -86,7 +104,7 @@ class FreeCADConnection:
                 f"Addon does not support inline screenshots for '{method}'; using legacy path"
             )
             res = self._invoke(method, *args)
-            if isinstance(res, dict) and res.get("success"):
+            if screenshot is not None and isinstance(res, dict) and res.get("success"):
                 shot = self.get_active_screenshot(
                     screenshot.get("view_name", "Isometric"),
                     screenshot.get("width"),
@@ -161,11 +179,10 @@ class FreeCADConnection:
         screenshot: dict[str, Any] | None = None,
         doc_name: str | None = None,
     ) -> dict[str, Any]:
-        # XML-RPC is positional: only send doc_name when set, so an addon that
-        # predates the parameter still accepts the two-argument call (and, via
-        # the TypeError fallback below, degrades to active-document behavior).
-        if doc_name is None:
-            return self._invoke_with_screenshot("execute_code", code, screenshot=screenshot)
+        # XML-RPC is positional: the helper appends doc_name (after the
+        # screenshot slot) only when set, so an addon that predates the
+        # parameter still accepts the call and degrades to active-document
+        # behavior instead of faulting.
         return self._invoke_with_screenshot(
             "execute_code", code, screenshot=screenshot, doc_name=doc_name
         )
@@ -330,9 +347,19 @@ class FreeCADConnection:
                 return self._invoke(
                     "get_active_screenshot", view_name, width, height, focus_object
                 )
-            return self._invoke(
-                "get_active_screenshot", view_name, width, height, focus_object, doc_name
-            )
+            try:
+                return self._invoke(
+                    "get_active_screenshot", view_name, width, height, focus_object, doc_name
+                )
+            except xmlrpc.client.Fault as e:
+                # Old addon without doc_name: a screenshot of the foreground
+                # view beats no screenshot at all.
+                if "TypeError" not in str(e):
+                    raise
+                logger.info("Addon does not support bound screenshots; using the active view")
+                return self._invoke(
+                    "get_active_screenshot", view_name, width, height, focus_object
+                )
         except Exception as e:
             logger.error(f"Error getting screenshot: {e}")
             return None

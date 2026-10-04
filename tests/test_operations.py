@@ -419,8 +419,10 @@ def test_execute_code_passes_explicit_doc_name(fake_freecad):
 
 def test_execute_code_binds_active_session_document_automatically(fake_freecad):
     """The session flow must not have to remember doc_name: an active session
-    binds its document. Without a session the argument stays None (legacy
-    active-document behavior), and an explicit doc_name wins over the session."""
+    binds its document. An explicit doc_name wins over the session, and a
+    process that has touched nothing keeps the legacy None (active-document)
+    behavior."""
+    from cadpilot.operations.core import reset_last_doc_name
     from cadpilot.session_state import new_session, set_current_session
 
     sess = new_session("bind test", "SessDoc")
@@ -433,8 +435,48 @@ def test_execute_code_binds_active_session_document_automatically(fake_freecad):
         (_m, _a, kw) = [c for c in fake_freecad.calls if c[0] == "execute_code"][-1]
         assert kw.get("doc_name") == "Explicit"
         set_current_session(None)
+        reset_last_doc_name()  # the explicit call above became the home document
         execute_code_operation(fake_freecad, False, "print(1)")
         (_m, _a, kw) = [c for c in fake_freecad.calls if c[0] == "execute_code"][-1]
         assert kw.get("doc_name") is None
     finally:
         set_current_session(None)
+
+
+def test_execute_code_falls_back_to_home_document(fake_freecad):
+    """The home document closes the mixing hole for agents that pass neither
+    doc_name nor a session: create_document marks it, and a later unbound
+    execute_code binds there instead of the global active document."""
+    create_document_operation(fake_freecad, "DocA")
+    execute_code_operation(fake_freecad, False, "print(1)")
+    (_m, _a, kw) = [c for c in fake_freecad.calls if c[0] == "execute_code"][-1]
+    assert kw.get("doc_name") == "DocA"
+
+
+def test_execute_code_home_document_follows_last_named_mutation(fake_freecad):
+    """cad() names its document explicitly, so it moves the home document;
+    an explicit execute_code doc_name still wins over it."""
+    create_document_operation(fake_freecad, "DocA")
+    cad_operation(
+        fake_freecad,
+        False,
+        "create_object",
+        "DocB",
+        obj_type="Part::Box",
+        obj_name="Box",
+    )
+    execute_code_operation(fake_freecad, False, "print(1)")
+    (_m, _a, kw) = [c for c in fake_freecad.calls if c[0] == "execute_code"][-1]
+    assert kw.get("doc_name") == "DocB"
+    execute_code_operation(fake_freecad, False, "print(1)", doc_name="DocC")
+    (_m, _a, kw) = [c for c in fake_freecad.calls if c[0] == "execute_code"][-1]
+    assert kw.get("doc_name") == "DocC"
+
+
+def test_execute_code_home_binding_is_disclosed_in_the_reply(fake_freecad):
+    """A home-bound run must say which document absorbed it, so the model can
+    catch a wrong binding from the reply alone."""
+    create_document_operation(fake_freecad, "DocA")
+    resp = execute_code_operation(fake_freecad, False, "print(1)")
+    assert "DocA" in resp[0].text
+    assert "doc_name" in resp[0].text

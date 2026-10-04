@@ -50,6 +50,30 @@ def _normalize_object_names(objects: Any) -> list[str]:
     return sorted(names)
 
 
+# Per-process home document: the document THIS server process last created or
+# explicitly mutated. Every MCP client spawns its own server process, so two
+# concurrent agents each keep their own. An execute_code that names no document
+# and has no active session binds here instead of FreeCAD's global active
+# document, which under two agents is whichever document the OTHER agent's
+# call left active (the "steps pile into each other's journals" bug).
+_last_doc_name: str | None = None
+
+
+def get_last_doc_name() -> str | None:
+    return _last_doc_name
+
+
+def reset_last_doc_name() -> None:
+    global _last_doc_name
+    _last_doc_name = None
+
+
+def _set_last_doc(doc_name: str | None) -> None:
+    global _last_doc_name
+    if doc_name:
+        _last_doc_name = doc_name
+
+
 def create_document_operation(
     freecad: FreeCADConnection,
     name: str,
@@ -60,6 +84,7 @@ def create_document_operation(
         shot = _shot_params(with_screenshot)
         res = freecad.create_document(name, screenshot=shot)
         if res["success"]:
+            _set_last_doc(res["document_name"])
             response = text_response(f"Document '{res['document_name']}' created successfully")
             return add_screenshot_if_available(
                 response, res.get("screenshot"), not with_screenshot, screenshot_mode
@@ -159,15 +184,30 @@ def execute_code_operation(
     # Bind the run to ONE document up front: under two concurrent agents the
     # active document is whichever the OTHER agent's call left active, so an
     # unbound run opens its transaction and files its journal step there. An
-    # active session binds automatically (the modeling flow never has to pass
-    # anything); an explicit doc_name wins over the session.
+    # explicit doc_name wins; then an active session binds automatically (the
+    # modeling flow never has to pass anything); then this process's home
+    # document (what it last created or mutated) — each agent runs its own
+    # server process, so two agents stick to their own document even when
+    # neither passes anything. Only a fresh process that touched nothing
+    # still falls through to the global active document.
     sess = get_current_session()
     if doc_name is None and sess is not None and sess.status == "active":
         doc_name = sess.doc_name
+    home_bound = False
+    if doc_name is None and _last_doc_name is not None:
+        doc_name = _last_doc_name
+        home_bound = True
+    bind_note = (
+        f" (no doc_name given: bound to '{doc_name}', the document this server "
+        "last created or mutated — pass doc_name to target another document)"
+        if home_bound
+        else ""
+    )
     try:
         res = freecad.execute_code(
             code, screenshot=_shot_params(with_screenshot), doc_name=doc_name
         )
+        _set_last_doc(doc_name)
         if res["success"]:
             # The addon wraps the snippet in a FreeCAD transaction; ``changed``
             # says whether it produced an undo entry. A mutating snippet is an
@@ -230,11 +270,13 @@ def execute_code_operation(
                     + " — that change happened outside this document's transaction, so it is "
                     "not part of any session step (it owns its own undo entry on that document)"
                 )
-            response = text_response(f"Code executed successfully: {res['message']}{step_note}")
+            response = text_response(
+                f"Code executed successfully: {res['message']}{step_note}{bind_note}"
+            )
             return add_screenshot_if_available(
                 response, res.get("screenshot"), not with_screenshot, screenshot_mode
             )
-        return text_response(f"Failed to execute code: {res['error']}")
+        return text_response(f"Failed to execute code: {res['error']}{bind_note}")
     except Exception as e:
         logger.error(f"Failed to execute code: {e!s}")
         return text_response(f"Failed to execute code: {e!s}")
@@ -538,6 +580,7 @@ def cad_operation(
     the addon commits whenever at least one op succeeded, and the step log
     must stay in sync with the undo stack.
     """
+    _set_last_doc(doc_name)
     shot = _shot_params(with_screenshot)
     batch_succeeded = 0
     try:
@@ -691,6 +734,7 @@ def session_start_operation(
         logger.warning(f"session_start: could not read the document's objects: {e!s}")
     sess = new_session(name or f"Modeling {doc_name}", doc_name, initial_objects=initial)
     set_current_session(sess)
+    _set_last_doc(doc_name)
     save_session(sess)
     return json_response(
         {
@@ -968,6 +1012,7 @@ def step_plan_operation(
     description: str = "",
 ) -> ToolResponse:
     """Submit a plan to the addon's step journal WITHOUT executing it."""
+    _set_last_doc(doc_name)
     if not isinstance(steps, list) or not steps:
         return text_response("step_plan requires a non-empty steps list")
     for i, step in enumerate(steps, start=1):
@@ -1010,6 +1055,7 @@ def step_control_operation(
     confirm: bool = False,
 ) -> ToolResponse:
     """Drive the step journal: run, roll back, or re-run recorded steps."""
+    _set_last_doc(doc_name)
     if action not in _STEP_ACTIONS:
         return text_response(f"unknown action '{action}'. Supported: {', '.join(_STEP_ACTIONS)}")
     spec: dict[str, Any] = {
@@ -1111,6 +1157,7 @@ def session_resume_operation(freecad: FreeCADConnection, session_id: str) -> Too
         )
     sess.status = "active"
     set_current_session(sess)
+    _set_last_doc(sess.doc_name)
     save_session(sess)
     warning = ""
     try:
@@ -1317,6 +1364,7 @@ def align_shapes_operation(
     mode: str = "touch",
     offset: float = 0.0,
 ) -> ToolResponse:
+    _set_last_doc(doc_name)
     try:
         res = freecad.align_shapes(
             doc_name,
@@ -1379,6 +1427,7 @@ def set_anchors_operation(
 ) -> ToolResponse:
     if not anchors:
         return text_response("set_anchors requires a non-empty anchors dict")
+    _set_last_doc(doc_name)
     try:
         res = freecad.set_anchors(
             doc_name,
@@ -1423,6 +1472,7 @@ def assemble_operation(
 ) -> ToolResponse:
     if not mates:
         return text_response("assemble requires a non-empty mates list")
+    _set_last_doc(doc_name)
     try:
         res = freecad.assemble(
             doc_name,

@@ -23,10 +23,14 @@ state-bound calls their document explicitly:
 
 - execute_code: pass doc_name. It binds the wrapper transaction, the step
   journal entry AND App.ActiveDocument (so App.ActiveDocument inside the
-  snippet resolves to the declared document). Without it all three land on
-  whichever document the OTHER agent's call left active, and steps mix into
-  each other's journals. An active session binds its own document
-  automatically, so the session flow needs no extra argument.
+  snippet resolves to the declared document). Without it, all three used to
+  land on whichever document the OTHER agent's call left active, mixing
+  steps into each other's journals. Two automatic bindings now close that:
+  an active session binds its own document, and with no session the run
+  binds to the document THIS server process last created or mutated (each
+  agent drives its own MCP server process, so the two stick to their own
+  document). A fallback binding is disclosed in the reply; pass doc_name
+  whenever the target differs.
 - get_view: pass doc_name. The default frames the foreground tab, which the
   other agent may have switched, so the screenshot shows the wrong model.
 - cad / get_objects / get_object / measure_geometry / get_topology /

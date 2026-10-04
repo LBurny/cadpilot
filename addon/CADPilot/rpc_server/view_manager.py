@@ -117,13 +117,17 @@ def save_active_screenshot(
     legacy GUI-handler return contract).
     """
     try:
-        doc = FreeCAD.getDocument(doc_name) if doc_name else FreeCAD.ActiveDocument
         if doc_name:
+            doc = FreeCAD.getDocument(doc_name)
             gdoc = FreeCADGui.getDocument(doc_name)
             view = gdoc.activeView()
         else:
-            gdoc = None
-            view = FreeCADGui.ActiveDocument.ActiveView
+            # The focus lookup must search the document the captured VIEW
+            # shows (the GUI foreground), not App.ActiveDocument: bound calls
+            # keep flipping the latter under a concurrent agent.
+            gdoc = FreeCADGui.ActiveDocument
+            view = gdoc.ActiveView
+            doc = gdoc.Document
         if not hasattr(view, "saveImage"):
             return "Current view does not support screenshots"
 
