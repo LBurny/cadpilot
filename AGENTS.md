@@ -169,7 +169,7 @@ During development you can reload the addon **without restarting FreeCAD**:
 
 ## Architecture & Key Constraints
 
-- **GUI thread rule**: All FreeCAD document/GUI operations MUST run on FreeCAD's main (GUI) thread. The addon uses `dispatch_to_gui()` to queue lambdas and a `QTimer` waker to process them. Never call FreeCAD APIs directly from the RPC server thread.
+- **GUI thread rule**: All FreeCAD document/GUI operations MUST run on FreeCAD's main (GUI) thread. The addon uses `dispatch_to_gui()` to queue lambdas and a `QTimer` waker to process them. Never call FreeCAD APIs directly from the RPC server thread. User interaction has priority over queued RPC work (`gui_dispatch.py`): on win32 the physical button state (`GetAsyncKeyState`) is authoritative in BOTH directions — Qt's `mouseButtons()` is event-delivered and therefore stale exactly while the event loop is busy, so trusting it alone misses fresh presses and lets tasks start mid-drag (the "frozen while the LLM models" bug); the drain loop also re-checks the mouse/popup/modal guards between tasks so a mid-drain press pauses the backlog, and the phantom caps (static 10s / hold 15s, time-based) exist only for the non-win32 heuristic path — never cap an OS-confirmed real hold.
 - **Two-process model**: The MCP server and FreeCAD run in separate processes. They communicate exclusively via XML-RPC on port 9875. The MCP server never imports FreeCAD.
 - **MCP version compatibility**: `server.py` imports `FastMCP` from `mcp.server.fastmcp` (1.x) with a fallback to `MCPServer` from `mcp.server.mcpserver` (2.x). Keep both paths working.
 - **Timeouts**: Default XML-RPC transport timeout is 150s. `execute_code` has a 90s GUI-thread timeout; use `execute_code_async` for longer operations.

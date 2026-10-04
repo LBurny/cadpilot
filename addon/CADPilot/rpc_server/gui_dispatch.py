@@ -15,10 +15,16 @@ Robustness and performance guarantees:
    waiting for the next 500 ms heartbeat tick. The 500 ms heartbeat is kept
    only as a fallback.
 3. Mouse-button guard: ``process_gui_tasks`` skips the current tick while
-   mouse buttons are held so MCP tasks cannot interrupt 3D navigation drags.
-   Phantom/stuck button states are filtered out by three independent checks
-   (OS physical button state, static-tick cap, hold-duration cap) so they
-   can never starve the queue — see ``_user_holding_button``.
+   mouse buttons are held so MCP tasks cannot interrupt 3D navigation drags,
+   and re-checks the guard BETWEEN queued tasks so a press that begins
+   mid-drain pauses the queue instead of starving user input for the whole
+   backlog. On Windows the OS physical button state (GetAsyncKeyState) is
+   authoritative in both directions — Qt's mouseButtons() is only refreshed
+   when the event loop delivers button events, which is stale exactly while
+   the queue is busy, so consulting it alone misses fresh presses and late
+   releases (the race that let tasks punch through mid-drag). Off Windows,
+   phantom/stuck states are filtered by a static-state time cap and a
+   hold-duration cap — see ``_user_holding_button``.
 4. Clean shutdown: the ``_SHUTDOWN`` sentinel sets a flag that suppresses the
    ``finally`` reschedule, so ``stop_rpc_server`` actually stops the loop.
 5. Exception isolation: exceptions inside a task are caught, logged, and
@@ -44,28 +50,28 @@ _SHUTDOWN = object()
 _processing = False  # re-entrancy guard: True while process_gui_tasks is draining
 _processing_since: float = 0.0  # wall-clock time when _processing became True
 
-# Phantom-input detection for the mouse-button guard. A stuck mouseButtons()
-# state (e.g. after a background launch or RDP session) is *static*: same
-# buttons and same cursor position on every tick. Real drags always move the
-# cursor or change buttons. The guard defers at most this many consecutive
-# identical ticks (~500 ms apart), then treats the held button as phantom
-# and processes the queue anyway — so a phantom state can never starve RPC,
-# even while the FreeCAD window is active.
-_PHANTOM_TICK_LIMIT = 20  # 20 x 500 ms = 10 s of motionless button-hold
+# Phantom-input detection for the mouse-button guard — only needed where the
+# OS cannot report the physical button state (i.e. off Windows; on win32 the
+# ground truth makes phantoms impossible to mistake, see _user_holding_button).
+# A stuck mouseButtons() state (e.g. after a background launch or RDP session)
+# is *static*: same buttons and same cursor position for a long stretch. Real
+# drags always move the cursor or change buttons. The guard treats a state
+# that has been identical for this many seconds as phantom and processes the
+# queue anyway. Measured in TIME, not ticks: the guard is also evaluated
+# between queued tasks now, so evaluations are no longer ~500 ms apart.
+_PHANTOM_STATIC_SECONDS = 10.0
 _last_held_state: "tuple | None" = None
-_held_static_ticks = 0
+_held_static_since: "float | None" = None
 
-# The static-tick cap alone is NOT enough: a phantom stuck button PLUS a
-# live cursor (the user keeps moving the mouse over the active window —
-# normal while inspecting a model between run steps) resets the counter on
-# every tick, so the queue defers forever (the recurring wedge). Two extra
-# bounds make the wedge impossible:
-#  1. win32 physical ground truth: GetAsyncKeyState says whether the button
-#     is REALLY down. Qt stuck + OS up = phantom, never defer.
-#  2. Hold-duration cap: the same nonzero mask held continuously longer
-#     than this is phantom even with a moving cursor (a real drag never
-#     holds that long; if one ever does, the consequence is merely that a
-#     queued task runs during the hold — pre-guard behavior).
+# The static cap alone is NOT enough: a phantom stuck button PLUS a live
+# cursor (the user keeps moving the mouse over the active window — normal
+# while inspecting a model between run steps) resets the static timer on
+# every evaluation, so the queue would defer forever (the recurring wedge).
+# The hold-duration cap bounds that: the same nonzero mask held continuously
+# longer than this is treated as phantom even with a moving cursor. Both caps
+# are heuristic-path only — on win32 the OS says whether the button is REALLY
+# down, and a real hold must never be capped: punching a task through a long
+# inspection drag at the 15 s mark is precisely the freeze users feel.
 _PHANTOM_HOLD_SECONDS = 15.0
 _held_mask: "int | None" = None
 _held_since: float = 0.0
@@ -149,51 +155,66 @@ def _physical_buttons_down() -> "int | None":
         return None
 
 
+def _reset_hold_trackers() -> None:
+    """Forget all held-button tracking state (heuristic path bookkeeping)."""
+    global _last_held_state, _held_static_since, _held_mask
+    _last_held_state = None
+    _held_static_since = None
+    _held_mask = None
+
+
 def _user_holding_button() -> bool:
     """True while a real user is holding a mouse button in the active window.
 
-    Phantom/stuck states are filtered by three independent checks: physical
-    OS state (win32), the static-state tick cap, and the hold-duration cap.
-    A real drag inside FreeCAD moves the cursor or changes buttons and the
-    OS confirms the hold — only then do RPC tasks wait.
+    On Windows the OS physical state is authoritative in BOTH directions.
+    Qt's mouseButtons() is only updated when the event loop delivers button
+    events, so it is stale exactly while the queue is busy: a fresh press is
+    invisible until the running task finishes (tasks used to start mid-drag)
+    and a release is invisible too (defers outlasted the drag). Consulting
+    GetAsyncKeyState only to REJECT phantom holds — the old design — fixed
+    the starvation direction but left the interrupt-the-user direction racy.
+    A nonzero physical mask with the FreeCAD window active is a REAL hold:
+    never capped, because capping it is what punched a task through a long
+    inspection drag at the 15 s mark.
+
+    Off Windows there is no ground truth, so the Qt state decides, with two
+    phantom filters (static-state time cap, hold-duration cap) so a stuck
+    button state can never starve the queue.
     """
-    global _last_held_state, _held_static_ticks, _held_mask, _held_since
+    global _last_held_state, _held_static_since, _held_mask, _held_since
+    physical = _physical_buttons_down()
+    if physical is not None:
+        if physical == 0 or not FreeCADGui.getMainWindow().isActiveWindow():
+            # OS says no button is down (any Qt-held state is a stale phantom),
+            # or the hold belongs to some other window. The inactive branch
+            # must reset too: a stale _held_since would otherwise trip the
+            # hold cap the moment the user comes back mid-hold.
+            _reset_hold_trackers()
+            return False
+        return True
     buttons = QtWidgets.QApplication.mouseButtons()
     if buttons == QtCore.Qt.NoButton:
-        _last_held_state = None
-        _held_static_ticks = 0
-        _held_mask = None
+        _reset_hold_trackers()
         return False
     if not FreeCADGui.getMainWindow().isActiveWindow():
-        return False  # button held in some other window; not our drag
-    physical = _physical_buttons_down()
-    if physical is not None and physical == 0:
-        # Qt claims a hold the OS says is not happening: phantom, and the
-        # static counter must not keep accumulating for it either.
-        logger.debug("mouse guard: phantom hold rejected by OS ground truth (mask=%s)", buttons)
-        _last_held_state = None
-        _held_static_ticks = 0
-        _held_mask = None
+        _reset_hold_trackers()  # same stale-_held_since trap as above
         return False
     pos = QtGui.QCursor.pos()
     state = (buttons, pos.x(), pos.y())
     now = time.monotonic()
-    if state == _last_held_state:
-        _held_static_ticks += 1
-    else:
+    if state != _last_held_state:
         _last_held_state = state
-        _held_static_ticks = 0
+        _held_static_since = now
     if buttons != _held_mask:
         _held_mask = buttons
         _held_since = now
-    if _held_static_ticks >= _PHANTOM_TICK_LIMIT:
-        logger.debug("mouse guard: motionless phantom cap hit (%d ticks)", _held_static_ticks)
+    if _held_static_since is not None and now - _held_static_since >= _PHANTOM_STATIC_SECONDS:
+        logger.debug("mouse guard: motionless phantom cap hit (%.1fs)", now - _held_static_since)
         return False  # motionless phantom cap
-    # continuous-hold cap (phantom + live cursor)
     held_for = now - _held_since
     if held_for >= _PHANTOM_HOLD_SECONDS:
         logger.debug("mouse guard: hold-duration cap hit (%.1fs)", held_for)
-        return False
+        return False  # continuous-hold cap (phantom + live cursor)
     return True
 
 
@@ -295,7 +316,26 @@ def process_gui_tasks(reschedule: bool = True) -> None:
         if status_bar is not None:
             status_bar.showMessage("CADPilot: processing…")
         try:
+            ran_one = False
             while not _rpc_request_queue.empty():
+                if ran_one:
+                    # Re-check the interaction guards BETWEEN tasks: the checks
+                    # above only run when a drain starts, so without this a
+                    # press that begins mid-drain (or a dialog a task opened)
+                    # cannot pause the queue and user input starves for the
+                    # whole backlog. Pausing returns to the event loop, which
+                    # delivers the pending input; the 500 ms heartbeat (and the
+                    # next dispatch's wake) resumes the drain once it clears.
+                    if _user_holding_button():
+                        _note_defer("button")
+                        logger.debug("mouse guard: user input mid-drain; pausing queue")
+                        return
+                    if QtWidgets.QApplication.activePopupWidget() is not None:
+                        _note_defer("popup")
+                        return
+                    if QtWidgets.QApplication.activeModalWidget() is not None:
+                        _note_defer("modal")
+                        return
                 task = _rpc_request_queue.get()
                 if task is _SHUTDOWN:
                     shutdown = True
@@ -313,6 +353,7 @@ def process_gui_tasks(reschedule: bool = True) -> None:
                         e,
                         exc_info=True,
                     )
+                ran_one = True
             _clear_defer()  # drained: any earlier deferral is over
         finally:
             if app is not None:

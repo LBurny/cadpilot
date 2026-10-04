@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -139,8 +140,8 @@ def dispatch(monkeypatch):
     spec = importlib.util.spec_from_file_location("gui_dispatch_under_test", ADDON)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    mod._PHANTOM_TICK_LIMIT = 5  # keep tests fast; production value is 20
-    # Tests drive the heuristic paths; real OS button state is environmental.
+    # Tests drive the heuristic (non-win32) guard paths by default; the win32
+    # ground-truth path is exercised by overriding this per-test.
     mod._physical_buttons_down = lambda: None
     return mod, state
 
@@ -161,19 +162,24 @@ def test_no_button_runs_immediately(dispatch):
 def test_phantom_button_does_not_starve_queue(dispatch):
     """Stuck buttons + static cursor + active window = phantom state.
 
-    The guard may defer a few ticks, but after the tick limit the queued
-    task must run even though Qt still reports the button held.
+    The guard defers while the static-state cap has not elapsed, then treats
+    the held button as phantom and runs the queue even though Qt still
+    reports it held. The cap is time-based (guard evaluations are no longer
+    ~500 ms heartbeat ticks), so the test shortens it instead of counting
+    ticks.
     """
     mod, state = dispatch
+    mod._PHANTOM_STATIC_SECONDS = 0.2  # production: 10 s
     state.buttons = 1  # LeftButton, stuck
     state.window_active = True
     ran = []
     mod._rpc_request_queue.put(lambda: ran.append(1))
 
-    _run_ticks(mod, mod._PHANTOM_TICK_LIMIT)
-    assert ran == [], "phantom state should still defer the first ticks"
-
     _run_ticks(mod, 3)
+    assert ran == [], "phantom state should still defer before the cap elapses"
+
+    time.sleep(0.25)
+    _run_ticks(mod, 1)
     assert ran == [1], "static input state must be treated as phantom"
 
 
@@ -185,7 +191,7 @@ def test_real_drag_defers_until_release(dispatch):
     ran = []
     mod._rpc_request_queue.put(lambda: ran.append(1))
 
-    for i in range(mod._PHANTOM_TICK_LIMIT * 3):
+    for i in range(15):
         state.cursor = (100 + i, 100 + i)  # cursor moves every tick
         _run_ticks(mod, 1)
     assert ran == [], "task ran during a real drag"
@@ -203,6 +209,81 @@ def test_button_held_in_inactive_window_runs(dispatch):
     mod._rpc_request_queue.put(lambda: ran.append(1))
     _run_ticks(mod, 1)
     assert ran == [1]
+
+
+# --- win32 OS ground-truth path ------------------------------------------------
+#
+# Qt's mouseButtons() is event-delivered state: stale exactly while the event
+# loop is busy draining tasks. The OS physical state must be authoritative in
+# BOTH directions, or a press that lands mid-task stays invisible until the
+# backlog has run (the "frozen while the LLM models" race).
+
+
+def test_physical_press_defers_even_when_qt_sees_no_button(dispatch):
+    """Fresh-press race: the OS says the button is down but Qt has not
+    delivered the press event yet — the queue must defer, not start mid-drag."""
+    mod, state = dispatch
+    mod._physical_buttons_down = lambda: 1
+    state.buttons = 0  # Qt still stale (press event not delivered)
+    state.window_active = True
+    ran = []
+    mod._rpc_request_queue.put(lambda: ran.append(1))
+    _run_ticks(mod, 3)
+    assert ran == [], "OS-visible press must defer the queue even when Qt is stale"
+
+
+def test_physical_release_runs_even_when_qt_still_reports_held(dispatch):
+    """Release side of the race: OS says the button is up, Qt still shows the
+    stale hold — the queue must not keep deferring."""
+    mod, state = dispatch
+    mod._physical_buttons_down = lambda: 0
+    state.buttons = 1  # stale Qt hold
+    state.window_active = True
+    ran = []
+    mod._rpc_request_queue.put(lambda: ran.append(1))
+    _run_ticks(mod, 1)
+    assert ran == [1]
+
+
+def test_real_physical_hold_is_never_capped(dispatch):
+    """A genuine (OS-confirmed) hold must not hit the phantom caps: long
+    inspection drags are normal, and capping punched a task through mid-drag."""
+    mod, state = dispatch
+    mod._physical_buttons_down = lambda: 1
+    state.buttons = 1
+    state.window_active = True
+    mod._PHANTOM_STATIC_SECONDS = 0.05
+    mod._PHANTOM_HOLD_SECONDS = 0.05
+    ran = []
+    mod._rpc_request_queue.put(lambda: ran.append(1))
+    time.sleep(0.1)  # well past both phantom caps
+    _run_ticks(mod, 2)
+    assert ran == [], "phantom caps must not apply to an OS-confirmed real hold"
+
+
+def test_press_mid_drain_pauses_remaining_backlog(dispatch):
+    """A press that begins after a drain started must pause the remaining
+    queue after the current task — not starve user input for the backlog."""
+    mod, state = dispatch
+    mod._physical_buttons_down = lambda: 0
+    state.window_active = True
+    ran = []
+
+    def first():
+        ran.append(1)
+        # the user grabs the mouse while the first task is running
+        mod._physical_buttons_down = lambda: 1
+        state.buttons = 1
+
+    mod._rpc_request_queue.put(first)
+    mod._rpc_request_queue.put(lambda: ran.append(2))
+    _run_ticks(mod, 1)  # one drain: task 1 runs, then the guard pauses the rest
+    assert ran == [1], "the backlog must pause when the user presses mid-drain"
+
+    mod._physical_buttons_down = lambda: 0  # released
+    state.buttons = 0
+    _run_ticks(mod, 1)
+    assert ran == [1, 2], "the next tick resumes the drain"
 
 
 def test_modal_dialog_defers(dispatch):
