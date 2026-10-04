@@ -715,9 +715,7 @@ def tracked_objects(records: list[StepRecord]) -> dict[str, dict[str, Any]]:
                 if sub_op == "move":
                     continue  # the fold handler owns move sub-ops
                 props = sub.get("obj_properties") or {}
-                claims = {
-                    k: k for k, v in props.items() if isinstance(v, (int, float, str, bool))
-                }
+                claims = {k: k for k, v in props.items() if isinstance(v, (int, float, str, bool))}
                 name = str(sub.get("obj_name") or "")
                 if not name:
                     continue

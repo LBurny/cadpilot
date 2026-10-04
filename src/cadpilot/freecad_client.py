@@ -344,9 +344,7 @@ class FreeCADConnection:
     ) -> str | None:
         try:
             if doc_name is None:
-                return self._invoke(
-                    "get_active_screenshot", view_name, width, height, focus_object
-                )
+                return self._invoke("get_active_screenshot", view_name, width, height, focus_object)
             try:
                 return self._invoke(
                     "get_active_screenshot", view_name, width, height, focus_object, doc_name
@@ -357,9 +355,7 @@ class FreeCADConnection:
                 if "TypeError" not in str(e):
                     raise
                 logger.info("Addon does not support bound screenshots; using the active view")
-                return self._invoke(
-                    "get_active_screenshot", view_name, width, height, focus_object
-                )
+                return self._invoke("get_active_screenshot", view_name, width, height, focus_object)
         except Exception as e:
             logger.error(f"Error getting screenshot: {e}")
             return None

@@ -653,7 +653,7 @@ def test_rewrite_document_refs_repoints_only_mapped_names():
     code = "doc = App.getDocument('Old')  # Old\nFreeCAD.getDocument(\"Old\")\ngetDocument('Keep')"
     out = sj.rewrite_document_refs(code, {"Old": "New"})
     assert "getDocument('New')" in out
-    assert "getDocument(\"New\")" in out
+    assert 'getDocument("New")' in out
     assert "getDocument('Keep')" in out
     assert "App.getDocument" in out  # the accessor itself is untouched
     # unmapped names survive; empty mapping is a no-op
@@ -684,12 +684,21 @@ def test_tracked_objects_claims_batch_sub_ops():
     rec = _done_rec(
         "batch",
         7,
-        {"ops": [
-            {"action": "create_object", "obj_name": "BatchA",
-             "obj_properties": {"Height": 6, "Length": 10, "Width": 10}},
-            {"action": "move", "obj_name": "BatchA", "obj_properties": {"translate": [1, 0, 0]}},
-            {"operation": "pad", "obj_name": "Pad1", "obj_properties": {"length": 5}},
-        ]},
+        {
+            "ops": [
+                {
+                    "action": "create_object",
+                    "obj_name": "BatchA",
+                    "obj_properties": {"Height": 6, "Length": 10, "Width": 10},
+                },
+                {
+                    "action": "move",
+                    "obj_name": "BatchA",
+                    "obj_properties": {"translate": [1, 0, 0]},
+                },
+                {"operation": "pad", "obj_name": "Pad1", "obj_properties": {"length": 5}},
+            ]
+        },
         before=["Old"],
         after=["Old", "BatchA", "Pad1"],
     )
@@ -705,9 +714,13 @@ def test_tracked_objects_claims_batch_sub_ops():
     assert "Pad1" not in t
     # later sub-op wins per property
     rec2 = _done_rec(
-        "batch", 8,
-        {"ops": [{"action": "edit_object", "obj_name": "BatchA",
-                  "obj_properties": {"Length": 12}}]},
+        "batch",
+        8,
+        {
+            "ops": [
+                {"action": "edit_object", "obj_name": "BatchA", "obj_properties": {"Length": 12}}
+            ]
+        },
         after=["BatchA"],
     )
     t2 = sj.tracked_objects([rec, rec2])
@@ -763,7 +776,7 @@ def test_set_plan_drops_planned_wherever_they_sit():
     ]
     added = sj.set_plan(recs, [_step(name="New")], OPS)
     assert [r.index for r in added] == [3]
-    assert [ (r.index, r.state, r.operation) for r in recs ] == [
+    assert [(r.index, r.state, r.operation) for r in recs] == [
         (1, sj.STATE_DONE, "pad"),
         (2, sj.STATE_DONE, "execute_code"),
         (3, sj.STATE_PLANNED, "create_object"),

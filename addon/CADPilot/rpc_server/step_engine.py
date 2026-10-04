@@ -96,7 +96,9 @@ def _undo_names(doc) -> list[str]:
         return []
 
 
-def _stack_holds_journal(doc, records: list[sj.StepRecord], upto_index: int, undo_count: int) -> bool:
+def _stack_holds_journal(
+    doc, records: list[sj.StepRecord], upto_index: int, undo_count: int
+) -> bool:
     """Can the native undo be trusted to revert exactly these steps?
 
     The undo stack is shared with the GUI, and it does not survive a reopen:
@@ -1212,8 +1214,7 @@ def _reexecute(
     # first and point at rollback_to, which can rebuild, instead.
     if res["count"] < plan["undo_count"]:
         why = (
-            "the undo stack does not match the journal (reopened document or "
-            "off-journal edits)"
+            "the undo stack does not match the journal (reopened document or off-journal edits)"
             if not trust_undo
             else "the undo stack is shorter than the journal"
         )
