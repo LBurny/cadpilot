@@ -10,9 +10,9 @@ Models built by the AI through CADPilot — demo files live in [`examples/`](exa
 
 | Backpack | Desk Fan |
 | :---: | :---: |
-| [![Backpack modeled by CADPilot](examples/Backpack.png)](examples/Backpack.FCStd) | [![Desk fan modeled by CADPilot](examples/DeskFan.png)](examples/DeskFan.FCStd) |
+| [<img src="examples/Backpack.png" width="300" alt="Backpack modeled by CADPilot">](examples/Backpack.FCStd) | [<img src="examples/DeskFan.png" width="300" alt="Desk fan modeled by CADPilot">](examples/DeskFan.FCStd) |
 | **Violin** | **Leaf** |
-| [![Violin modeled by CADPilot](examples/Violin.png)](examples/Violin.FCStd) | [![Leaf modeled by CADPilot](examples/Leaf.png)](examples/Leaf.FCStd) |
+| [<img src="examples/Violin.png" width="300" alt="Violin modeled by CADPilot">](examples/Violin.FCStd) | [<img src="examples/Leaf.png" width="300" alt="Leaf modeled by CADPilot">](examples/Leaf.FCStd) |
 
 ## Features
 

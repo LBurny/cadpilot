@@ -10,9 +10,9 @@ AI 通过 CADPilot 构建的模型 —— 演示文件位于 [`examples/`](examp
 
 | 双肩包 | 台式风扇 |
 | :---: | :---: |
-| [![CADPilot 建模的双肩包](examples/Backpack.png)](examples/Backpack.FCStd) | [![CADPilot 建模的台式风扇](examples/DeskFan.png)](examples/DeskFan.FCStd) |
+| [<img src="examples/Backpack.png" width="300" alt="CADPilot 建模的双肩包">](examples/Backpack.FCStd) | [<img src="examples/DeskFan.png" width="300" alt="CADPilot 建模的台式风扇">](examples/DeskFan.FCStd) |
 | **小提琴** | **树叶** |
-| [![CADPilot 建模的小提琴](examples/Violin.png)](examples/Violin.FCStd) | [![CADPilot 建模的树叶](examples/Leaf.png)](examples/Leaf.FCStd) |
+| [<img src="examples/Violin.png" width="300" alt="CADPilot 建模的小提琴">](examples/Violin.FCStd) | [<img src="examples/Leaf.png" width="300" alt="CADPilot 建模的树叶">](examples/Leaf.FCStd) |
 
 ## 特点
 
