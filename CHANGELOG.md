@@ -1,5 +1,58 @@
 # Changelog
 
+## v0.5.10 (2026-10-04)
+
+The steps panel stops being a wall of identical `execute_code` rows: every step
+now carries a human description, and the panel's layout stops fighting the
+user (fixed-width columns, wrapped code, a meta line that jittered the dock).
+
+### Added
+
+- **Step descriptions** (`step_journal.py`, `step_panel.py`). An
+  `execute_code` row now leads with the snippet's LEADING `#` comment block —
+  `步骤1: 琴身轮廓 + f孔 · +1 object(s): Body` instead of
+  `execute_code: +1 object(s)…` — with the full block on hover
+  (`snippet_description`: boilerplate like the coding cookie and shebang is
+  skipped, the block ends at the first blank or code line). Other ops use their
+  recorded label. The convention is taught to models where they write the code:
+  `prompt_text.py` ("ALWAYS start an execute_code snippet with a one-line
+  `# comment`") and the `execute_code` docstring. The extraction and row
+  rendering live in `step_journal` as pure functions
+  (`snippet_description`/`step_description`/`row_text`/`tooltip_text`), so the
+  display rules are unit-tested without Qt.
+
+- **Click-to-explain spotlight** (`step_panel.py`). Selecting a step renders
+  its description as one bright line (bold, theme `seltext` — white in dark
+  mode, black in light) below the log console, timestamp included, replaced by
+  the next selection. It is deliberately NOT a log entry: the log is for
+  debugging, and re-reading a step's description is not a debug event — the
+  200-entry history stays clean. Double-click keeps its own affordance: jump
+  into the parameter editor.
+
+- **User-resizable Step column** (`step_panel.py`). The Step column was
+  `Stretch`, so a long label was elided with no way to widen it. All columns
+  are Interactive now (Op takes the slack via `stretchLastSection`), and the
+  chosen width persists in `cadpilot_settings.json`
+  (`step_panel_step_width`, debounced like the splitter sizes).
+
+### Changed
+
+- **The detail meta line is one elided line** (`step_panel.py`). It used to
+  wrap to two lines; now it elides with the full text on tooltip. Two Qt traps
+  surfaced live: the ellipsis must be measured against `contentsRect()` (the
+  stylesheet's 8px side padding is part of the widget, not the text area —
+  measuring against `width()` painted the ellipsis into the padding and
+  clipped it away), and a non-wrapping QLabel reports
+  `minimumSizeHint == full text width`, which the layout takes as a width
+  FLOOR — since every refresh wrote a differently elided text, the dock's
+  width tracked the text and jittered. The label's horizontal size policy is
+  `Ignored`, so the layout hands it the available width instead.
+
+- **The parameter editor does not soft-wrap** (`step_panel.py`).
+  `QPlainTextEdit.NoWrap` — a wrapped code line reads as different code; it
+  scrolls horizontally instead. The log console keeps `WidgetWidth` (prose can
+  wrap, code cannot).
+
 ## v0.5.9 (2026-10-04)
 
 A second round of multi-agent stress modelling (a travel mug, a lathe-turned
