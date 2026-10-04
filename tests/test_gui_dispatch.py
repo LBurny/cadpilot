@@ -23,6 +23,11 @@ import pytest
 ADDON = (
     Path(__file__).resolve().parent.parent / "addon" / "CADPilot" / "rpc_server" / "gui_dispatch.py"
 )
+# gui_dispatch does ``from rpc_server import dbglog``; without the addon dir on the
+# path this file only ever worked inside a full-suite run (some later test module
+# happened to insert it first), and failed with ModuleNotFoundError on its own.
+if str(ADDON.parent.parent) not in sys.path:
+    sys.path.insert(0, str(ADDON.parent.parent))
 
 
 class _FakeSignal:
@@ -210,3 +215,80 @@ def test_modal_dialog_defers(dispatch):
     state.modal = None
     _run_ticks(mod, 1)
     assert ran == [1]
+
+
+# --- timeout diagnosis -------------------------------------------------------
+#
+# The timeout path used to blame the waker unconditionally:
+#   "GUI dispatch timed out after 90s with an idle GUI thread (queue depth 1)
+#    — the waker/heartbeat chain may be dead"
+# which is a *guess*, and the wrong one while a human has a dialog open: the
+# heartbeat is fine, the queue simply must not be drained mid-interaction.
+# The user's own report — "it happens when I operate FreeCAD at the same time
+# as the model, and the process CPU barely moves" — is that case, not a dead
+# waker. Name the real cause; keep the dead-waker verdict for when it is true.
+
+
+def _timeout_error(mod, state, guard):
+    """Defer a few ticks under ``guard``, then let a call time out."""
+    guard(state)
+    mod._rpc_request_queue.put(lambda: None)  # something to defer for
+    _run_ticks(mod, 3)
+    return mod.dispatch_to_gui(lambda: None, timeout=0.02)
+
+
+def test_timeout_names_an_open_modal_dialog(dispatch):
+    mod, state = dispatch
+    err = _timeout_error(mod, state, lambda s: setattr(s, "modal", object()))
+    assert err["success"] is False
+    assert "modal dialog" in err["error"], err["error"]
+    assert "waker" not in err["error"], "the waker is fine; do not blame it"
+
+
+def test_timeout_names_an_open_popup_menu(dispatch):
+    mod, state = dispatch
+    err = _timeout_error(mod, state, lambda s: setattr(s, "popup", object()))
+    assert err["success"] is False
+    assert "popup" in err["error"], err["error"]
+    assert "waker" not in err["error"]
+
+
+def test_timeout_names_a_real_drag(dispatch):
+    mod, state = dispatch
+
+    def drag(s):
+        s.buttons = 1
+        s.window_active = True
+
+    err = _timeout_error(mod, state, drag)
+    assert err["success"] is False
+    assert "mouse button" in err["error"], err["error"]
+    assert "waker" not in err["error"]
+
+
+def test_timeout_still_blames_the_waker_when_nothing_defers(dispatch):
+    """The genuine dead-chain case must keep its verdict — the fix is to stop
+    mislabelling the dialog case, not to remove the diagnosis."""
+    mod, _state = dispatch
+    err = mod.dispatch_to_gui(lambda: None, timeout=0.02)
+    assert err["success"] is False
+    assert "waker" in err["error"], err["error"]
+
+
+def test_long_deferral_is_logged_once(dispatch):
+    """get_addon_log has to show why the queue stalled, without a warning per
+    500 ms tick."""
+    mod, state = dispatch
+    warnings = []
+    mod.logger = types.SimpleNamespace(
+        warning=lambda *a, **k: warnings.append((a, k)),
+        error=lambda *a, **k: None,
+        info=lambda *a, **k: None,
+        debug=lambda *a, **k: None,
+    )
+    state.modal = object()
+    mod._rpc_request_queue.put(lambda: None)
+    mod._DEFER_WARN_SECONDS = 0.0  # warn on the second identical tick
+    _run_ticks(mod, 4)
+    assert len(warnings) == 1, warnings
+    assert "modal" in str(warnings[0]), warnings[0]

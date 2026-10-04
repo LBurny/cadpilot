@@ -953,7 +953,14 @@ class FreeCADRPC:
             except Exception:
                 pass
             # Capture screenshot in the same GUI dispatch if requested
-            doc_name = doc.Name if doc is not None else None
+            # The snippet may have closed or replaced the active document (both
+            # are legitimate: closing a scratch doc, or setting the active doc so
+            # the step lands on the right one) — reading .Name off the deleted
+            # reference raises ReferenceError and would report a snippet that
+            # SUCCEEDED as a failure.
+            doc_name = None
+            with contextlib.suppress(Exception):
+                doc_name = doc.Name if doc is not None else None
             if tmp_path is not None:
                 shot = save_active_screenshot(
                     tmp_path,

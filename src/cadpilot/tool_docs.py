@@ -53,11 +53,17 @@ tool: single object name OR a list — multiple tools are combined into one
 fillet — parametric fillet (obj_name = base object).
 Required in obj_properties: edges (selector), radius. Optional: name.
 Selectors accept "all", an index list [0,2], or a name list ["Edge1"] —
-use get_topology to find indices.""",
+use get_topology to find indices.
+A base inside a PartDesign Body yields a PartDesign::Fillet inside that Body
+(it follows the Body's Placement and becomes its Tip); a bare Part-level base
+yields a Part::Fillet at the document root. A base inside a Body must BE that
+Body's Tip: dressing a mid-chain feature is refused, because FreeCAD moves the
+Body's Tip onto the new dress-up and would silently drop every later feature
+(pockets, patterns).""",
     "chamfer": """\
 chamfer — parametric chamfer (obj_name = base object).
 Required in obj_properties: edges (selector), size. Optional: name.
-Same selector syntax as fillet.""",
+Same selector syntax and the same Body-Tip rule as fillet.""",
     "loft": """\
 loft — parametric loft through profiles (obj_name names the NEW loft, may be omitted).
 Required in obj_properties: profiles (list of >= 2 object names).

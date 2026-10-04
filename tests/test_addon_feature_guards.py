@@ -10,6 +10,14 @@ SILENT (the tool reported success while the geometry was wrong):
   plates or as 1 hole;
 * a cut that removed nothing reported plain success.
 
+Plus, found by re-verifying a user bug report on 1.1.4:
+
+* a PartDesign *transform* feature was created correctly but never became its
+  Body's Tip, so the body kept showing the pre-pattern result while the tool
+  reported success (``body.Tip`` is now pushed explicitly — see tip_policy);
+* a fillet/chamfer on a base inside a Body was built as a document-root
+  ``Part::Fillet``, which is not part of the Body at all.
+
 The addon cannot be imported without FreeCAD, so these parse the source.
 """
 
@@ -120,3 +128,68 @@ def test_recompute_failure_reports_status_string():
     assert any(isinstance(n, ast.Constant) and n.value == "StatusString" for n in ast.walk(body)), (
         "read the feature's StatusString for the failure detail"
     )
+
+
+def _names(node) -> set[str]:
+    return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+
+
+def test_new_feature_is_pushed_as_its_body_tip():
+    """Measured on 1.1.4: a polar pattern built from a flange pocket was correct
+    (its own Shape was the 6-hole result) yet Body.Tip stayed on the pocket, so
+    the body kept ONE hole while the op returned success. Trusting FreeCAD to
+    advance the tip is not enough for transform features."""
+    helper = _func(_FEATURE, "_advance_body_tip")
+    assert "tip_policy" in _names(helper), "the tip decision belongs in tip_policy"
+    assert any(isinstance(n, ast.Attribute) and n.attr == "Tip" for n in ast.walk(helper)), (
+        "the helper must assign body.Tip"
+    )
+    assert "advances_tip" in {n.attr for n in ast.walk(helper) if isinstance(n, ast.Attribute)}, (
+        "consult the whitelist before assigning a tip"
+    )
+    assert "should_advance" in {n.attr for n in ast.walk(helper) if isinstance(n, ast.Attribute)}, (
+        "only a successor of the current tip may claim it, or a later feature is hidden"
+    )
+    # And the single creation entry point must actually call it.
+    assert "_advance_body_tip" in _names(_func(_FEATURE, "create_feature_gui")), (
+        "create_feature_gui must push the tip after building the feature"
+    )
+
+
+def test_tip_advance_tolerates_a_body_less_feature():
+    """A Part-level base (or a document-root build) has no body: the helper must
+    return quietly instead of raising — the guard already ran the whole op inside
+    a transaction and an exception would discard a valid feature."""
+    helper = _func(_FEATURE, "_advance_body_tip")
+    assert any(isinstance(n, ast.Return) for n in ast.walk(helper))
+    assert "None" in _strings(helper) or any(
+        isinstance(n, ast.Constant) and n.value is None for n in ast.walk(helper)
+    ), "a missing body must be a plain early return"
+
+
+def test_dressup_inside_a_body_builds_the_partdesign_feature():
+    """#2: Part::Fillet is a document-root object — not in Body.Group, it does
+    not follow the Body's Placement, and Body.Tip = <it> is accepted silently
+    while leaving the Body ['Touched', 'Invalid']."""
+    body = _func(_FEATURE, "_build_fillet_chamfer")
+    assert "tip_policy" in _names(body), "the Part-vs-PartDesign choice belongs in tip_policy"
+    assert "newObject" in {n.attr for n in ast.walk(body) if isinstance(n, ast.Attribute)}, (
+        "the PartDesign dress-up must be created inside the Body"
+    )
+    assert "dress_type" in {n.attr for n in ast.walk(body) if isinstance(n, ast.Attribute)}
+    assert "dress_size_property" in {
+        n.attr for n in ast.walk(body) if isinstance(n, ast.Attribute)
+    }, "PartDesign::Fillet takes a scalar Radius, not the Part-level Edges tuples"
+
+
+def test_invalid_shape_error_names_the_object_and_reason():
+    """Reported live: 'shape is invalid' was raised for a self-intersecting
+    meridian, a broken reference and a corrupted dependency graph alike — three
+    different causes, one opaque message. It must name the object and carry
+    FreeCAD's own reason."""
+    helper = _func(_FEATURE, "_invalid_shape_error")
+    text = ast.unparse(helper)
+    assert "produced an invalid Shape" in text
+    assert ".Name" in text, "the object name is what makes the error actionable"
+    assert "StatusString" in text, "FreeCAD's reason must be carried through"
+    assert "_invalid_shape_error" in _names(_func(_FEATURE, "create_feature_gui"))

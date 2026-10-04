@@ -11,7 +11,7 @@ import contextlib
 import FreeCAD
 import Part
 
-from rpc_server import sketcher_ops
+from rpc_server import sketcher_ops, tip_policy
 
 FEATURE_TYPES = (
     "boolean",
@@ -132,12 +132,54 @@ def _build_boolean(doc, spec):
     return feat
 
 
-def _build_fillet_chamfer(doc, spec, fc_type, size_key):
+def _require_end_of_chain(body, base, op):
+    """Refuse a dress-up whose base is not the end of its Body's chain.
+
+    FreeCAD moves ``Body.Tip`` onto a newly created PartDesign feature, so
+    dressing a mid-chain feature makes the body SHOW the dress-up and silently
+    drop everything after it — measured live: a fillet on the pad under a flange
+    left the body at 15999 mm^3 with the six bolt holes gone. PartDesign offers no
+    safe mid-chain insert through the API (``Body.insertObject`` duplicated the
+    Group entry and still left the tip wrong), so the op refuses. The caller runs
+    it in a transaction, so refusing leaves the document untouched.
+    """
+    tip = getattr(body, "Tip", None)
+    if tip_policy.dress_base_is_allowed(base_in_body=True, base_is_tip=tip is base):
+        return
+    tip_name = tip.Name if tip is not None else "none"
+    raise ValueError(
+        f"{op} base '{base.Name}' is inside Body '{body.Name}' but is not its Tip "
+        f"({tip_name}). A dress-up is built at the END of the chain, and FreeCAD would "
+        "move the Body's Tip onto it, silently dropping every later feature (pockets and "
+        "patterns included). Dress the Tip instead, or reorder the features in FreeCAD's GUI."
+    )
+
+
+def _build_fillet_chamfer(doc, spec, kind):
+    """Build a fillet/chamfer where it belongs: inside the Body when the base
+    lives in one, at the document root otherwise.
+
+    A ``Part::Fillet`` is a document-root object — it is not in the Body's
+    Group, it does not follow the Body's Placement, and ``Body.Tip = <it>`` is
+    accepted silently while leaving the Body ``['Touched', 'Invalid']``. A base
+    that is a bare Part-level object still wants the Part::Fillet path.
+    """
+    size_key = tip_policy.dress_spec_key(kind)
     _require(spec, "base", "edges", size_key)
     base = _get_obj(doc, spec["base"], "base")
     names = _resolve_elements(base, spec["edges"], "Edge")
-    feat = doc.addObject(fc_type, spec.get("name") or fc_type.split("::")[1])
     size = float(spec[size_key])
+    body = _parent_body(base)
+    label = spec.get("name") or f"{kind.capitalize()}"
+    if body is not None:
+        _require_end_of_chain(body, base, kind)
+        # FreeCAD 1.1's PartDesign dress-up holds ONE scalar size for all edges
+        # (the per-edge tuple form is Part-level only).
+        feat = body.newObject(tip_policy.dress_type(kind, True), label)
+        feat.Base = (base, names)
+        setattr(feat, tip_policy.dress_size_property(kind), size)
+        return feat
+    feat = doc.addObject(tip_policy.dress_type(kind, False), label)
     if hasattr(feat, "EdgeLinks"):
         # FreeCAD >= 1.1 rework: Base is a plain link and per-edge sizes live
         # in Edges as (1-based edge index, size_start, size_end) tuples.
@@ -145,7 +187,7 @@ def _build_fillet_chamfer(doc, spec, fc_type, size_key):
         feat.Edges = [(int(n[4:]), size, size) for n in names]
     else:
         feat.Base = (base, names)
-        setattr(feat, size_key.capitalize(), size)
+        setattr(feat, tip_policy.dress_size_property(kind), size)
     return feat
 
 
@@ -653,6 +695,9 @@ def _build_thickness(doc, spec):
     _require(spec, "faces", "value")
     body = sketcher_ops._get_or_create_body(doc, spec.get("body"))
     base = _get_obj(doc, spec["base"], "base feature")
+    owner = _parent_body(base)
+    if owner is not None:
+        _require_end_of_chain(owner, base, "thickness")
     names = _resolve_elements(base, spec["faces"], "Face")
     feat = body.newObject("PartDesign::Thickness", spec.get("name") or "Thickness")
     if "Faces" in feat.PropertiesList:
@@ -671,6 +716,9 @@ def _build_draft(doc, spec):
     _require(spec, "faces", "angle")
     body = sketcher_ops._get_or_create_body(doc, spec.get("body"))
     base = _get_obj(doc, spec["base"], "base feature")
+    owner = _parent_body(base)
+    if owner is not None:
+        _require_end_of_chain(owner, base, "draft")
     names = _resolve_elements(base, spec["faces"], "Face")
     neutral = spec.get("neutral_plane", names[0])
     neutral_names = _resolve_elements(
@@ -760,8 +808,8 @@ def describe_feature(feat, spec) -> dict:
 
 _BUILDERS = {
     "boolean": _build_boolean,
-    "fillet": lambda doc, spec: _build_fillet_chamfer(doc, spec, "Part::Fillet", "radius"),
-    "chamfer": lambda doc, spec: _build_fillet_chamfer(doc, spec, "Part::Chamfer", "size"),
+    "fillet": lambda doc, spec: _build_fillet_chamfer(doc, spec, "fillet"),
+    "chamfer": lambda doc, spec: _build_fillet_chamfer(doc, spec, "chamfer"),
     "loft": _build_loft,
     "sweep": _build_sweep,
     "mirror": _build_mirror,
@@ -780,6 +828,63 @@ _BUILDERS = {
 }
 
 
+def _advance_body_tip(feat) -> bool:
+    """Make ``feat`` its Body's Tip. Returns True when the tip actually moved.
+
+    FreeCAD advances Body.Tip by itself for additive/subtractive features, but
+    NOT for a PartDesign transform. Measured on 1.1.4: a polar pattern built from
+    a flange pocket was correct on its own (its Shape was the 6-hole result,
+    15246 mm^3) while Body.Tip stayed on the single-hole pocket, so the Body kept
+    ONE hole (15874 mm^3) and the op reported success.
+
+    Only a successor of the current tip may claim it: Body.Tip is what the body
+    SHOWS, so a dress-up on a feature in the middle of the chain taking the tip
+    would silently hide every later feature. ``OutList`` — FreeCAD's own "what do
+    I link to" — is the honest test for "the tip is my predecessor". A body-less
+    feature (a Part-level build) is left alone.
+    """
+    type_id = getattr(feat, "TypeId", "")
+    if not tip_policy.advances_tip(type_id):
+        return False
+    body = _parent_body(feat)
+    if body is None:
+        return False
+    tip = getattr(body, "Tip", None)
+    depends_on_tip = tip is not None and any(o is tip for o in getattr(feat, "OutList", []))
+    if not tip_policy.should_advance(
+        type_id,
+        body_has_tip=tip is not None,
+        tip_is_feat=tip is feat,
+        feat_depends_on_tip=depends_on_tip,
+    ):
+        return False
+    try:
+        body.Tip = feat
+    except Exception as exc:
+        # A stale tip merely hides the feature; an exception here would discard
+        # an otherwise valid build, so warn instead of failing the op.
+        FreeCAD.Console.PrintWarning(
+            f"CADPilot: could not set {body.Name}.Tip = {feat.Name}: {exc}\n"
+        )
+        return False
+    return True
+
+
+def _invalid_shape_error(feat_type, feat) -> str:
+    """ "<op> produced an invalid Shape" was raised for a self-intersecting
+    profile, a dangling reference and a corrupted dependency graph alike — three
+    different causes behind one opaque message. Name the object and carry
+    FreeCAD's own reason."""
+    status = str(getattr(feat, "StatusString", "") or "").strip()
+    reason = f" — FreeCAD says: {status}" if status and status != "Invalid" else ""
+    return (
+        f"{feat_type} '{feat.Name}' produced an invalid Shape{reason}. "
+        "Typical causes: the profile/section is not a closed face or wire, the "
+        "profile self-intersects, or it references a deleted object. Select "
+        f"'{feat.Name}' in FreeCAD and use Part > Check geometry for the OCC fault."
+    )
+
+
 def create_feature_gui(doc, spec):
     """Create one parametric feature from ``spec``; returns the object.
 
@@ -795,6 +900,8 @@ def create_feature_gui(doc, spec):
     if ftype == "move":
         return feat
     doc.recompute()
+    if _advance_body_tip(feat):
+        doc.recompute()
     state = [str(s) for s in getattr(feat, "State", [])]
     if "Invalid" in state:
         # StatusString carries FreeCAD's actual failure reason (bad support,
@@ -803,7 +910,13 @@ def create_feature_gui(doc, spec):
         status = str(getattr(feat, "StatusString", "") or "").strip()
         detail = f" — {status}" if status and status != "Invalid" else ""
         raise RuntimeError(f"{ftype} failed to recompute{detail} (check parameters/geometry).")
-    shape = getattr(feat, "Shape", None)
-    if shape is not None and not shape.isNull() and not shape.isValid():
-        raise RuntimeError(f"{ftype} produced an invalid Shape.")
+    try:
+        shape = getattr(feat, "Shape", None)
+        invalid = shape is not None and not shape.isNull() and not shape.isValid()
+    except Exception:
+        # A feature whose Shape cannot even be read (a broken tip, a dangling
+        # link) fails the same way as an invalid one, and must name itself too.
+        invalid = True
+    if invalid:
+        raise RuntimeError(_invalid_shape_error(ftype, feat))
     return feat

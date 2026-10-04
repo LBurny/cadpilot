@@ -70,6 +70,55 @@ _PHANTOM_HOLD_SECONDS = 15.0
 _held_mask: "int | None" = None
 _held_since: float = 0.0
 
+# Why the queue was last deferred, and for how long. Written on the GUI thread by
+# process_gui_tasks, read on the RPC thread by the timeout path — a plain str/float
+# is atomic enough in CPython and this is only a diagnosis.
+#
+# Without it the timeout message blamed the waker unconditionally, which is wrong
+# exactly when a human is interacting: the heartbeat is healthy, the queue simply
+# must not be drained during a drag, an open context menu or a modal dialog. The
+# reported symptom ("it happens when I operate FreeCAD at the same time as the
+# model; the process CPU barely moves") is that case, not a dead chain.
+_DEFER_LABELS = {
+    "button": "the user is holding a mouse button in the FreeCAD window",
+    "popup": "a popup menu is open",
+    "modal": "a modal dialog is open",
+}
+_DEFER_WARN_SECONDS = 10.0
+_defer_reason: "str | None" = None
+_defer_since: float = 0.0
+_defer_warned = False
+
+
+def _note_defer(reason: str) -> None:
+    """Record a deferral, warning once when it outlasts _DEFER_WARN_SECONDS.
+
+    The warning is what makes a stalled queue visible in get_addon_log while it
+    is happening — otherwise the only trace is a client-side timeout.
+    """
+    global _defer_reason, _defer_since, _defer_warned
+    now = time.monotonic()
+    if _defer_reason != reason:
+        _defer_reason = reason
+        _defer_since = now
+        _defer_warned = False
+        return
+    if not _defer_warned and now - _defer_since >= _DEFER_WARN_SECONDS:
+        _defer_warned = True
+        logger.warning(
+            "GUI queue deferred for %.1fs by %s (queue depth %d) — RPC calls will time out "
+            "until it clears; the heartbeat is fine, this is back-pressure",
+            now - _defer_since,
+            _DEFER_LABELS.get(reason, reason),
+            _rpc_request_queue.qsize(),
+        )
+
+
+def _clear_defer() -> None:
+    global _defer_reason, _defer_warned
+    _defer_reason = None
+    _defer_warned = False
+
 
 def _physical_buttons_down() -> "int | None":
     """OS-level physical mouse-button mask on Windows; None elsewhere.
@@ -217,16 +266,20 @@ def process_gui_tasks(reschedule: bool = True) -> None:
     shutdown = False
     try:
         if _rpc_request_queue.empty():
+            _clear_defer()
             return  # nothing queued; skip cursor/status-bar churn on idle heartbeat ticks
         if _user_holding_button():
             # user is dragging in the active window; defer to next tick.
             # (Phantom/stuck button states are filtered out inside
             # _user_holding_button — they must not starve the queue.)
+            _note_defer("button")
             logger.debug("mouse guard: deferring queue (real drag in the active window)")
             return
         if QtWidgets.QApplication.activePopupWidget() is not None:
+            _note_defer("popup")
             return  # context menu or popup open; defer to next tick
         if QtWidgets.QApplication.activeModalWidget() is not None:
+            _note_defer("modal")
             return  # modal dialog open; defer to next tick
 
         _processing = True
@@ -260,6 +313,7 @@ def process_gui_tasks(reschedule: bool = True) -> None:
                         e,
                         exc_info=True,
                     )
+            _clear_defer()  # drained: any earlier deferral is over
         finally:
             if app is not None:
                 app.restoreOverrideCursor()
@@ -341,15 +395,44 @@ def dispatch_to_gui(task: Callable[[], Any], timeout: float = 60) -> Any:
                 "consider execute_code_async for heavy OCCT operations)"
             )
             logger.error("GUI dispatch timed out after %ss%s", timeout, hint)
-        else:
-            hint = ""
-            # Idle GUI thread + timeout means the waker/heartbeat chain is dead,
-            # not that FreeCAD is busy — the failure mode that used to wedge the
-            # addon with nothing in any log to show for it.
+            return {"success": False, "error": f"GUI dispatch timed out after {timeout}s{hint}"}
+        if _defer_reason is not None:
+            # The guards are holding the queue back on purpose: the user is
+            # mid-interaction. Nothing is broken and nothing needs restarting.
+            label = _DEFER_LABELS.get(_defer_reason, _defer_reason)
+            deferred_for = time.monotonic() - _defer_since
             logger.error(
-                "GUI dispatch timed out after %ss with an idle GUI thread (queue depth %d) "
-                "— the waker/heartbeat chain may be dead",
+                "GUI dispatch timed out after %ss — %s (queue depth %d, deferred %.1fs); "
+                "back-pressure from user interaction, not a dead dispatcher",
                 timeout,
+                label,
                 _rpc_request_queue.qsize(),
+                deferred_for,
             )
-        return {"success": False, "error": f"GUI dispatch timed out after {timeout}s{hint}"}
+            return {
+                "success": False,
+                "error": (
+                    f"GUI dispatch timed out after {timeout}s because {label} — CADPilot must "
+                    "not act on the document mid-interaction, so the queued work is held back. "
+                    "Nothing is stuck: close the dialog or menu (or release the mouse button) "
+                    "and retry; the queue drains by itself."
+                ),
+            }
+        # Idle GUI thread + timeout means the waker/heartbeat chain is dead,
+        # not that FreeCAD is busy — the failure mode that used to wedge the
+        # addon with nothing in any log to show for it.
+        logger.error(
+            "GUI dispatch timed out after %ss with an idle GUI thread (queue depth %d) "
+            "— the waker/heartbeat chain may be dead",
+            timeout,
+            _rpc_request_queue.qsize(),
+        )
+        return {
+            "success": False,
+            "error": (
+                f"GUI dispatch timed out after {timeout}s: nothing is holding the queue and "
+                "the GUI thread is idle, so the waker/heartbeat chain may be dead. Repair it "
+                "with execute_code_async (its worker needs no GUI dispatch); see the addon "
+                "section of AGENTS.md."
+            ),
+        }
