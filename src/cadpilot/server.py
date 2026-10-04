@@ -301,7 +301,7 @@ def execute_code(
     FreeCAD/FreeCADGui already imported). print() output is returned.
 
     Args:
-        code: Python code to execute.
+        code: Python code to execute. Start with a # comment describing the step (the Steps panel shows it).
         with_screenshot/screenshot_mode: attach a screenshot (default off): "image" = inline PNG, "file" = path only (default: server config).
     """
     return execute_code_operation(

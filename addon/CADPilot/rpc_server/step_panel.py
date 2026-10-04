@@ -151,6 +151,15 @@ def _op_label(spec: dict) -> str:
     return label
 
 
+def _row_text(rec) -> str:
+    """Delegate: the display rules live in ``step_journal`` (pure, tested)."""
+    return sj.row_text(rec)
+
+
+def _tooltip_text(rec) -> str:
+    return sj.tooltip_text(rec)
+
+
 class StepPanel(QtWidgets.QDockWidget):
     def __init__(self, parent=None):
         super().__init__(PANEL_TITLE, parent)
@@ -160,11 +169,18 @@ class StepPanel(QtWidgets.QDockWidget):
         self._records: list = []
         self._details_for: int = 0
         self._in_apply: bool = False
+        self._entries: list[dict] = []
+        self._spotlight: dict | None = None
+        self._meta_raw: str = ""
         self._derive_colors()
         self._splitter_timer = QtCore.QTimer(self)
         self._splitter_timer.setSingleShot(True)
         self._splitter_timer.setInterval(600)
         self._splitter_timer.timeout.connect(self._save_splitter)
+        self._columns_timer = QtCore.QTimer(self)
+        self._columns_timer.setSingleShot(True)
+        self._columns_timer.setInterval(600)
+        self._columns_timer.timeout.connect(self._save_step_width)
         self._build()
         self._timer = QtCore.QTimer(self)
         self._timer.timeout.connect(self.refresh)
@@ -294,13 +310,20 @@ class StepPanel(QtWidgets.QDockWidget):
         self.tree.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._menu)
         self.tree.itemSelectionChanged.connect(self._on_selection)
-        # Double-click jumps into the parameter editor (it no longer re-runs
-        # blindly — editing IS the point of double-clicking).
-        self.tree.itemDoubleClicked.connect(lambda *_: self.editor.setFocus())
+        # The description follows the SELECTION (one click), so double-click
+        # keeps its own affordance: jump into the parameter editor.
+        self.tree.itemDoubleClicked.connect(self._focus_editor)
         header = self.tree.header()
+        # The Step column carries long labels ("execute_code: +1 object(s)…")
+        # and was Stretch: elided, with no way to widen it. Now everything is
+        # user-resizable, Op takes the slack, and the Step width persists
+        # (double-clicking a section separator still auto-fits, per Qt).
         header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
-        header.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QtWidgets.QHeaderView.Interactive)
+        header.setSectionResizeMode(2, QtWidgets.QHeaderView.Interactive)
+        header.setStretchLastSection(True)
+        header.resizeSection(1, self._load_step_width())
+        header.sectionResized.connect(self._columns_changed)
         self.tree.setMinimumHeight(120)
 
         splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical, box)
@@ -334,7 +357,20 @@ class StepPanel(QtWidgets.QDockWidget):
 
         self.detail_meta = QtWidgets.QLabel("", card)
         self.detail_meta.setObjectName("DetailMeta")
-        self.detail_meta.setWordWrap(True)
+        # One elided line, never a wrapped two-liner; the tooltip holds the
+        # full text. Eliding is recomputed on resize (eventFilter below).
+        #
+        # Ignored horizontal policy is load-bearing: a non-wrapping QLabel
+        # reports minimumSizeHint == the full text width, and the layout takes
+        # that as a width FLOOR. Since every refresh wrote a differently
+        # elided text, the dock's width tracked the text and visibly jittered
+        # (and the floor exceeded the visible width, clipping the ellipsis).
+        # Ignored makes the layout hand the label the available width instead.
+        self.detail_meta.setWordWrap(False)
+        self.detail_meta.setSizePolicy(
+            QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred
+        )
+        self.detail_meta.installEventFilter(self)
         card_lay.addWidget(self.detail_meta)
         card_lay.addWidget(self._hairline(card))
 
@@ -342,6 +378,9 @@ class StepPanel(QtWidgets.QDockWidget):
         self.editor.setObjectName("ParamEditor")
         self.editor.setFont(QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont))
         self.editor.setPlaceholderText("Step parameters (JSON)")
+        # Code must not soft-wrap: a wrapped line is unreadable. The editor
+        # scrolls horizontally instead (the log console keeps WidgetWidth).
+        self.editor.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
         self.editor.setMinimumHeight(80)
         card_lay.addWidget(self.editor, stretch=1)
 
@@ -392,7 +431,6 @@ class StepPanel(QtWidgets.QDockWidget):
         self.log.setFont(QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont))
         self.log.setLineWrapMode(QtWidgets.QTextEdit.WidgetWidth)
         self.log.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-        self.log.document().setMaximumBlockCount(200)
         card_lay.addWidget(self.log, stretch=1)
         lay.addWidget(card, stretch=1)
         box.setMinimumHeight(90)
@@ -547,9 +585,9 @@ QLabel#PanelStatus {{ color: {c["dim"]}; padding: 5px 8px 4px 8px; }}
         self.tree.blockSignals(True)
         self.tree.clear()
         for rec in records:
-            label = rec.label + (f"  — {rec.error}" if rec.error else "")
-            item = QtWidgets.QTreeWidgetItem([str(rec.index), label, rec.operation])
+            item = QtWidgets.QTreeWidgetItem([str(rec.index), _row_text(rec), rec.operation])
             item.setIcon(0, _state_icon(rec))
+            item.setToolTip(1, _tooltip_text(rec))
             if rec.accepted:
                 font = item.font(1)
                 font.setBold(True)
@@ -565,6 +603,10 @@ QLabel#PanelStatus {{ color: {c["dim"]}; padding: 5px 8px 4px 8px; }}
         self.tree.blockSignals(False)
         self.status.setText(note)
         self._update_details()
+        # The rebuild above ran with signals blocked, so _on_selection never
+        # fired — the spotlight must be refreshed here, or an edited snippet's
+        # comment would not show until the selection moved.
+        self._update_spotlight()
         self._update_actions()
 
     # --- selection / details ---------------------------------------------
@@ -584,13 +626,46 @@ QLabel#PanelStatus {{ color: {c["dim"]}; padding: 5px 8px 4px 8px; }}
 
     def _on_selection(self) -> None:
         self._update_details()
+        self._update_spotlight()
         self._update_actions()
+
+    def _focus_editor(self, *_) -> None:
+        """Double-click: jump into the parameter editor (editing IS the point
+        of double-clicking; the description already shows on selection)."""
+        self.editor.setFocus()
+
+    def _update_spotlight(self) -> None:
+        """Show the SELECTED step's description as the log's spotlight.
+
+        Runs on every selection change, so one click is enough — the same way
+        the middle pane shows the step's code the moment it is selected. The
+        spotlight is for the human, not the debug history: it renders as one
+        bright line BELOW the log entries but never becomes one (the log is
+        for debugging). No selection = no spotlight.
+        """
+        rec = self._selected_record()
+        if rec is None:
+            self._spotlight = None
+        else:
+            desc = sj.step_description(rec)
+            if desc:
+                text = f"step {rec.index} ({rec.operation}): {desc}"
+            elif rec.operation == "execute_code":
+                effect = rec.label.removeprefix("execute_code: ") or rec.operation
+                text = (
+                    f"step {rec.index} ({rec.operation}): {effect} "
+                    "(no description — start the snippet with a # comment line)"
+                )
+            else:
+                text = f"step {rec.index} ({rec.operation}): {rec.label or '?'}"
+            self._spotlight = {"stamp": time.strftime("%H:%M:%S"), "text": text}
+        self._render_log()
 
     def _update_details(self) -> None:
         rec = self._selected_record()
         if rec is None:
             self._details_for = 0
-            self.detail_meta.setText("No step selected")
+            self._set_meta("No step selected")
             if not self.editor.document().isModified():
                 self.editor.setPlainText("")
             return
@@ -608,7 +683,7 @@ QLabel#PanelStatus {{ color: {c["dim"]}; padding: 5px 8px 4px 8px; }}
         gained = len(rec.objects_after) - len(rec.objects_before)
         if rec.state == sj.STATE_DONE and gained:
             parts.append(f"{gained:+d} object(s)")
-        self.detail_meta.setText(" · ".join(parts))
+        self._set_meta(" · ".join(parts))
         # Do not clobber a half-edited value on every 1s refresh: only refill
         # when the selection moved or the editor is untouched.
         if self._details_for != rec.index or not self.editor.document().isModified():
@@ -616,6 +691,28 @@ QLabel#PanelStatus {{ color: {c["dim"]}; padding: 5px 8px 4px 8px; }}
             self.editor.setPlainText(_editor_text(rec))
             self.editor.document().setModified(False)
         self._details_for = rec.index
+
+    def _set_meta(self, text: str) -> None:
+        """The detail meta line: one line, elided to fit — never wrapped.
+
+        The full text stays available as the tooltip; the elision is
+        recomputed from the raw text on every set and on every resize (the
+        event filter below), so widening the dock reveals more of it.
+        """
+        self._meta_raw = text
+        self.detail_meta.setToolTip(text)
+        # contentsRect, not width(): the stylesheet's 8px side padding is part
+        # of the widget but not of the text area — eliding against width()
+        # put the ellipsis 12px too far right, painted into the padding and
+        # clipped away (the "no ellipsis, just cut off" bug).
+        width = max(self.detail_meta.contentsRect().width(), 60)
+        elided = self.detail_meta.fontMetrics().elidedText(text, QtCore.Qt.ElideRight, width)
+        self.detail_meta.setText(elided)
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj is self.detail_meta and event.type() == QtCore.QEvent.Resize:
+            self._set_meta(self._meta_raw)
+        return super().eventFilter(obj, event)
 
     def _update_actions(self) -> None:
         rec = self._selected_record()
@@ -862,23 +959,73 @@ QLabel#PanelStatus {{ color: {c["dim"]}; padding: 5px 8px 4px 8px; }}
         except Exception:
             pass
 
+    @staticmethod
+    def _load_step_width() -> int:
+        """The Step column's width from the previous session, else a default."""
+        try:
+            from rpc_server.settings import load_settings
+
+            width = load_settings().get("step_panel_step_width")
+            if isinstance(width, int) and 60 <= width <= 2000:
+                return width
+        except Exception:
+            pass
+        return 220
+
+    def _columns_changed(self, *_) -> None:
+        self._columns_timer.start()
+
+    def _save_step_width(self) -> None:
+        """Persist the Step column's width (debounced from sectionResized)."""
+        try:
+            from rpc_server.settings import load_settings, save_settings
+
+            width = self.tree.header().sectionSize(1)
+            if width > 0:
+                settings = load_settings()
+                settings["step_panel_step_width"] = width
+                save_settings(settings)
+        except Exception:
+            pass
+
     def _log(self, text: str, kind: str = "info") -> None:
         """Append one timestamped entry to the persistent console.
 
         "ok" entries keep the theme's text color, "info" is dimmed, "error"
         is red — the MATLAB Command-Window idiom: output is quiet, failures
         are loud. The full history (200 entries) is the single place every
-        outcome lands, so nothing is duplicated in the status footer.
+        outcome lands, so nothing is duplicated in the status footer. The
+        entries list is the model and the QTextEdit its re-rendered view, so
+        the human-facing spotlight line (double-click) can render below the
+        history without becoming part of it.
         """
-        message = html.escape(text)
+        self._entries.append({"stamp": time.strftime("%H:%M:%S"), "text": text, "kind": kind})
+        del self._entries[:-200]
+        self._render_log()
+
+    def _entry_html(self, entry: dict) -> str:
+        message = html.escape(entry["text"]).replace("\n", "<br>")
         color = {
             "info": self._colors["dim"],
             "error": self._colors["red"],
-        }.get(kind)
+        }.get(entry["kind"])
         if color:
             message = f"<span style='color:{color}'>{message}</span>"
-        stamp = time.strftime("%H:%M:%S")
-        self.log.append(f"<span style='color:{self._colors['dim']}'>[{stamp}]</span> {message}")
+        return f"<span style='color:{self._colors['dim']}'>[{entry['stamp']}]</span> {message}"
+
+    def _spotlight_html(self, entry: dict) -> str:
+        """The double-clicked step's description: the WHOLE line — timestamp
+        included — bright and bold, so it reads as the answer, not as log
+        noise."""
+        message = html.escape(entry["text"]).replace("\n", "<br>")
+        line = f"[{entry['stamp']}] {message}"
+        return f"<b><span style='color:{self._colors['seltext']}'>{line}</span></b>"
+
+    def _render_log(self) -> None:
+        lines = [self._entry_html(e) for e in self._entries]
+        if self._spotlight is not None:
+            lines.append(self._spotlight_html(self._spotlight))
+        self.log.setHtml("<br>".join(lines))
         bar = self.log.verticalScrollBar()
         bar.setValue(bar.maximum())
 

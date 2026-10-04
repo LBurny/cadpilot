@@ -87,6 +87,124 @@ def test_panel_lifecycle_drops_duplicate_docks():
     assert "_drop_panel" in called
 
 
+def test_step_column_is_user_resizable():
+    """The Step column was Stretch — a label like 'execute_code: +1 object(s)…'
+    elided with no way to widen it. Sections must be Interactive (or
+    ResizeToContents), never Stretch."""
+    modes = [
+        _dotted(call.args[-1])
+        for call in _calls(_PANEL)
+        if (_dotted(call.func) or "").endswith(".setSectionResizeMode") and call.args
+    ]
+    assert modes, "the tree header must set an explicit resize mode"
+    assert "QtWidgets.QHeaderView.Stretch" not in modes
+    assert "QtWidgets.QHeaderView.Interactive" in modes
+
+
+def test_column_width_is_persisted():
+    """A resized Step column must survive a panel rebuild (settings key)."""
+    source = (_ADDON / "rpc_server" / "step_panel.py").read_text(encoding="utf-8")
+    assert "step_panel_step_width" in source
+
+
+def test_double_click_focuses_the_editor():
+    """Describing moved to selection; double-click keeps its edit affordance —
+    it jumps into the parameter editor."""
+    for call in _calls(_PANEL):
+        if (_dotted(call.func) or "").endswith("itemDoubleClicked.connect"):
+            assert call.args and _dotted(call.args[0]) == "self._focus_editor"
+            return
+    raise AssertionError("itemDoubleClicked is not connected")
+
+
+def _panel_function(name: str):
+    return next(n for n in ast.walk(_PANEL) if isinstance(n, ast.FunctionDef) and n.name == name)
+
+
+def test_detail_card_does_not_repeat_the_description():
+    """The description shows ONCE — in the log spotlight. The detail card's
+    meta line repeating it read as noise."""
+    func = _panel_function("_update_details")
+    called = {_dotted(c.func) for c in ast.walk(func) if isinstance(c, ast.Call)}
+    assert "sj.step_description" not in called
+
+
+def test_selecting_a_step_shows_its_description_immediately():
+    """One click is enough: selecting a step refreshes the description
+    spotlight (double-click used to be the trigger)."""
+    func = _panel_function("_on_selection")
+    called = {_dotted(c.func) for c in ast.walk(func) if isinstance(c, ast.Call)}
+    assert "self._update_spotlight" in called
+
+
+def test_refresh_keeps_the_spotlight_in_sync():
+    """The 1s refresh rebuilds the tree with signals blocked, so _on_selection
+    does not fire — _render must refresh the spotlight itself (else a snippet's
+    edited comment would not show until the selection moved)."""
+    func = _panel_function("_render")
+    called = {_dotted(c.func) for c in ast.walk(func) if isinstance(c, ast.Call)}
+    assert "self._update_spotlight" in called
+
+
+def test_spotlight_is_human_only_not_a_log_entry():
+    """The spotlight is for the human, not the debug history: _update_spotlight
+    must NOT append a log entry (the log is for debugging) — it sets ONE
+    spotlight line rendered below the entries, timestamp included, replaced on
+    the next selection."""
+    func = _panel_function("_update_spotlight")
+    called = {_dotted(c.func) for c in ast.walk(func) if isinstance(c, ast.Call)}
+    assert "self._log" not in called, "the spotlight must not pollute the debug log"
+    stores = [
+        n
+        for n in ast.walk(func)
+        if isinstance(n, ast.Attribute) and n.attr == "_spotlight" and isinstance(n.ctx, ast.Store)
+    ]
+    assert stores, "_update_spotlight must set self._spotlight"
+
+
+def test_detail_meta_elides_instead_of_wrapping():
+    """The detail meta line is ONE elided line — a wrapped two-line meta read
+    as clutter."""
+    source = (_ADDON / "rpc_server" / "step_panel.py").read_text(encoding="utf-8")
+    assert "detail_meta.setWordWrap(False)" in source
+    assert "elidedText" in source
+
+
+def test_param_editor_does_not_wrap():
+    """The code pane must scroll horizontally instead of wrapping: a soft-
+    wrapped code line is unreadable. NoWrap on the editor (the log console
+    keeps WidgetWidth — prose can wrap, code cannot)."""
+    for call in _calls(_PANEL):
+        if not (_dotted(call.func) or "").endswith(".setLineWrapMode") or not call.args:
+            continue
+        if _dotted(call.args[0]) == "QtWidgets.QPlainTextEdit.NoWrap":
+            return
+    raise AssertionError("the parameter editor must set QPlainTextEdit.NoWrap")
+
+
+def test_detail_meta_elides_against_the_padded_width():
+    """Eliding against label.width() put the ellipsis under the 8px stylesheet
+    padding — computed, but painted into the padding and clipped away. The
+    elide target must be the contents rect (padding excluded)."""
+    func = _panel_function("_set_meta")
+    called = {_dotted(c.func) for c in ast.walk(func) if isinstance(c, ast.Call)}
+    assert any((c or "").endswith(".contentsRect") for c in called)
+
+
+def test_detail_meta_does_not_demand_the_text_width():
+    """A non-wrapping QLabel reports minimumSizeHint == the full text width, so
+    the layout took it as a width FLOOR — and every refresh wrote a
+    differently-elided text, so the dock's width tracked the text and jittered.
+    The horizontal size policy must be Ignored: the layout gives the label the
+    available width and the elision fits inside it."""
+    for call in _calls(_PANEL):
+        if not (_dotted(call.func) or "").endswith(".setSizePolicy") or len(call.args) < 2:
+            continue
+        if _dotted(call.args[0]) == "QtWidgets.QSizePolicy.Ignored":
+            return
+    raise AssertionError("detail_meta must set an Ignored horizontal size policy")
+
+
 # --- FreeCAD's bare-exec namespace trap -------------------------------------
 #
 # FreeCAD runs InitGui.py with a bare exec() into a namespace that is NOT the

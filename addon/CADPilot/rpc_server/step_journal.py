@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any
@@ -269,6 +270,70 @@ def effect_label(changed: bool, before: list[str], after: list[str]) -> str:
     if removed:
         return f"-{len(removed)} object(s)"
     return "changed properties"
+
+
+# A PEP-263 coding cookie ("# -*- coding: utf-8 -*-", "# coding=latin-1") is
+# encoding boilerplate, never a step description.
+_CODING_RE = re.compile(r"^#.*\bcoding[:=]")
+
+
+def snippet_description(code: str) -> str:
+    """The execute_code description convention: the snippet's LEADING comment
+    block is the step's human description ("# 步骤1: 琴身轮廓 + f孔").
+
+    Leading blank lines, a shebang and the coding cookie are boilerplate and
+    skipped; the block ends at its first blank or non-comment line — a later
+    comment is an implementation note, not the description. "" = the snippet
+    carries no description (callers fall back to the effect label).
+    """
+    lines: list[str] = []
+    for raw in str(code or "").splitlines():
+        line = raw.strip()
+        if not lines and (not line or line.startswith("#!") or _CODING_RE.match(line)):
+            continue
+        if not line.startswith("#"):
+            break
+        lines.append(line[1:].strip())
+    return "\n".join(lines).strip()
+
+
+def step_description(rec: StepRecord) -> str:
+    """A step's human description — one rule for every op, so the panel has a
+    single canonical text to show (row, tooltip, spotlight).
+
+    execute_code: the snippet's leading comment block (snippet_description) —
+    the recorded label only says what the snippet DID, not what it IS. Every
+    other op: the recorded label, which is already human text ("pad 'Pad'", a
+    snapshot's note).
+    """
+    if rec.operation == "execute_code":
+        return snippet_description(str((rec.params or {}).get("code") or ""))
+    return rec.label
+
+
+def row_text(rec: StepRecord) -> str:
+    """The panel tree row for one step.
+
+    An execute_code row leads with its description (what the snippet IS) and
+    keeps the effect (what it DID) behind it. The description is read off the
+    CURRENT params, so editing the snippet's leading comment updates the row on
+    the next refresh. Pure so the display rule is unit-testable without Qt.
+    """
+    label = rec.label
+    desc = step_description(rec)
+    if rec.operation == "execute_code" and desc:
+        label = f"{desc.splitlines()[0]} · {rec.label.removeprefix('execute_code: ')}"
+    if rec.error:
+        label += f"  — {rec.error}"
+    return label
+
+
+def tooltip_text(rec: StepRecord) -> str:
+    """Full row text for hover: the whole description block, then the label."""
+    desc = step_description(rec)
+    if desc and desc != rec.label:
+        return f"{desc}\n{rec.label.removeprefix('execute_code: ')}"
+    return rec.label
 
 
 def build_record(

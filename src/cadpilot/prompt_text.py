@@ -128,4 +128,7 @@ computing Placement values; use relative moves and alignment instead:
    get_topology first to pick edges/faces by index. execute_code remains
    for anything cad() cannot express; for long-running pure OCCT
    computations use execute_code_async() + get_task_result().
+   ALWAYS start an execute_code snippet with a one-line `# comment` stating
+   what the step does (e.g. `# Cut the f-holes`) — the Steps panel shows
+   that leading comment block as the step's description.
 """

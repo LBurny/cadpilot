@@ -67,6 +67,110 @@ def test_effect_label_summarises_a_snippet():
     assert sj.effect_label(True, ["A"], ["A"]) == "changed properties"
 
 
+def test_snippet_description_reads_the_leading_comment_block():
+    """The execute_code description convention: the snippet's LEADING comment
+    block is the step's human description — the steps panel shows it in the
+    row, the tooltip and (on double-click) the log."""
+    code = "# 步骤1: 琴身轮廓 + f孔\n# 样条曲线插值\nimport FreeCAD\n"
+    assert sj.snippet_description(code) == "步骤1: 琴身轮廓 + f孔\n样条曲线插值"
+
+
+def test_snippet_description_skips_shebang_and_coding_lines():
+    """Boilerplate lines are not description: shebang and the PEP-263 coding
+    cookie (what the MCP client prepends) are skipped before the block."""
+    code = "# -*- coding: utf-8 -*-\n# Cut the f-holes\nimport FreeCAD\n"
+    assert sj.snippet_description(code) == "Cut the f-holes"
+    assert sj.snippet_description("#!/usr/bin/env python3\n# Body\nx = 1\n") == "Body"
+
+
+def test_snippet_description_stops_at_the_first_blank_or_code_line():
+    """Only the leading block: a later comment is an implementation note."""
+    code = "# Title\n\n# not part of the description\nimport FreeCAD\n"
+    assert sj.snippet_description(code) == "Title"
+    assert sj.snippet_description("# A\nx = 1\n# B\n") == "A"
+
+
+def test_snippet_description_is_empty_without_a_leading_comment():
+    assert sj.snippet_description("import FreeCAD\n# trailing\n") == ""
+    assert sj.snippet_description("") == ""
+    assert sj.snippet_description(None) == ""
+    assert sj.snippet_description("# coding: utf-8\nimport Part\n") == ""
+
+
+def test_step_description_prefers_the_snippet_comment_for_execute_code():
+    rec = sj.StepRecord(
+        index=1,
+        operation="execute_code",
+        label="execute_code: +1 object(s): Body",
+        params={"code": "# 琴身轮廓\nimport FreeCAD\n"},
+    )
+    assert sj.step_description(rec) == "琴身轮廓"
+
+
+def test_step_description_uses_the_label_for_other_ops():
+    """Every other op's recorded label IS its human description."""
+    rec = sj.StepRecord(index=1, operation="pad", label="pad 'Pad'")
+    assert sj.step_description(rec) == "pad 'Pad'"
+
+
+def test_step_description_is_empty_for_an_uncommented_snippet():
+    rec = sj.StepRecord(
+        index=1,
+        operation="execute_code",
+        label="execute_code: read-only",
+        params={"code": "import FreeCAD\n"},
+    )
+    assert sj.step_description(rec) == ""
+
+
+def test_row_text_leads_with_the_description():
+    """An execute_code row is identifiable by its description, with the effect
+    kept behind it — a column of 'execute_code: +1 object(s)…' rows told the
+    user nothing."""
+    rec = sj.StepRecord(
+        index=3,
+        operation="execute_code",
+        label="execute_code: +1 object(s): Body",
+        params={"code": "# 步骤1: 琴身轮廓 + f孔\n# 样条曲线\nimport FreeCAD\n"},
+    )
+    assert sj.row_text(rec) == "步骤1: 琴身轮廓 + f孔 · +1 object(s): Body"
+
+
+def test_row_text_falls_back_to_the_label():
+    """No comment (or another op): the label is the row, unchanged."""
+    bare = sj.StepRecord(
+        index=1,
+        operation="execute_code",
+        label="execute_code: read-only",
+        params={"code": "import FreeCAD\n"},
+    )
+    assert sj.row_text(bare) == "execute_code: read-only"
+    pad = sj.StepRecord(index=2, operation="pad", label="pad 'Pad'")
+    assert sj.row_text(pad) == "pad 'Pad'"
+
+
+def test_row_text_appends_the_error():
+    rec = sj.StepRecord(index=4, operation="pad", label="pad 'Pad'", error="ValueError: boom")
+    assert sj.row_text(rec).endswith("— ValueError: boom")
+
+
+def test_tooltip_text_shows_the_whole_description_block():
+    rec = sj.StepRecord(
+        index=3,
+        operation="execute_code",
+        label="execute_code: +1 object(s): Body",
+        params={"code": "# 琴身轮廓\n# 样条曲线插值\nimport FreeCAD\n"},
+    )
+    assert sj.tooltip_text(rec) == "琴身轮廓\n样条曲线插值\n+1 object(s): Body"
+
+
+def test_tooltip_text_is_the_label_when_there_is_no_description():
+    bare = sj.StepRecord(index=1, operation="execute_code", label="execute_code: read-only")
+    assert sj.tooltip_text(bare) == "execute_code: read-only"
+    pad = sj.StepRecord(index=2, operation="pad", label="pad 'Pad'")
+    assert sj.tooltip_text(pad) == "pad 'Pad'"
+
+
 def test_steps_without_undo_are_the_ones_a_rollback_leaves_behind():
     """The trigger for the whole fix: a step after the target that owns no
     transaction keeps its changes, so reporting plain success there is wrong."""
