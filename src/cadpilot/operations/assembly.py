@@ -74,6 +74,26 @@ def _rpc_error(res: Any, operation: str) -> ToolResponse | None:
     return None
 
 
+def _session_doc_mismatch(session: astate.AssemblySession, doc_name: str | None) -> str:
+    """Refuse an op aimed at a DIFFERENT document than the active session's.
+
+    The current assembly session is one global slot per MCP server process,
+    and several agents share that process: an op trusting the slot blindly
+    mates/rolls back the OTHER agent's document (live: rollback with
+    doc_name=R4G_Asm returned R4G_Asm2's objects while R4G_Asm never moved;
+    to_step=1 there would have dismantled a stranger's assembly). Every op
+    carries doc_name, so a mismatch is detectable — say it instead of acting.
+    """
+    if doc_name and session.doc_name and doc_name != session.doc_name:
+        return (
+            f"the active assembly session {session.session_id} tracks document "
+            f"'{session.doc_name}', not '{doc_name}' (another agent or a restarted "
+            "client owns it). Pass its document's name, or start/resume a session "
+            f"for '{doc_name}'."
+        )
+    return ""
+
+
 def assembly_session_operation(
     conn,
     operation: str,
@@ -91,6 +111,7 @@ def assembly_session_operation(
     if operation == "start":
         if not (doc_name and part):
             return text_response("start requires doc_name and part (the ground part)")
+        replaced = astate.current_session()
         spec = {"operation": "start", "ground": part, "name": name or ""}
         res = conn.assembly_op(doc_name, spec)
         if (err := _rpc_error(res, "start")) is not None:
@@ -115,18 +136,29 @@ def assembly_session_operation(
         )
         session.components[part] = {"link": ground_link, "added_step": st.step_number}
         astate.save(session)
-        return json_response(
-            {
-                "started": session.name,
-                "session_id": session.session_id,
-                "assembly": session.assembly_name,
-                **res,
-            }
-        )
+        started: dict[str, Any] = {
+            "started": session.name,
+            "session_id": session.session_id,
+            "assembly": session.assembly_name,
+            **res,
+        }
+        if (
+            replaced is not None
+            and replaced.status == "active"
+            and replaced.session_id != session.session_id
+        ):
+            started["note"] = (
+                f"this replaced the active assembly session {replaced.session_id} of "
+                f"document '{replaced.doc_name}' — its steps are still on disk "
+                "(session list) but it is no longer current."
+            )
+        return json_response(started)
 
     session = astate.current_session()
     if session is None or session.status != "active":
         return text_response("No active assembly session; call start first")
+    if err := _session_doc_mismatch(session, doc_name):
+        return text_response(err)
 
     if operation == "add_component":
         if not part:

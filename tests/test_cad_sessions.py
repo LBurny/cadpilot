@@ -8,6 +8,7 @@ from cadpilot.operations import (
     inspect_freecad_operation,
     recall_patterns_operation,
     save_pattern_operation,
+    session_action_operation,
     session_add_note_operation,
     session_complete_operation,
     session_get_steps_operation,
@@ -520,3 +521,37 @@ def test_align_shapes_failed_op_not_recorded(fake_freecad, isolated_home):
     data = _json(resp)
     assert data["success"] is False
     assert sess.step_count == 0
+
+
+def test_session_actions_refuse_another_documents_session(fake_freecad, isolated_home):
+    """The current session is ONE global slot per MCP server process, and several
+    agents share that process: a status/rollback trusting the slot answers for —
+    or undoes — the OTHER agent's document (live: an agent's rollback was refused
+    with a stranger session's step range while its own document had 6 valid undo
+    steps). A call that NAMES a document must be refused, not redirected."""
+    _start_session(fake_freecad, doc="DocA")
+    resp = session_action_operation(fake_freecad, "status", doc_name="DocB")
+    text = _text(resp)
+    assert "tracks document 'DocA'" in text, text
+    assert "DocB" in text
+    # Same document (and no document named at all) keeps working.
+    assert "success" in _text(session_action_operation(fake_freecad, "status", doc_name="DocA"))
+    assert "success" in _text(session_action_operation(fake_freecad, "status"))
+
+
+def test_step_control_failure_carries_the_document_state(fake_freecad, isolated_home):
+    """A bare "step 1 (batch): ValueError: …" hid that replay had already rolled
+    the model back to step 0 (live: the document came out with 0 objects)."""
+    from cadpilot.operations.core import step_control_operation
+
+    fake_freecad.journal_op = lambda doc_name, spec: {
+        "success": False,
+        "error": "step 1 (batch): ValueError: bad alias",
+        "warning": "replay rolled the document back to step 0 before re-running, so it "
+        "now holds only what re-ran successfully (0 step(s))",
+        "document_objects": [],
+    }
+    text = _text(step_control_operation(fake_freecad, "Doc", "replay"))
+    assert "bad alias" in text
+    assert "rolled the document back to step 0" in text
+    assert "now holds: (nothing)" in text

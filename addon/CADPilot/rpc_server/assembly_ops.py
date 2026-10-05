@@ -402,6 +402,23 @@ def _bbox_dist(b1, b2):
     return math.sqrt(dx * dx + dy * dy + dz * dz)
 
 
+def _audit_bbox(shape):
+    """BoundBox enlarged a hair, for the audit's cheap prefilters only.
+
+    OCC's BoundBox is built from control points, so it can UNDER-report a
+    curved shape (measured: a torus with tube radius 8 reports z +-7.94; a
+    spline-revolved mug +-39.79 for 40). A prefilter that trusts it skips
+    pairs that really touch — a false island or a missed interference — and
+    inflates nearest distances into false "floating" reports. 0.25 mm sits
+    well above the observed error at part scale and well below any real
+    clearance; the exact distToShape still decides every pair that survives.
+    """
+    bb = shape.BoundBox
+    with contextlib.suppress(Exception):
+        bb.enlarge(0.25)
+    return bb
+
+
 _CONTACT_TOLERANCE = 0.5  # mm — exact distance that counts as touching
 _MAX_ISLAND_REPORT = 10
 _MAX_ISLAND_OBJECTS = 20
@@ -504,6 +521,9 @@ def verify_assembly(doc_name, checks=None, float_threshold=1.0, interference_min
         # the contact tolerance so contact edges are collected for free.
         scan_range = max(float_threshold, _CONTACT_TOLERANCE)
         name_index = {name: i for i, (name, _) in enumerate(shaped)}
+        # One enlarged BoundBox per object: the raw BoundBox under-reports
+        # curved shapes, and these filters decide which pairs get measured.
+        bboxes = {name: _audit_bbox(shape) for name, shape in shaped}
         edges = []  # contact edges as index pairs
         floating = []
         for i, (name, shape) in enumerate(shaped):
@@ -514,7 +534,7 @@ def verify_assembly(doc_name, checks=None, float_threshold=1.0, interference_min
             for j, (other_name, other) in enumerate(shaped):
                 if i == j:
                     continue
-                d = _bbox_dist(shape.BoundBox, other.BoundBox)
+                d = _bbox_dist(bboxes[name], bboxes[other_name])
                 if d < best_bbox:
                     best_bbox, best_name = d, other_name
                 if d <= scan_range:
@@ -534,6 +554,16 @@ def verify_assembly(doc_name, checks=None, float_threshold=1.0, interference_min
                     for on, d in dists:
                         if d <= _CONTACT_TOLERANCE:
                             edges.append((i, name_index[on]))
+            if best_exact is None and best_name is not None:
+                # No pair inside the scan range: the bbox distance is only a
+                # PREfilter value and it comes from the INFLATED box, so it
+                # under-reads the gap by up to 0.5 mm (live: a true 3.0 mm gap
+                # reported as 2.5). Pay one exact measurement for the nearest
+                # candidate so a reported "floating" distance is real.
+                try:
+                    best_exact = shape.distToShape(dict(shaped)[best_name])[0]
+                except Exception:
+                    skipped_unmeasurable += 1
             nearest = best_exact if best_exact is not None else best_bbox
             if nearest > float_threshold:
                 floating.append({"obj": name, "nearest": best_name, "distance_mm": _r(nearest)})
@@ -545,7 +575,7 @@ def verify_assembly(doc_name, checks=None, float_threshold=1.0, interference_min
             name_a, shape_a = shaped[i]
             for j in range(i + 1, len(shaped)):
                 name_b, shape_b = shaped[j]
-                if _bbox_dist(shape_a.BoundBox, shape_b.BoundBox) > 0:
+                if _bbox_dist(bboxes[name_a], bboxes[name_b]) > 0:
                     continue
                 try:
                     vol = shape_a.common(shape_b).Volume
@@ -577,7 +607,7 @@ def verify_assembly(doc_name, checks=None, float_threshold=1.0, interference_min
             for name in comp:
                 shape = shaped[name_index[name]][1]
                 for mn, mshape in main_shapes:
-                    d = _bbox_dist(shape.BoundBox, mshape.BoundBox)
+                    d = _bbox_dist(bboxes[name], bboxes[mn])
                     if d < best_bbox:
                         best_bbox, best_pair = d, (mn, shape, mshape)
             best_gap, best_main = None, None

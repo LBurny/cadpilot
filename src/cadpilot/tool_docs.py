@@ -85,8 +85,12 @@ boolean — parametric Boolean (obj_name = base object).
 Required in obj_properties: op (fuse/cut/common), tool. Optional: name.
 Without name the result is named after the op ("Cut"/"Fuse"/"Common"), which
 FreeCAD de-duplicates — read the actual name from the response.
-tool: single object name OR a list — multiple tools are combined into one
-(hidden) Part::Compound that stays linked as the boolean's Tool.""",
+tool: single object name OR a list. Several tools are a REAL multi-boolean:
+fuse/cut aggregate them with Part::MultiFuse (used as the hidden Tool for cut)
+and common intersects ALL of them (Part::MultiCommon). A compound Tool must not
+be used: it does not merge overlapping tools (a box+arm+knuckle fuse measured
+17462 mm^3 against the true 15765), and for common it flips the meaning to
+base ∩ (T1 ∪ T2) instead of base ∩ T1 ∩ T2.""",
     "fillet": """\
 fillet — parametric fillet (obj_name = base object).
 Required in obj_properties: edges (selector), radius. Optional: name.
@@ -155,6 +159,11 @@ Optional: plane, offset, body, construction, external, constraints.
 - plane: "XY" / "XZ" / "YZ" (with optional offset along the plane normal),
   {"face": ["ObjName", "FaceN"], "offset": 0} to sketch on an existing solid
   face, or {"datum": "DatumPlaneName"} to sketch on a datum plane.
+  A base-plane name means FreeCAD's own origin plane, identically to a datum
+  plane made on it: XY has x->+X, y->+Y, normal +Z; XZ has x->+X, y->+Z,
+  normal -Y; YZ has x->+Y, y->+Z, normal +X. So a profile drawn upward in y on
+  XZ rises along +Z, and offset moves along the plane's normal (+offset on XZ
+  goes toward -Y). The result echoes x_axis/y_axis/normal for the plane.
   PREFER A DIRECTION OVER A FACE NAME: {"face": ["ObjName", "+Z"]} (also -Z,
   +X/-X, +Y/-Y, top/bottom/left/right/front/back, MaxX/MinZ/…) resolves to the
   planar face facing that way. Face names (Face1, Face2, …) are re-derived
@@ -166,8 +175,12 @@ Optional: plane, offset, body, construction, external, constraints.
   CORNER on rectangular faces (a circle meant for the middle of a 100x60 side
   face lands at its corner and the cut is clipped by the part's edge).
   The sketch result echoes the resolved `plane` (object, face name, center,
-  normal, centered) so a surprise pick is visible — a direction token picks the
-  FARTHEST face facing that way.
+  normal, centered) plus `sketch_origin` — where the sketch's origin actually
+  landed, which is NOT the reported face center unless you passed
+  `"center": true` (a face's parametric origin is a CORNER on a rectangular
+  face, so a profile drawn around the origin hangs off the part). A direction
+  token picks the FARTHEST face facing that way, and the echo lists
+  `same_direction` alternatives.
 - geometry: list of items; the list order is the GeoId used in constraints:
     {"type": "line", "from": [x,y], "to": [x,y]}
     {"type": "arc", "center": [x,y], "radius": r, "start_angle": deg, "end_angle": deg}
@@ -242,8 +255,15 @@ Attachment fusion: on a face-attached sketch, pocket CUTS the supporting
 solid via attachment — no boolean needed.""",
     "revolution": """\
 revolution — revolve a closed profile (obj_name = profile sketch).
-Optional: axis ("X"/"Y"/"Z" sketch axes, or {"edge": ["ObjName", "EdgeN"]}),
-angle (degrees, default 360), body, name.""",
+Optional: axis (default "Y" = the sketch's in-plane V axis, the usual lathe
+setup where the profile's y is the axial position and x the radius; "X" = the
+in-plane H axis; {"edge": ["ObjName", "EdgeN"]} for an external axis),
+angle (degrees, default 360), reversed, body, name.
+axis "Z" is the profile's own normal and is REFUSED: revolving a planar
+profile about its normal keeps every point in the drawing plane, so it can
+only ever produce a flat zero-volume shell (FreeCAD still reports success).
+A profile that CROSSES its revolve axis is refused too — FreeCAD's own reason
+("Revolve axis intersects the sketch") is carried into the error.""",
     "groove": """\
 groove — subtractive revolution (obj_name = profile sketch).
 Same axis/angle params as revolution.""",
@@ -323,13 +343,25 @@ Anchors and points must sit ON the part: the ref resolves to the nearest
 PLANAR FACE within 1 mm. The auto faceN_center anchors lie on their face;
 the axis_*/bbox_* anchors do not, so use those for assemble/verify checks
 rather than as mate refs.
-The contact point maps to the nearest VERTEX of the face, which decides WHERE
-on the face the mate lands (GUI click semantics). On a symmetric face the
-nearest vertex to the center is arbitrary (a square face lands at a corner),
-so the mate result reports the landing vertices and warns when the landing
-is far from the face center — control it with "point_on_face": [x,y,z]
-(a face-ref modifier picking the vertex near that global point), an anchor,
-or a point ref.
+The contact point follows FreeCAD's own click rules and decides WHERE on the
+face the mate lands: a face ref without a hint lands on the FACE CENTER (the
+face-name marker the GUI writes for a plain selection), and it is what makes
+a fixed mate of two circular faces concentric; with "point_on_face" it lands
+on the closest selectable point (vertex, circular edge center, face center).
+A circular planar face has exactly ONE vertex (OCC's seam), which is why
+"nearest vertex" logic used to land bolt holes R-r off axis with residual 0.
+The result reports `landing` (the resolved sub-elements), `landing_points`
+(where the JCS actually landed, mm) and `warnings` when a hint/anchor/point
+ref snapped somewhere more than 0.5 mm from the point it aimed at.
+For a cylindrical face a plain face ref lands on the AXIS (FreeCAD projects
+the face center onto it) — an axis-based joint on two cylindrical faces is
+the axle-in-hole form; for two rotational faces `residual_mm` is measured
+AXIS-to-AXIS and the result says `residual_basis: "axis"` (a surface distance
+for an axle fit is its radial gap, so a 5 mm pin in a 20 mm bore would read
+as a 15 mm error even when the axes are perfect). An axis joint aligns the two
+reference POINTS, so a partial curved face can slide the part along the axis:
+when it moves more than 2 mm, `axial_slide_mm` reports the displacement and a
+warning says to pin the axial position with `point_on_face`.
 
 joint_type: fixed (default) / revolute / cylindrical / slider / ball /
 distance / parallel / perpendicular / angle.

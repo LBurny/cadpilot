@@ -860,6 +860,19 @@ def _apply_op(doc, spec: dict[str, Any]) -> dict[str, Any]:
             return res
         out = _run_steps(doc, read_journal(doc), limit=None, upto=None)
         out["replayed_from"] = from_index
+        if not out.get("success"):
+            # Replay rolls back to 0 FIRST, so a re-run failure leaves the
+            # document holding only the steps that re-ran before it. The old
+            # reply named the failing step and nothing else; the caller found an
+            # emptied model on its next call (live: a failed batch step left 0
+            # objects while the error text said nothing about it).
+            out["document_objects"] = [o.Name for o in doc.Objects]
+            out["warning"] = (
+                "replay rolled the document back to step 0 before re-running, so it now "
+                f"holds only what re-ran successfully ({len(out.get('executed', []))} "
+                "step(s)); the model is NOT the pre-replay state. Fix the failing step "
+                "(step_control update/reject) and replay again."
+            )
         return out
     if operation == "reset":
         # confirm arrives top-level from the RPC spec and, for callers that

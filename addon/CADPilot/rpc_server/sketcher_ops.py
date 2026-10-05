@@ -26,12 +26,16 @@ _LAST_ATTACHMENT: dict | None = None
 # spec point keyword -> Sketcher PointPos
 _POINT_POS = {"start": 1, "end": 2, "center": 3, "mid": 3}
 
-# Base-plane placements: sketch local +Z is the drawing normal.
-# Convention: XZ sketch normal = +Y, YZ sketch normal = +X.
+# Base-plane placements as (yaw, pitch, roll) degrees, copied from FreeCAD's
+# own origin planes (XY_Plane R=identity, XZ_Plane roll +90, YZ_Plane
+# yaw 90/roll 90). Matching them is the point: plane="XZ" and a datum plane on
+# XZ_Plane must mean the SAME frame, or the same profile comes out mirrored
+# (the old XZ entry was R_x(-90), which put the drawing's +v along global -Z
+# and the solid below the XY plane while datum_plane(XZ) put it above).
 _BASE_PLANES = {
-    "XY": ((0, 0, 0), (1, 0, 0), 0),
-    "XZ": ((0, 0, 0), (1, 0, 0), -90),
-    "YZ": ((0, 0, 0), (0, 1, 0), 90),
+    "XY": (0, 0, 0),
+    "XZ": (0, 0, 90),
+    "YZ": (90, 0, 90),
 }
 
 
@@ -418,6 +422,11 @@ def _resolve_semantic_face(ref, token: str) -> str:
     return best[1]
 
 
+def _vec3(vec) -> list:
+    """A vector in the same rounded form as the other echoes (4 decimals)."""
+    return [round(float(v), 4) for v in vec]
+
+
 def _face_echo(obj, face_name: str) -> dict:
     """A small report of the face a selector resolved to (name/center/normal)."""
     entry = {"object": obj.Name, "face": face_name}
@@ -486,11 +495,19 @@ def _attach_sketch(sketch, doc, spec):
         key = plane.upper()
         if key not in _BASE_PLANES:
             raise ValueError(f"plane must be XY/XZ/YZ or {{'face': ...}}, got {plane!r}")
-        _, axis, angle = _BASE_PLANES[key]
-        normal = FreeCAD.Rotation(FreeCAD.Vector(*axis), angle).multVec(FreeCAD.Vector(0, 0, 1))
-        sketch.Placement = FreeCAD.Placement(
-            normal * offset, FreeCAD.Rotation(FreeCAD.Vector(*axis), angle)
-        )
+        rot = FreeCAD.Rotation(*_BASE_PLANES[key])
+        normal = rot.multVec(FreeCAD.Vector(0, 0, 1))
+        sketch.Placement = FreeCAD.Placement(normal * offset, rot)
+        # Echo the plane's local axes in global terms: a profile's "+v" is the
+        # single most surprising thing about a non-XY base plane, and until
+        # this echo existed the caller had to infer it from a flipped result.
+        _LAST_ATTACHMENT = {
+            "plane": key,
+            "offset": offset,
+            "x_axis": _vec3(rot.multVec(FreeCAD.Vector(1, 0, 0))),
+            "y_axis": _vec3(rot.multVec(FreeCAD.Vector(0, 1, 0))),
+            "normal": _vec3(normal),
+        }
         return
 
     if isinstance(plane, dict) and plane.get("face"):
@@ -529,6 +546,17 @@ def _attach_sketch(sketch, doc, spec):
             sketch.AttachmentOffset = FreeCAD.Placement(
                 FreeCAD.Vector(0, 0, offset), FreeCAD.Rotation()
             )
+        # The echo used to report only the FACE center, which a caller reads as
+        # "the sketch origin is here" — while the origin actually sits on the
+        # face's parametric origin (a corner). Say where the origin IS (live: a
+        # centered rib profile drew its rectangle around the corner and hung
+        # half of it outside the part, with the volume still adding up).
+        _LAST_ATTACHMENT["sketch_origin"] = _vec3(sketch.Placement.Base)
+        if not plane.get("center"):
+            _LAST_ATTACHMENT["note"] = (
+                "the sketch origin sits on the face's parametric origin (a corner on a "
+                'rectangular face); pass "center": true to put it at the face center'
+            )
         return
 
     if isinstance(plane, dict) and plane.get("datum"):
@@ -541,10 +569,17 @@ def _attach_sketch(sketch, doc, spec):
         _LAST_ATTACHMENT = {"object": ref.Name, "type": "datum"}
         with contextlib.suppress(Exception):
             # Follow the datum's own support so the echo names the REAL base
-            # face the sketch hangs off.
+            # face the sketch hangs off. LinkSub sub-elements arrive as a list
+            # or tuple — str() on it leaked a Python repr ("('Face3',)").
             support = list(getattr(ref, "AttachmentSupport", None) or [])
             if support and support[0]:
-                _LAST_ATTACHMENT["support"] = _face_echo(support[0][0], str(support[0][1]))
+                subs = support[0][1] if len(support[0]) > 1 else ""
+                if isinstance(subs, (list, tuple)):
+                    subs = subs[0] if subs else ""
+                if subs:
+                    _LAST_ATTACHMENT["support"] = _face_echo(support[0][0], str(subs))
+                else:
+                    _LAST_ATTACHMENT["support"] = {"object": support[0][0].Name}
         if offset:
             sketch.AttachmentOffset = FreeCAD.Placement(
                 FreeCAD.Vector(0, 0, offset), FreeCAD.Rotation()

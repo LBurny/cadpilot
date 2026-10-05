@@ -295,6 +295,7 @@ def execute_operations_operation(
                 "summary": (
                     f"Batch finished: {succeeded}/{total} operations succeeded"
                     + (" (stopped early)" if stop_on_error and succeeded < total else "")
+                    + _BATCH_COMMIT_NOTE
                 ),
                 **res,
             }
@@ -584,7 +585,11 @@ def cad_operation(
             results = res.get("results", [])
             batch_succeeded = sum(1 for r in results if r.get("success"))
             success = bool(res.get("success"))
-            summary = f"Batch finished: {batch_succeeded}/{len(results)} operations succeeded"
+            summary = (
+                f"Batch finished: {batch_succeeded}/{len(results)} operations succeeded"
+                + (" (stopped early)" if stop_on_error and batch_succeeded < len(results) else "")
+                + _BATCH_COMMIT_NOTE
+            )
             params_summary = f"{len(ops)} ops"
             default_desc = f"batch of {len(ops)} ops"
         else:
@@ -1060,7 +1065,16 @@ def step_control_operation(
     except Exception as e:
         return text_response(f"step_control failed: {e!s}")
     if not res.get("success"):
-        return text_response(f"step_control '{action}' failed: {res.get('error')}")
+        # A bare error string hides the state the caller most needs: after a
+        # replay that rolled back to 0 first, the document may be nearly empty
+        # and nothing in "step 1 (batch): ValueError: …" said so (live-caught).
+        detail = res.get("error") or "unknown error"
+        if res.get("warning"):
+            detail = f"{detail}\n{res['warning']}"
+        objs = res.get("document_objects")
+        if objs is not None:
+            detail = f"{detail}\nThe document now holds: {', '.join(objs) or '(nothing)'}"
+        return text_response(f"step_control '{action}' failed: {detail}")
     return json_response(res)
 
 
@@ -1247,6 +1261,15 @@ def session_action_operation(
         if not doc_name:
             return text_response("session(action='start') requires doc_name")
         return session_start_operation(freecad, doc_name, name, create_document)
+    # The current session is ONE global slot per MCP server process, and several
+    # agents share that process: a status/rollback that trusts the slot answers
+    # for — or undoes — the OTHER agent's document (live: an agent's rollback
+    # was refused with the stranger session's step range while its own document
+    # had 6 valid undo steps). Every call carries doc_name, so a mismatch is
+    # detectable; say it instead of acting.
+    guarded = ("status", "get_steps", "rollback", "redo", "add_note", "pause", "complete")
+    if action in guarded and (err := _session_doc_mismatch(doc_name)):
+        return text_response(err)
     if action == "status":
         return session_status_operation(freecad)
     if action == "get_steps":
@@ -1278,6 +1301,35 @@ def session_action_operation(
     return text_response(
         f"unknown session action '{action}'. Supported: {', '.join(_SESSION_ACTIONS)}"
     )
+
+
+# Said on every batch summary: a partially failed batch COMMITS the ops that
+# worked (one undo step removes the whole batch), which a bare "3/4 succeeded"
+# left ambiguous — callers read it as "the batch was rolled back".
+_BATCH_COMMIT_NOTE = (
+    " — the successful ops ARE committed (the whole batch is one undo step; "
+    "step_control rollback_to removes it)"
+)
+
+
+def _session_doc_mismatch(doc_name: str | None) -> str:
+    """Refuse a session action aimed at a document the active session is not on.
+
+    Only checked when the caller NAMED a document (doc_name=None keeps the
+    single-agent flow working) — a client that says which document it means
+    must never get away with acting on another one.
+    """
+    current = get_current_session()
+    if current is None or not doc_name or not current.doc_name:
+        return ""
+    if doc_name != current.doc_name:
+        return (
+            f"the active session {current.session_id} tracks document "
+            f"'{current.doc_name}', not '{doc_name}' (another agent or a restarted "
+            "client owns it). Pass its document's name, or start/resume a session "
+            f"for '{doc_name}'."
+        )
+    return ""
 
 
 # --- pattern memory ------------------------------------------------------------

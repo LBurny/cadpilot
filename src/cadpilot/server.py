@@ -546,7 +546,8 @@ def measure_geometry(ctx: Context, doc_name: str, obj_name: str) -> list[TextCon
     targets quantitatively after modeling steps.
 
     Returns: JSON volume_mm3, area_mm2, bbox, center_of_mass, element
-    counts, is_valid, shape_type.
+    counts, is_valid, shape_type. Numbers carry 6 significant digits; bbox is
+    OCC's bound box (exact for planar shapes, +-0.1 mm on curved ones).
     """
     return measure_geometry_operation(get_freecad_connection(), doc_name, obj_name)
 

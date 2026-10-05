@@ -14,8 +14,9 @@ operations:
 * deleting an object others are BUILT ON must be refused: FreeCAD leaves the
   consumer behind with its base cleared, turning a subtractive feature additive
   — a silently wrong solid reported as a successful delete;
-* an axis-based joint cannot be expressed through a face+vertex ref on a
-  cylindrical face (the parts land tangent while the residual reads 0.0);
+* an axis-based joint on a cylindrical face used to land the parts TANGENT (a
+  face+vertex ref has no axis; the residual still read 0.0) — the ref landing
+  is now the face center/axis, and an axis joint names the axis it will use;
 * a read-only ``execute_code`` must not be appended AFTER a pending plan, which
   left the plan cursor unable to run anything;
 * a pattern ``count`` expression that does not resolve must say so instead of
@@ -155,16 +156,29 @@ def test_delete_refuses_when_objects_depend_on_it():
     ), "a delete with dependents must refuse, not silently corrupt the model"
 
 
-def test_axis_joints_cannot_be_refs_on_cylindrical_faces():
-    helper = _func(JOINTS, "_axis_ref_refusal")
-    assert "Part::GeomPlane" in _strings(helper), "a planar ref is the only usable one"
-    assert "_AXIS_JOINTS" in _names(helper)
+def test_axis_joints_name_the_axis_they_use_instead_of_landing_tangent():
+    """A cylinder ref lands on the AXIS now (the face-center marker FreeCAD's
+    own click rules use), so an axle-in-hole joint works; the old hard refusal
+    was correct only while the landing was a seam vertex. What must survive is
+    the visibility: an axis joint on a rotational face reports the axis it
+    will use, and the residual for two rotational faces is axis-to-axis (the
+    surface distance of an axle fit is its radial gap, e.g. 15 mm for a 5 mm
+    pin in a 20 mm bore — a coaxial mate must not read as a 15 mm error)."""
+    helper = _func(JOINTS, "_axis_ref_notes")
+    assert "_AXIS_JOINTS" in _names(helper), "only axis joints need an axis"
+    assert "_axis_of" in _names(helper), "the note names the surface's own axis"
     mate = _func(JOINTS, "_op_mate")
-    assert "_axis_ref_refusal" in _names(mate)
-    # It must run BEFORE the joint moves anything: refusing has no side effects,
-    # while failing after solve() could leave the parts displaced.
-    src = ast.unparse(mate)
-    assert src.index("_axis_ref_refusal") < src.index("_make_joint")
+    assert "_axis_ref_notes" in _names(mate)
+    assert "ValueError" not in ast.unparse(_func(JOINTS, "_axis_ref_notes")), (
+        "a rotational ref is no longer refused — it lands on its axis"
+    )
+    residual = ast.unparse(_func(JOINTS, "_residual"))
+    assert "axis" in residual and "_ROTATIONAL_SURFACES" in residual, (
+        "two rotational faces measure axis-to-axis"
+    )
+    assert "_axis_ref_notes" not in _names(mate) or "_landing_warnings" in _names(mate), (
+        "the axis note joins the landing warnings, not a separate channel"
+    )
 
 
 def test_read_only_execute_code_appends_and_plan_removal_is_by_state():

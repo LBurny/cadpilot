@@ -22,8 +22,8 @@ logger = dbglog.get_logger("assembly")
 
 ASSEMBLY_NAME = "MCP_Assembly"
 
-# Joint types that need an AXIS; see _axis_ref_refusal for why a non-planar ref
-# cannot express one through this API.
+# Joint types that need an AXIS: their refs get an axis note (see
+# _axis_ref_notes) so the axis a mate will use is never a guess.
 _AXIS_JOINTS = frozenset({"revolute", "cylindrical", "slider"})
 
 _JOINT_MODS = None
@@ -99,42 +99,83 @@ def _wrap_link(doc, asm, part_name: str):
     return link
 
 
-def _nearest_vertex_name(shape, face_name: str, pt) -> str:
-    face = shape.getElement(face_name)
-    face_pts = [v.Point for v in face.Vertexes]
-    best, bd = None, 1e18
+def _shape_vertex_name(shape, point) -> str | None:
+    """The shape-global name of the vertex at ``point`` (None when absent)."""
+    best, bd = None, 1e-6
     for i, v in enumerate(shape.Vertexes):
-        if not any(v.Point.distanceToPoint(fp) < 1e-6 for fp in face_pts):
-            continue
-        d = v.Point.distanceToPoint(pt)
+        d = v.Point.distanceToPoint(point)
         if d < bd:
             bd, best = d, f"Vertex{i + 1}"
-    if best is None:
-        raise ValueError(f"no vertex of {face_name} found")
     return best
 
 
-def _global_shape(link):
-    """link.Shape is already GLOBAL (the placed shape).
+def _shape_edge_name(shape, edge) -> str | None:
+    """The shape-global name of ``edge`` (a face-local sub-shape)."""
+    for i, e in enumerate(shape.Edges):
+        if e.Curve.TypeId != edge.Curve.TypeId or abs(e.Length - edge.Length) > 1e-6:
+            continue
+        if e.CenterOfGravity.distanceToPoint(edge.CenterOfGravity) < 1e-6:
+            return f"Edge{i + 1}"
+    return None
 
-    NOTE the asymmetry: UtilsAssembly.findPlacement / joint References work
-    on the linked part's LOCAL shape (identity frame), while link.Shape is
-    placement-transformed. Geometry queries in world space use link.Shape
-    directly; composing with link.Placement again would double-transform.
+
+def _vec3(vec) -> str:
+    return "[" + ", ".join(f"{float(v):.2f}" for v in vec) + "]"
+
+
+def _face_landing(shape, face_name: str, pt=None) -> str:
+    """Second sub-element for a face ref — where the joint's JCS lands.
+
+    ``UtilsAssembly.findPlacement`` derives the landing point from the SECOND
+    element's type: a Vertex lands at that vertex, a circular/elliptical edge
+    lands at its CENTER, and the face's own name lands at the face center.
+    Always appending the nearest vertex — the old behaviour — mis-landed every
+    circular face, whose only vertex is the OCC seam: two concentric holes
+    came out R-r off axis, with residual 0 and no warning. A plain face ref
+    (no hint) uses the GUI's own marker — "we add sub_name twice because the
+    joint references have element name + vertex name" — so it lands on the
+    face center exactly; a hinted/anchor/point ref keeps click semantics and
+    snaps to the closest selectable point.
     """
-    return link.Shape
+    face = shape.getElement(face_name)
+    if pt is None:
+        return face_name
+    cands = []
+    for v in face.Vertexes:
+        name = _shape_vertex_name(shape, v.Point)
+        if name:
+            cands.append((v.Point, name))
+    for e in face.Edges:
+        if e.Curve.TypeId in ("Part::GeomCircle", "Part::GeomEllipse"):
+            name = _shape_edge_name(shape, e)
+            if name:
+                cands.append((e.Curve.Location, name))
+    cands.append((face.CenterOfGravity, face_name))
+    return min(cands, key=lambda c: c[0].distanceToPoint(pt))[1]
 
 
-def _local_shape(doc, link):
-    """The linked part's identity-frame shape (the frame joints reason in)."""
-    part = link.LinkedObject
-    return part.Shape if part is not None else link.Shape
+def _landing_point(link, fe) -> App.Vector | None:
+    """Where the ref's JCS lands (mirrors findPlacement's element-type rules)."""
+    shape = link.Shape
+    name = str(fe[1])
+    try:
+        if name == str(fe[0]) or name.startswith("Face"):
+            return shape.getElement(str(fe[0])).CenterOfGravity
+        if name.startswith("Edge"):
+            edge = shape.getElement(name)
+            if edge.Curve.TypeId in ("Part::GeomCircle", "Part::GeomEllipse"):
+                return edge.Curve.Location
+            return edge.CenterOfGravity
+        return shape.getElement(name).Point
+    except Exception:
+        return None
 
 
 def _resolve_ref(doc, ref: dict):
-    """Ref dict -> (link, ['FaceN', 'VertexM']).
+    """Ref dict -> (link, ['FaceN', <landing sub-element>]).
 
-    face   — direct; contact point = 'point_on_face' hint (global) or face CoM.
+    face   — direct; contact point = 'point_on_face' hint (global) or the face
+             center (the marker convention).
     anchor — named anchor from assembly_ops; global pos.
     point  — global pos; nearest planar face within 1 mm is used.
     Probing happens against link.Shape (global); face/vertex NAMES are
@@ -144,11 +185,9 @@ def _resolve_ref(doc, ref: dict):
     shape = link.Shape
     if "face" in ref:
         face_name = ref["face"]
-        if ref.get("point_on_face") is not None:
-            pt = App.Vector(*ref["point_on_face"])
-        else:
-            pt = shape.getElement(face_name).CenterOfMass
-        return (link, [face_name, _nearest_vertex_name(shape, face_name, pt)])
+        hint = ref.get("point_on_face")
+        pt = App.Vector(*hint) if hint is not None else None
+        return (link, [face_name, _face_landing(shape, face_name, pt)])
     if "anchor" in ref:
         from . import assembly_ops as aops
 
@@ -175,7 +214,24 @@ def _resolve_ref(doc, ref: dict):
             bd, best = d, f"Face{fi + 1}"
     if best is None:
         raise ValueError(f"no planar face within 1 mm of the anchor/point on {ref['part']!r}")
-    return (link, [best, _nearest_vertex_name(shape, best, pt)])
+    return (link, [best, _face_landing(shape, best, pt)])
+
+
+def _global_shape(link):
+    """link.Shape is already GLOBAL (the placed shape).
+
+    NOTE the asymmetry: UtilsAssembly.findPlacement / joint References work
+    on the linked part's LOCAL shape (identity frame), while link.Shape is
+    placement-transformed. Geometry queries in world space use link.Shape
+    directly; composing with link.Placement again would double-transform.
+    """
+    return link.Shape
+
+
+def _local_shape(doc, link):
+    """The linked part's identity-frame shape (the frame joints reason in)."""
+    part = link.LinkedObject
+    return part.Shape if part is not None else link.Shape
 
 
 def _make_joint(asm, joint_type: str, ref_a, ref_b, name: str = ""):
@@ -191,31 +247,63 @@ def _make_joint(asm, joint_type: str, ref_a, ref_b, name: str = ""):
     return j
 
 
+_ROTATIONAL_SURFACES = frozenset({"Part::GeomCylinder", "Part::GeomCone"})
+
+
+def _axis_of(face):
+    """(point, unit direction) of a rotational face's axis, or None.
+
+    A GeomCylinder/GeomCone surface exposes ``Center``/``Axis`` as plain
+    Vectors (not a gp_Ax1) — ``Center`` is a point ON the axis.
+    """
+    try:
+        surface = face.Surface
+        return App.Vector(surface.Center), App.Vector(surface.Axis)
+    except Exception:
+        return None
+
+
 def _residual(j):
-    """Geometric-truth residual: (face-to-face distance mm, normal angle deg).
+    """Geometric-truth residual: (distance mm, angle deg, basis).
 
     Measured directly between the two referenced faces on link.Shape
     (GLOBAL placed shapes) — immune to the JCS frame asymmetry between
     UtilsAssembly.findPlacement (local) and link placements (global).
-    For non-planar faces the angular part is 0 (distance still valid).
+    For planar pairs the angle is the normal deviation (opposing normals ==
+    touching). For two rotational faces the distance is AXIS-TO-AXIS and the
+    angle is the axis deviation: an axle fit's surface distance is its radial
+    gap, so a 5 mm pin in a 20 mm bore reported 15 mm — reading like a broken
+    mate although the axes were perfectly coaxial (live-verified).
     """
     try:
         fa = j.Reference1[0].Shape.getElement(j.Reference1[1][0])
         fb = j.Reference2[0].Shape.getElement(j.Reference2[1][0])
     except Exception:
-        return -1.0, -1.0
+        return -1.0, -1.0, "surface"
     try:
         mm = fa.distToShape(fb)[0]
     except Exception:
         mm = -1.0
-    deg = 0.0
+    deg, basis = 0.0, "surface"
     if fa.Surface.TypeId == "Part::GeomPlane" and fb.Surface.TypeId == "Part::GeomPlane":
         na = fa.normalAt(*fa.Surface.parameter(fa.CenterOfMass))
         nb = fb.normalAt(*fb.Surface.parameter(fb.CenterOfMass))
         dot = max(-1.0, min(1.0, na.dot(nb)))
         ang = math.degrees(math.acos(dot))
         deg = min(ang, 180.0 - ang)  # opposing normals == touching faces
-    return round(mm, 4), round(deg, 3)
+    elif fa.Surface.TypeId in _ROTATIONAL_SURFACES and fb.Surface.TypeId in _ROTATIONAL_SURFACES:
+        aa, ab = _axis_of(fa), _axis_of(fb)
+        if aa and ab:
+            (pa, da), (pb, db) = aa, ab
+            cross = da.cross(db)
+            if cross.Length > 1e-9:
+                mm = abs((pb - pa).dot(cross)) / cross.Length  # skew-line distance
+                deg = math.degrees(math.acos(max(-1.0, min(1.0, abs(da.dot(db))))))
+            else:
+                mm = (pb - pa).cross(da).Length  # parallel: perpendicular distance
+                deg = 0.0
+            basis = "axis"
+    return round(mm, 4), round(deg, 3), basis
 
 
 def _joints_of(asm):
@@ -323,98 +411,91 @@ def _op_add_component(doc, spec: dict) -> dict:
 
 
 def _landing_warnings(doc, spec: dict, ref_a, ref_b) -> list[str]:
-    """Warn when a mate lands far from the point the user aimed at.
+    """Warn when a mate's landing sits far from the point the caller aimed at.
 
-    All refs resolve to a VERTEX of the face (GUI click semantics), and the
-    nearest vertex to the intent point is arbitrary on symmetric faces — a
-    plate's top face lands at a corner — so a residual-0 mate can still put
-    the part where the user never meant it. Intent point per ref kind: the
-    face center for a plain face ref, the anchor position for an anchor ref,
-    the point itself for a point ref. A face with a single vertex (a circular
-    face's seam) offers no choice, so it never warns.
+    A plain face ref now lands on the face center by construction (the
+    face-name marker), so only hint/anchor/point refs can deviate: they snap
+    to the closest selectable point (vertex, circular-edge center, face
+    center), and on a symmetric face that choice is arbitrary — a plate's top
+    face lands at whichever corner is nearest the anchor.
     """
     warnings = []
     for side, resolved in (("a", ref_a), ("b", ref_b)):
         r = spec[side]
         link, fe = resolved
         if "face" in r:
-            if r.get("point_on_face") is not None:
-                continue  # the user aimed deliberately at that point
-            intent_desc = "the face center"
-            remedy = 'add "point_on_face": [x,y,z] to the ref, or use an anchor/point ref'
+            if r.get("point_on_face") is None:
+                continue  # lands on the face center exactly
+            intent = App.Vector(*r["point_on_face"])
+            remedy = "aim point_on_face at a vertex or a circular edge center to land there"
         elif "anchor" in r:
-            intent_desc = f"anchor '{r['anchor']}'"
-            remedy = "the mate lands on the vertex nearest the anchor"
-        else:
-            intent_desc = "the point ref"
-            remedy = "the mate lands on the vertex nearest that point"
-        try:
-            face = link.Shape.getElement(fe[0])
-            if len(face.Vertexes) <= 1:
-                continue
-            if "face" in r:
-                intent = face.CenterOfMass
-            elif "anchor" in r:
-                from . import assembly_ops as aops
+            from . import assembly_ops as aops
 
-                pos, _d, _s, aerr = aops._resolve_anchor(doc.getObject(r["part"]), r["anchor"])
-                if aerr:
-                    continue
-                intent = link.Placement.multVec(pos)
-            else:
-                intent = App.Vector(*r["point"])
-            vertex = link.Shape.getElement(fe[1])
-            d = vertex.Point.distanceToPoint(intent)
-        except Exception:
+            pos, _d, _s, aerr = aops._resolve_anchor(doc.getObject(r["part"]), r["anchor"])
+            if aerr:
+                continue
+            intent = link.Placement.multVec(pos)
+            remedy = "use a face ref with point_on_face, or an anchor sitting on the wanted spot"
+        else:
+            intent = App.Vector(*r["point"])
+            remedy = "use a face ref with point_on_face, or an anchor sitting on the wanted spot"
+        landing = _landing_point(link, fe)
+        if landing is None:
             continue
+        d = landing.distanceToPoint(intent)
         if d > 0.5:  # rigid measure — placement-invariant, safe pre-solve
             warnings.append(
-                f"'{r['part']}' {fe[0]} landed on {fe[1]} ({d:.1f}mm from {intent_desc}) — "
-                f"refs pick the nearest vertex (GUI click semantics); {remedy}, "
-                "or accept the vertex."
+                f"'{r['part']}' {fe[0]} lands on {fe[1]} at {_vec3(landing)}, {d:.2f}mm from "
+                f"the ref's intent point {_vec3(intent)}; {remedy}."
             )
     return warnings
 
 
-def _axis_ref_refusal(ref_a, ref_b, joint_type: str) -> str:
-    """Refuse an axis-requiring joint whose refs cannot express an axis.
+def _axis_ref_notes(ref_a, ref_b, joint_type: str) -> list[str]:
+    """Say which axis an axis-requiring joint will actually use.
 
-    A resolved ref is ``(link, ["FaceN", "VertexM"])`` and the JCS is placed at
-    that vertex landmark. On a CYLINDRICAL face that lands the parts TANGENT:
-    measured live on 1.1.4, a revolute pin/bore mate put the pin 2.1 mm off the
-    bore axis (exactly bore_r - pin_r) and 42 mm axially displaced, while the
-    joint reported ``residual 0.0`` and verify found no interference. No ref
-    form here carries an axis, so refusing BEFORE anything moves is the honest
-    outcome — a wrong assembly reported as success is worse.
+    Ref landings used to be nearest-vertex, which on a cylinder landed the
+    parts TANGENT (live, before the face-center landing: a revolute pin/bore
+    mate came out 2.1 mm off the bore axis = bore_r - pin_r, reported as
+    residual 0) and this function refused such refs outright. A cylindrical
+    face now lands on its AXIS — the same thing FreeCAD's own click rules do —
+    so an axle-in-hole joint works and the honest output is to name the axis
+    the joint will use rather than to block it.
     """
     if str(joint_type).lower() not in _AXIS_JOINTS:
-        return ""
+        return []
+    notes = []
     for side, ref in (("a", ref_a), ("b", ref_b)):
         link, names = ref
         try:
-            surf = link.Shape.getElement(names[0]).Surface
+            face = link.Shape.getElement(names[0])
         except Exception:
             continue
-        if surf.TypeId != "Part::GeomPlane":
-            return (
-                f"{joint_type} joint: side {side} resolves to a non-planar face "
-                f"({names[0]}: {surf.TypeId.rsplit('::', 1)[-1]}), and an axis-based joint "
-                "needs an axis. This API places a joint by the face's nearest VERTEX, which "
-                "lands the parts tangent instead of coaxial — the mate would report success "
-                "with a wrong assembly. Use assemble(mode='axis') with anchors "
-                "(get_anchors/set_anchors) for axle-in-hole fits, or mate planar faces."
+        if face.Surface.TypeId == "Part::GeomPlane":
+            continue
+        axis = _axis_of(face)
+        kind = face.Surface.TypeId.rsplit("::", 1)[-1]
+        if axis is None:
+            notes.append(
+                f"side {side}: {joint_type} on the {kind} face {names[0]} has no axis of its "
+                "own; the joint uses the face-center frame instead."
             )
-    return ""
+            continue
+        pt, direction = axis
+        notes.append(
+            f"side {side}: the joint's axis is the {kind} axis through {_vec3(pt)} "
+            f"(direction {_vec3(direction)}); residual_mm is measured axis-to-axis for "
+            "two rotational faces."
+        )
+    return notes
 
 
 def _op_mate(doc, spec: dict) -> dict:
     asm = _get_assembly(doc)
     ref_a = _resolve_ref(doc, spec["a"])
     ref_b = _resolve_ref(doc, spec["b"])
-    refusal = _axis_ref_refusal(ref_a, ref_b, spec["joint"])
-    if refusal:
-        raise ValueError(refusal)
-    landing_warnings = _landing_warnings(doc, spec, ref_a, ref_b)
+    landing_warnings = _axis_ref_notes(ref_a, ref_b, spec["joint"])
+    landing_warnings += _landing_warnings(doc, spec, ref_a, ref_b)
     landing_warnings += _duplicate_joint_warnings(asm, ref_a, ref_b)
     # Which link the solver MOVES is its own choice (usually b's), not a's: the
     # old record named ref_a's link, so a rollback restored a part that had
@@ -436,7 +517,7 @@ def _op_mate(doc, spec: dict) -> dict:
         j.Proxy.preSolve(j)
     asm.solve(True)
     doc.recompute()
-    mm, deg = _residual(j)
+    mm, deg, basis = _residual(j)
     moved_links = {}
     for lnk in _links_of(asm):
         before = links_before.get(lnk.Name)
@@ -446,7 +527,11 @@ def _op_mate(doc, spec: dict) -> dict:
                 "to": _placement_to_dict(lnk.Placement),
             }
     # Legacy single-link fields (an older MCP client records only these) must
-    # name the link that ACTUALLY moved, b's side preferred when both did.
+    # name the link that ACTUALLY moved, b's side preferred when both did. A
+    # mate the solver satisfied without moving anything reports NO moved link:
+    # naming ref_a made the fields contradict their own evidence (moved_links
+    # empty, pre == moved_to on an untouched ground link) and told the MCP
+    # recorder to "restore" a part that never left.
     if ref_b[0].Name in moved_links:
         primary = ref_b[0].Name
     elif ref_a[0].Name in moved_links:
@@ -454,13 +539,38 @@ def _op_mate(doc, spec: dict) -> dict:
     elif moved_links:
         primary = next(iter(moved_links))
     else:
-        primary = ref_a[0].Name
-    entry = moved_links.get(primary)
-    if entry is None:
-        entry = {
-            "pre": _placement_to_dict(ref_a[0].Placement),
-            "to": _placement_to_dict(ref_a[0].Placement),
-        }
+        primary = None
+        landing_warnings.append(
+            "the mate was satisfied without moving any component (the parts were already "
+            "in the requested relationship); no placement was recorded for rollback."
+        )
+    entry = moved_links.get(primary) if primary else None
+    # An axis joint aligns the two JCS AXIS POINTS, so a PARTIAL curved face
+    # (its reference point is the surface's own axis base, not the face center)
+    # can slide the part along the common axis by tens of mm while the residual
+    # reads 0 — live: a revolute on two hinge barrels translated the lid
+    # -20.62 mm along X and buried the barrels in each other; the mate itself
+    # said nothing (a later verify found 4417 mm^3 of interference).
+    axial_slide = None
+    if str(spec["joint"]).lower() in _AXIS_JOINTS and entry is not None:
+        axis_dir = None
+        for link, names in (ref_a, ref_b):
+            with contextlib.suppress(Exception):
+                found = _axis_of(link.Shape.getElement(names[0]))
+                if found is not None and axis_dir is None:
+                    axis_dir = found[1]
+        if axis_dir is not None:
+            pre = _dict_to_placement(moved_links[primary]["pre"])
+            post = _dict_to_placement(moved_links[primary]["to"])
+            axial_slide = round((post.Base - pre.Base).dot(axis_dir), 4)
+            if abs(axial_slide) > 2.0:
+                landing_warnings.append(
+                    f"the joint aligned the two axis reference points, which slid "
+                    f"'{primary}' {axial_slide:.2f} mm ALONG the joint axis (a partial "
+                    "curved face's reference point is the surface's own axis base, not "
+                    "its face center) — give both refs a point_on_face to control the "
+                    f"axial position. axial_slide_mm reports the displacement."
+                )
     # preSolve vs. solve-only is the difference between a correct mate and
     # faces landing perpendicular; record which path ran and how it settled.
     logger.debug(
@@ -476,13 +586,23 @@ def _op_mate(doc, spec: dict) -> dict:
         "joint": j.Name,
         "residual_mm": mm,
         "residual_deg": deg,
+        "residual_basis": basis,
         "moved_link": primary,
-        "pre_placement": entry["pre"],
-        "moved_to": entry["to"],
         "moved_links": moved_links,
         "landing": {"a": list(ref_a[1]), "b": list(ref_b[1])},
         "warnings": landing_warnings,
     }
+    # Where the JCS landed once the solver settled — the number to check a mate
+    # against (a residual of 0 only says the two JCS frames agree, not that the
+    # frames landed where the caller meant).
+    pts = {"a": _landing_point(ref_a[0], ref_a[1]), "b": _landing_point(ref_b[0], ref_b[1])}
+    if all(v is not None for v in pts.values()):
+        res["landing_points"] = {k: _vec3(v) for k, v in pts.items()}
+    if entry is not None:
+        res["pre_placement"] = entry["pre"]
+        res["moved_to"] = entry["to"]
+    if axial_slide is not None:
+        res["axial_slide_mm"] = axial_slide
     trim = spec.get("trim")
     if trim:
         from . import trim_ops
@@ -512,6 +632,7 @@ def _op_solve(doc, _spec: dict) -> dict:
                 "name": j.Name,
                 "residual_mm": _residual(j)[0],
                 "residual_deg": _residual(j)[1],
+                "residual_basis": _residual(j)[2],
                 "type": j.JointType,
             }
             for j in _joints_of(asm)
@@ -577,7 +698,41 @@ def _op_rollback_step(doc, spec: dict) -> dict:
             doc.removeObject(asm_name)
     doc.recompute()
     _settle_shapes(doc, asm)
-    return {"done": True}
+    out = {"done": True}
+    # Consistency glance: a rollback restores the placements the ASSEMBLY
+    # journal recorded, and a placement change the journal never saw (a plain
+    # cad move on a link, a manual GUI drag) is not among them — the parts can
+    # end up detached or overlapping while the rollback still reports success
+    # (live: a lamp arm rolled back onto a base link that had been moved
+    # afterwards). Report the document's actual state instead of leaving it to
+    # the caller to discover.
+    try:
+        from . import assembly_ops as aops
+
+        audit = aops.verify_assembly(doc.Name)
+        s = audit.get("summary") or {}
+        out["verify"] = {
+            k: s[k]
+            for k in ("island_count", "floating_count", "interference_count", "component_count")
+            if k in s
+        }
+        problems = []
+        if s.get("island_count", 0) > 1:
+            problems.append(f"{s['island_count']} disconnected islands")
+        if s.get("floating_count", 0):
+            problems.append(f"{s['floating_count']} floating objects")
+        if s.get("interference_count", 0):
+            problems.append(f"{s['interference_count']} interferences")
+        if problems:
+            out["warnings"] = [
+                "the document is not consistent after this rollback: "
+                + ", ".join(problems)
+                + " — a placement change made outside the assembly journal "
+                "(e.g. a cad move on a link) is not restored by rollback."
+            ]
+    except Exception as e:
+        out["verify_error"] = str(e)
+    return out
 
 
 def _op_verify(doc, spec: dict) -> dict:
@@ -588,6 +743,7 @@ def _op_verify(doc, spec: dict) -> dict:
                 "name": j.Name,
                 "residual_mm": _residual(j)[0],
                 "residual_deg": _residual(j)[1],
+                "residual_basis": _residual(j)[2],
                 "type": j.JointType,
             }
             for j in _joints_of(asm)

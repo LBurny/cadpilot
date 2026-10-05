@@ -123,11 +123,20 @@ def test_datum_plane_accepts_a_direction_face_token():
 
 def test_recompute_failure_reports_status_string():
     """'failed to recompute (check parameters/geometry)' alone sends the caller
-    hunting blind; FreeCAD's StatusString carries the actual reason."""
+    hunting blind; FreeCAD's own reason carries the actual cause. 1.1.4 exposes
+    it as the METHOD getStatusString() — the old property read
+    (getattr(feat, "StatusString", "")) always returned nothing, so a
+    "Revolve axis intersects the sketch" reached the caller as a bare
+    "check parameters/geometry" (live-verified through the MCP tool)."""
     body = _func(_FEATURE, "create_feature_gui")
-    assert any(isinstance(n, ast.Constant) and n.value == "StatusString" for n in ast.walk(body)), (
-        "read the feature's StatusString for the failure detail"
-    )
+    assert "_status_string" in _names(body), "the failure detail comes from _status_string"
+    helper = _func(_FEATURE, "_status_string")
+    assert "getStatusString" in {
+        n.attr for n in ast.walk(helper) if isinstance(n, ast.Attribute)
+    }, "the method form is the one FreeCAD 1.1.4 actually provides"
+    assert any(
+        isinstance(n, ast.Constant) and n.value == "StatusString" for n in ast.walk(helper)
+    ), "keep the property form as a fallback for other versions"
 
 
 def _names(node) -> set[str]:
@@ -191,5 +200,5 @@ def test_invalid_shape_error_names_the_object_and_reason():
     text = ast.unparse(helper)
     assert "produced an invalid Shape" in text
     assert ".Name" in text, "the object name is what makes the error actionable"
-    assert "StatusString" in text, "FreeCAD's reason must be carried through"
+    assert "_status_string" in _names(helper), "FreeCAD's reason must be carried through"
     assert "_invalid_shape_error" in _names(_func(_FEATURE, "create_feature_gui"))

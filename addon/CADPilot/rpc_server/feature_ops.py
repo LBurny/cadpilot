@@ -104,7 +104,10 @@ def _record_resolved_faces(base, names) -> None:
     A direction token picks the FARTHEST face facing that way; on a stepped
     part that can be a different face than the caller pictured, and without an
     echo the result looked exactly like success (live: a circle meant for the
-    seat face landed on a wall top 92 mm above it).
+    seat face landed on a wall top 92 mm above it). Faces facing the same way
+    are listed as ``same_direction`` — on a phone stand the "+Z" pick was
+    right, it was just one of three upward faces, and the alternative was
+    only discoverable by trial and error.
     """
     global _LAST_FEATURE_INFO
     info = []
@@ -115,7 +118,22 @@ def _record_resolved_faces(base, names) -> None:
             if face is not None:
                 entry["center"] = [round(float(v), 4) for v in face.CenterOfMass]
                 if face.Surface.TypeId == "Part::GeomPlane":
-                    entry["normal"] = [round(float(v), 4) for v in face.normalAt(0, 0)]
+                    normal = face.normalAt(0, 0)
+                    entry["normal"] = [round(float(v), 4) for v in normal]
+                    same = []
+                    for i, f in enumerate(base.Shape.Faces):
+                        if f.Surface.TypeId != "Part::GeomPlane" or f.isSame(face):
+                            continue
+                        if f.normalAt(0, 0).dot(normal) > 0.999:
+                            same.append(
+                                {
+                                    "face": f"Face{i + 1}",
+                                    "center": [round(float(v), 4) for v in f.CenterOfMass],
+                                    "area": round(float(f.Area), 4),
+                                }
+                            )
+                    if same:
+                        entry["same_direction"] = sorted(same, key=lambda e: -e["area"])[:6]
         info.append(entry)
     _LAST_FEATURE_INFO = {"base": base.Name, "faces": info}
 
@@ -155,34 +173,47 @@ def _inherit_appearance(feat, base):
 
 def _build_boolean(doc, spec):
     _require(spec, "op", "base", "tool")
-    type_map = {"fuse": "Part::Fuse", "cut": "Part::Cut", "common": "Part::Common"}
-    fc_type = type_map.get(spec["op"])
-    if fc_type is None:
-        raise ValueError(f"boolean op must be fuse/cut/common, got {spec['op']!r}")
-    feat = doc.addObject(fc_type, spec.get("name") or spec["op"].capitalize())
-    feat.Base = _get_obj(doc, spec["base"], "base")
-    # Support tool as either a single object name or a list of names.
+    op = spec["op"]
+    if op not in ("fuse", "cut", "common"):
+        raise ValueError(f"boolean op must be fuse/cut/common, got {op!r}")
+    base_obj = _get_obj(doc, spec["base"], "base")
     tool_val = spec["tool"]
     if isinstance(tool_val, list):
         if not tool_val:
             raise ValueError("boolean tool list must not be empty.")
-        if len(tool_val) == 1:
-            feat.Tool = _get_obj(doc, tool_val[0], "tool")
-        else:
-            # Aggregate ALL tools into one compound — Part booleans accept a
-            # compound as Tool. (Chaining Part::Fuse pairs would silently drop
-            # tools[2:] and leave fuse residue in the tree.)
-            tools = [_get_obj(doc, name, "tool") for name in tool_val]
-            compound = doc.addObject("Part::Compound", f"{feat.Name}_tools")
-            compound.Links = tools
-            doc.recompute()
-            view = getattr(compound, "ViewObject", None)
-            if view is not None:
-                view.Visibility = False
-            feat.Tool = compound
+        tools = [_get_obj(doc, name, "tool") for name in tool_val]
     else:
-        feat.Tool = _get_obj(doc, tool_val, "tool")
-    _inherit_appearance(feat, feat.Base)
+        tools = [_get_obj(doc, tool_val, "tool")]
+    name = spec.get("name") or op.capitalize()
+    if len(tools) == 1:
+        feat = doc.addObject(
+            {"fuse": "Part::Fuse", "cut": "Part::Cut", "common": "Part::Common"}[op], name
+        )
+        feat.Base, feat.Tool = base_obj, tools[0]
+    elif op == "fuse":
+        # Part::MultiFuse, NOT a compound Tool: a compound of OVERLAPPING tools
+        # does not merge them, and the result double-counts the overlap —
+        # measured live on a box + arm + knuckle, a compound Tool gave 17461.9
+        # mm^3 against the true 15765.5, with the knuckle only partly present.
+        feat = doc.addObject("Part::MultiFuse", name)
+        feat.Shapes = [base_obj, *tools]
+    elif op == "common":
+        # "common" with several tools means intersecting ALL of them;
+        # Part::MultiCommon is FreeCAD's own form of that. (A compound Tool
+        # computes base ∩ (T1 ∪ T2) instead — measured 800 vs 0 mm^3 for the
+        # same inputs, a silent semantic flip.)
+        feat = doc.addObject("Part::MultiCommon", name)
+        feat.Shapes = [base_obj, *tools]
+    else:  # cut: base - (T1 ∪ T2), the chained-cut result (verified equal)
+        union = doc.addObject("Part::MultiFuse", f"{name}_tools")
+        union.Shapes = tools
+        doc.recompute()
+        view = getattr(union, "ViewObject", None)
+        if view is not None:
+            view.Visibility = False
+        feat = doc.addObject("Part::Cut", name)
+        feat.Base, feat.Tool = base_obj, union
+    _inherit_appearance(feat, base_obj)
     return feat
 
 
@@ -524,28 +555,11 @@ def _build_variables(doc, spec):
     ss = doc.getObject(name)
     if ss is None:
         ss = doc.addObject("Spreadsheet::Sheet", name)
-    for cell, entry in cells.items():
-        if not (isinstance(entry, (list, tuple)) and len(entry) == 2):
-            raise ValueError(f"cells['{cell}'] must be [alias, value].")
-        alias, value = entry
-        if isinstance(value, bool):
-            raise ValueError(f"cells['{cell}']: bool is not a valid value.")
-        if isinstance(value, (int, float)):
-            ss.set(cell, repr(value))
-        elif isinstance(value, str):
-            ss.set(cell, value if value.startswith("=") else f'"{value}"')
-        else:
-            raise ValueError(f"cells['{cell}']: unsupported value {value!r}.")
-        try:
-            ss.setAlias(cell, str(alias))
-        except Exception as e:
-            # FreeCAD's own "Invalid alias" names neither the cell nor the
-            # alias, so the caller could not tell which entry was wrong.
-            raise ValueError(
-                f"cells['{cell}']: alias {alias!r} was rejected ({e}). Aliases must "
-                "start with a letter and contain only letters/digits/underscores "
-                "(no spaces, no leading digit, not a cell reference like 'A1')."
-            ) from None
+    # The same setter ``edit_object`` uses for cells: shared so both paths
+    # validate identically ("Invalid alias" alone names nothing).
+    from .property_mapper import set_spreadsheet_cells
+
+    set_spreadsheet_cells(ss, cells)
     doc.recompute()
     return ss
 
@@ -784,6 +798,20 @@ def _build_pocket(doc, spec):
     return _build_padlike(doc, spec, "PartDesign::Pocket", "Pocket")
 
 
+# A recompute failure with an empty StatusString leaves the caller nothing to
+# act on; these name the operation's own known trap instead.
+_FAILURE_HINTS = {
+    # OCC's MakeThickSolid fails on a removed face that carries an INNER WIRE
+    # (measured live: a 60x40x10 plate with a 20x20 blind pocket refused
+    # thickness("+Z") at value 2 and 3, StatusString empty, while the opposite
+    # face worked).
+    "thickness": "OCC fails when a removed face carries an inner wire (a hole/pocket); "
+    "try reversed=true, a smaller value, or the opposite face",
+    "revolution": "check that the profile is a closed wire on ONE side of the axis "
+    "(a profile crossing its revolve axis is rejected by FreeCAD)",
+    "groove": "check that the profile is a closed wire on one side of the axis",
+}
+
 _REV_AXIS = {"X": "H_Axis", "Y": "V_Axis", "Z": "N_Axis"}
 
 
@@ -796,7 +824,10 @@ def _build_revlike(doc, spec, fc_type, default_name):
     feat = body.newObject(fc_type, spec.get("name") or default_name)
     feat.Profile = sketch
     _set_or_bind(feat, "Angle", spec.get("angle", 360.0))
-    axis = spec.get("axis", "Z")
+    # Default "Y" (the sketch's V axis) is the lathe setup a profile is
+    # normally drawn for: v = axial position, u = radius. The old default "Z"
+    # was the profile normal, i.e. always degenerate.
+    axis = spec.get("axis", "Y")
     edge = axis.get("edge") if isinstance(axis, dict) else None
     if edge:
         if not (isinstance(edge, (list, tuple)) and len(edge) == 2):
@@ -813,6 +844,15 @@ def _build_revlike(doc, spec, fc_type, default_name):
         sub = _REV_AXIS.get(str(axis).upper())
         if sub is None:
             raise ValueError("axis must be 'X'/'Y'/'Z' or {\"edge\": [obj, \"EdgeN\"]}")
+        if sub == "N_Axis":
+            # Revolving a planar profile about its own normal keeps every
+            # point in the drawing plane: the result is a flat zero-volume
+            # shell, never a solid (FreeCAD still calls it valid).
+            raise ValueError(
+                "axis='Z' is the profile's own normal — revolving about it sweeps a "
+                "flat zero-volume shell, not a solid. Use 'X'/'Y' (the sketch's "
+                'in-plane axes) or {"edge": [obj, "EdgeN"]}.'
+            )
         feat.ReferenceAxis = (sketch, [sub])
     feat.Reversed = bool(spec.get("reversed", False))
     return feat
@@ -874,6 +914,7 @@ def _build_datum_plane(doc, spec):
                 f"'{face_name}' out of range on '{ref.Name}' (1-{len(ref.Shape.Faces)})."
             )
         setattr(dp, support_prop, [(ref, face_name)])
+        _record_resolved_faces(ref, [face_name])
         if plane.get("center"):
             center_target = (ref, face_name)
     else:
@@ -1054,20 +1095,34 @@ _CUT_TYPES = ("pocket", "groove")
 def _cut_without_material(feat) -> str:
     """Warn when a cut feature has no solid to cut into.
 
-    A pocket/groove whose profile resolves to no material (an attachment chain
-    ending in another body, an un-attached sketch in an empty body) still
+    A pocket/groove whose profile resolves to no material (an un-attached
+    sketch in an empty body, an attachment chain ending in another body) still
     "succeeds": FreeCAD returns the profile's own extrusion — a floating disk
-    where the user expected a hole (live: 942.5 mm^3 of nothing). The body's
-    material or a BaseFeature is what makes a cut real.
+    where the user expected a hole (live: 942.5 mm^3 of nothing). The material
+    must come from ANOTHER member: reading `body.Shape` alone is not enough,
+    because by the time this runs the body's tip IS the cut feature, so its
+    own extrusion looked like material and the warning went silent
+    (live-verified: an unsupported sketch in an empty body reported plain
+    success).
     """
     try:
         if getattr(feat, "BaseFeature", None) is not None:
             return ""
         body = _parent_body(feat)
         if body is not None:
-            sh = body.Shape
-            if sh is not None and not sh.isNull() and float(sh.Volume) > 0:
-                return ""  # attachment fusion: the body's material is the base
+            adopted = getattr(body, "BaseFeature", None)
+            if adopted is not None:
+                sh = getattr(adopted, "Shape", None)
+                if sh is not None and not sh.isNull() and float(sh.Volume) > 0:
+                    return ""  # an adopted base solid is the material
+            for member in getattr(body, "Group", []) or []:
+                if member is feat:
+                    continue
+                if not tip_policy.advances_tip(getattr(member, "TypeId", "")):
+                    continue
+                sh = getattr(member, "Shape", None)
+                if sh is not None and not sh.isNull() and float(sh.Volume) > 0:
+                    return ""  # attachment fusion with an existing member
         return (
             f"{feat.Name} has no material to cut: neither the body nor a BaseFeature "
             "provides a solid, so the result is the profile's own extrusion (a floating "
@@ -1216,7 +1271,7 @@ def describe_feature(feat, spec) -> dict:
         sh = feat.Shape
         return {"volume_mm3": round(sh.Volume, 2), "solids": len(sh.Solids)}
     warnings: list[str] = []
-    resolved = pop_last_feature_info() if op in ("thickness", "draft") else None
+    resolved = pop_last_feature_info() if op in ("thickness", "draft", "datum_plane") else None
     if op in _CUT_TYPES:
         message = _cut_without_material(feat) or _cut_removed_nothing(feat)
         if message:
@@ -1333,13 +1388,35 @@ def _advance_body_tip(feat) -> bool:
     return True
 
 
+def _status_string(feat) -> str:
+    """FreeCAD's own failure reason for a feature, '' when it has none.
+
+    1.1.4 exposes this as the METHOD ``getStatusString()``; the old
+    ``getattr(feat, "StatusString", "")`` silently returned nothing (the
+    property does not exist), so every recompute failure lost its reason —
+    "Revolve axis intersects the sketch" reached the caller as a bare
+    "check parameters/geometry".
+    """
+    for getter in (
+        lambda: feat.getStatusString(),
+        lambda: getattr(feat, "StatusString", ""),
+    ):
+        try:
+            status = str(getter() or "").strip()
+        except Exception:
+            continue
+        if status and status != "Invalid":
+            return status
+    return ""
+
+
 def _invalid_shape_error(feat_type, feat) -> str:
     """ "<op> produced an invalid Shape" was raised for a self-intersecting
     profile, a dangling reference and a corrupted dependency graph alike — three
     different causes behind one opaque message. Name the object and carry
     FreeCAD's own reason."""
-    status = str(getattr(feat, "StatusString", "") or "").strip()
-    reason = f" — FreeCAD says: {status}" if status and status != "Invalid" else ""
+    status = _status_string(feat)
+    reason = f" — FreeCAD says: {status}" if status else ""
     return (
         f"{feat_type} '{feat.Name}' produced an invalid Shape{reason}. "
         "Typical causes: the profile/section is not a closed face or wire, the "
@@ -1367,12 +1444,15 @@ def create_feature_gui(doc, spec):
         doc.recompute()
     state = [str(s) for s in getattr(feat, "State", [])]
     if "Invalid" in state:
-        # StatusString carries FreeCAD's actual failure reason (bad support,
-        # missing subelement, …) — "check parameters/geometry" alone sends the
-        # caller hunting blind.
-        status = str(getattr(feat, "StatusString", "") or "").strip()
+        # FreeCAD's actual failure reason (bad support, missing subelement,
+        # "Revolve axis intersects the sketch", …) — "check parameters/geometry"
+        # alone sends the caller hunting blind. 1.1.4 exposes it as the METHOD
+        # getStatusString(); the old property read returned nothing, so every
+        # failure lost its reason.
+        status = _status_string(feat)
         detail = f" — {status}" if status and status != "Invalid" else ""
-        raise RuntimeError(f"{ftype} failed to recompute{detail} (check parameters/geometry).")
+        hint = _FAILURE_HINTS.get(ftype, "check parameters/geometry.")
+        raise RuntimeError(f"{ftype} failed to recompute{detail} ({hint})")
     try:
         shape = getattr(feat, "Shape", None)
         invalid = shape is not None and not shape.isNull() and not shape.isValid()
@@ -1382,6 +1462,23 @@ def create_feature_gui(doc, spec):
         invalid = True
     if invalid:
         raise RuntimeError(_invalid_shape_error(ftype, feat))
+    # A negative volume is never a legitimate solid: OCC returns one for a
+    # self-intersecting result (a profile straddling its revolve axis is the
+    # classic case) and FreeCAD still calls the feature valid — the caller
+    # would get silent garbage. Only shapes that actually HOLD solids are
+    # judged: a PartDesign::Plane's infinite face reports a garbage "volume"
+    # whose SIGN follows its offset, so an unscoped check refused every
+    # datum_plane with a negative offset (live: offset -5 → "volume -1.3e+98").
+    volume = float(getattr(shape, "Volume", 0.0) or 0.0) if shape is not None else 0.0
+    if volume < -1e-6 and len(getattr(shape, "Solids", []) or []) > 0:
+        hint = (
+            "the profile probably crosses its revolve axis"
+            if ftype in ("revolution", "groove")
+            else "check the profile/parameters"
+        )
+        raise RuntimeError(
+            f"{ftype} produced a self-intersecting solid (volume {volume:.1f} mm^3 < 0); {hint}."
+        )
     # Settle the lazy Shape caches INSIDE this op: a read immediately after the
     # commit (the caller's measure_geometry, the connectivity audit) otherwise
     # saw an interim result — live: a datum-plane pocket reported Body volume

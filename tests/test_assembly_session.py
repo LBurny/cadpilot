@@ -184,6 +184,37 @@ def test_mate_restores_every_link_the_solver_actually_moved(asm_conn, asm_home, 
     assert undo["links_restore"]["L_Chassis"]["Base"]["x"] == 1
 
 
+def test_mate_that_moved_nothing_records_no_restore(asm_conn, asm_home, monkeypatch):
+    """The addon now reports moved_link=None when the solver satisfied the mate
+    without displacement; the recorder must then store no placement snapshot
+    (restoring a part that never moved would teleport it later)."""
+    assembly_session_operation(asm_conn, "start", doc_name="Car", part="Chassis")
+    assembly_session_operation(asm_conn, "add_component", part="Gear")
+
+    def no_move(doc_name, spec):
+        asm_conn._record("assembly_op", doc_name, spec)
+        return {
+            "joint": "J_MCP",
+            "residual_mm": 0.0,
+            "residual_deg": 0.0,
+            "moved_link": None,
+            "moved_links": {},
+            "warnings": ["the mate was satisfied without moving any component"],
+        }
+
+    monkeypatch.setattr(asm_conn, "assembly_op", no_move, raising=False)
+    r = assembly_session_operation(
+        asm_conn,
+        "mate",
+        a={"part": "Gear", "face": "Face1"},
+        b={"part": "Chassis", "face": "Face1"},
+    )
+    undo = astate.current_session().steps[-1].undo
+    assert undo["links_restore"] == {}
+    assert undo["joints_to_delete"] == ["J_MCP"]
+    assert "without moving any component" in r[0].text
+
+
 def test_start_undo_tears_the_assembly_down_on_rollback_across_it(asm_conn, asm_home):
     """to_step=0 used to leave MCP_Assembly, its ground joint and the ground
     link behind — the start step carried an empty undo."""
@@ -396,10 +427,12 @@ def test_rollback_restores_placements_before_removing_links():
     )
 
 
-def test_mate_reports_landing_and_warns_on_vertex_landing():
-    """Face refs land on the nearest VERTEX (arbitrary on symmetric faces) —
-    residual 0 does not mean the part landed where the user meant. The result
-    must report the landing vertices and warn on far-from-intent landings."""
+def test_mate_reports_landing_and_where_the_jcs_landed():
+    """`landing` tells which sub-elements the refs resolved to and
+    `landing_points` where the JCS actually landed — the number to check a
+    mate against, since residual 0 only says the two frames agree, not that
+    they landed where the caller meant (live: a fixed mate of two concentric
+    circular faces came out 44 mm off axis at residual 0)."""
     fn = _func(_JOINT_OPS, "_op_mate")
     src = ast.get_source_segment(
         (
@@ -412,16 +445,18 @@ def test_mate_reports_landing_and_warns_on_vertex_landing():
         fn,
     )
     assert '"landing"' in src
+    assert '"landing_points"' in src
     assert '"warnings"' in src
     assert "_landing_warnings" in src
 
 
 def test_landing_warnings_measure_distance_to_each_ref_kinds_intent():
-    """Anchor and point refs have the same arbitrary-nearest-vertex problem as
-    face refs, so the warning must measure against the intent point of the
-    actual ref kind: face center for a face ref (skipped when point_on_face
-    aims deliberately), the anchor's position for an anchor ref, the point
-    itself for a point ref."""
+    """A plain face ref lands on the face CENTER by construction (the
+    face-name marker), so only hint/anchor/point refs can snap somewhere else:
+    they pick the closest selectable point, which is arbitrary on a symmetric
+    face. The warning must compare the landing point with the actual intent of
+    the ref kind: the point_on_face hint, the anchor's position, the point
+    itself."""
     fn = _func(_JOINT_OPS, "_landing_warnings")
     src = ast.get_source_segment(
         (
@@ -433,9 +468,51 @@ def test_landing_warnings_measure_distance_to_each_ref_kinds_intent():
         ).read_text(encoding="utf-8"),
         fn,
     )
-    assert "CenterOfMass" in src, "face refs measure against the face center"
-    assert "point_on_face" in src, "point_on_face exempts the face-center check"
+    assert "_landing_point" in src, "measure where the ref actually lands"
+    assert "point_on_face" in src, "a plain face ref lands on the center — skip it"
     assert "_resolve_anchor" in src, "anchor refs measure against the anchor position"
     assert "multVec" in src, "anchor positions are local — map into the link frame"
     assert 'r["point"]' in src, "point refs measure against the point itself"
-    assert "Vertexes" in src, "single-vertex faces (a circular seam) must be exempt"
+
+
+def test_face_refs_land_on_the_face_center_not_a_seam_vertex():
+    """UtilsAssembly.findPlacement lands by the SECOND element's type: a
+    Vertex at that vertex, a circular edge at its CENTER, the face's own name
+    at the face center. Always appending the nearest vertex mis-landed every
+    circular face (its only vertex is OCC's seam): concentric holes came out
+    R-r off axis. The resolver must use the GUI's own [sub, sub] marker for a
+    plain face ref and offer circular-edge centers as click candidates."""
+    src = ast.unparse(_func(_JOINT_OPS, "_face_landing"))
+    assert "return face_name" in src, "the face-name marker lands on the face center"
+    assert "GeomCircle" in src and "Curve.Location" in src, (
+        "a circular boundary edge lands at its center"
+    )
+    assert "_shape_edge_name" in src, "face-local edges must be named shape-globally"
+    assert "_shape_vertex_name" in src
+    landing = ast.unparse(_func(_JOINT_OPS, "_landing_point"))
+    assert "CenterOfGravity" in landing and "Curve.Location" in landing
+    resolve = ast.unparse(_func(_JOINT_OPS, "_resolve_ref"))
+    assert "_face_landing" in resolve
+
+
+def test_assembly_ops_refuse_another_documents_session(asm_conn, asm_home):
+    """Same global-slot hazard as session(): assembly ops took the active
+    session's doc and ignored the passed doc_name, so an agent's rollback
+    dismantled the OTHER agent's assembly (live: rollback(doc_name=R4G_Asm)
+    returned R4G_Asm2's objects while R4G_Asm never moved)."""
+    r = assembly_session_operation(asm_conn, "start", doc_name="Car", part="Chassis")
+    assert '"success"' in r[0].text or "started" in r[0].text
+    r = assembly_session_operation(asm_conn, "status", doc_name="Other")
+    assert "tracks document 'Car'" in r[0].text, r[0].text
+    # The session's own document (and the no-doc_name legacy form) still work.
+    ok = assembly_session_operation(asm_conn, "status", doc_name="Car")
+    assert "tracks document" not in ok[0].text
+    legacy = assembly_session_operation(asm_conn, "status")
+    assert "tracks document" not in legacy[0].text
+
+
+def test_start_reports_replacing_another_documents_session(asm_conn, asm_home):
+    assembly_session_operation(asm_conn, "start", doc_name="DocA", part="A")
+    r = assembly_session_operation(asm_conn, "start", doc_name="DocB", part="B")
+    blob = "".join(getattr(c, "text", str(c)) for c in r)
+    assert "replaced the active assembly session" in blob, blob

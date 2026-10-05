@@ -11,7 +11,14 @@ the first kind:
   inside the Shape (measured: a box at (100,0,0) has ``BoundBox.XMin == 100``);
 * a PartDesign **feature inside a Body** keeps its Shape in the BODY's local
   frame while the Body owns the Placement (measured: a Pad reads bb 0..10 with
-  its Body at y=200).
+  its Body at y=200);
+* a feature's OWN Placement is NOT part of that shape: FreeCAD computes it in
+  the Body frame with the sketch's plane attachment already baked in, so a
+  feature on an XZ/YZ/face-attached sketch carries the same rotation in
+  ``Placement`` and in ``Shape`` — applying ``getGlobalPlacement()`` (which
+  multiplies the feature's own Placement in) rotated it TWICE (live: an XZ pad
+  read y -20..0 / z -5..0 for a body at the origin while ``Part.getShape(obj)``
+  and the Body agreed on y -5..0 / z 0..20).
 
 Every shape read here goes through :func:`global_shape`, so a feature of a
 moved Body no longer reports local coordinates as if they were global (live:
@@ -49,12 +56,15 @@ def global_placement(obj):
     """The placement that maps ``obj.Shape`` to global coordinates.
 
     Equals ``obj.Placement`` for objects that carry it inside the Shape; for a
-    PartDesign feature it is ``getGlobalPlacement()`` (the owning Body's frame,
-    nested containers included).
+    PartDesign feature it is the OWNING BODY's global placement (nested
+    containers included) — deliberately NOT ``obj.getGlobalPlacement()``,
+    which also multiplies the feature's own Placement, a value its Shape
+    already contains (see the module docstring).
     """
-    if body_owner(obj) is not None:
+    body = body_owner(obj)
+    if body is not None:
         with contextlib.suppress(Exception):
-            return obj.getGlobalPlacement()
+            return body.getGlobalPlacement()
     return obj.Placement
 
 
@@ -84,9 +94,14 @@ def _get_shape(doc_name, obj_name):
 
 
 def _r(value):
-    """Round to 4 significant digits to keep RPC payloads small."""
+    """Round to 6 significant digits to keep RPC payloads small.
+
+    6 (not 4) because callers diff two reports to get a delta (a 0.05 mm wall
+    change on a 240 mm part): at 4 digits the rounding of the operands is the
+    same order as the answer.
+    """
     try:
-        return float(f"{float(value):.4g}")
+        return float(f"{float(value):.6g}")
     except (TypeError, ValueError):
         return None
 
@@ -165,7 +180,7 @@ def measure_geometry(doc_name, obj_name):
                 "edges": len(gshape.Edges),
                 "vertices": len(gshape.Vertexes),
             },
-            "placement": _placement_info(obj.Placement),
+            "placement": _placement_info(global_placement(obj)),
         }
     except Exception as e:
         return {"success": False, "error": f"{type(e).__name__}: {e}"}
@@ -275,6 +290,10 @@ def get_topology(doc_name, obj_name, element="faces", limit=50, offset=0):
     shape = getattr(obj, "Shape", None)
     if shape is None or shape.isNull():
         return {"success": False, "error": f"Object '{obj_name}' has no Shape."}
+    # Global frame, like every other query: a body member's raw Shape is
+    # body-local and listing its elements reported local coordinates as if
+    # they were global (live-verified after this very fix landed elsewhere).
+    shape = global_shape(obj)
     if element not in ("faces", "edges", "vertices"):
         return {
             "success": False,
@@ -349,6 +368,7 @@ def get_positioning_info(doc_name, obj_name, element, element_index):
     shape = getattr(obj, "Shape", None)
     if shape is None or shape.isNull():
         return {"success": False, "error": f"Object '{obj_name}' has no Shape."}
+    shape = global_shape(obj)
 
     try:
         idx = int(element_index)
@@ -368,7 +388,7 @@ def get_positioning_info(doc_name, obj_name, element, element_index):
                 "type": _short_type(surf.TypeId),
                 "area": _r(face.Area),
                 "center": _vec(face.CenterOfMass),
-                "placement": _placement_info(obj.Placement),
+                "placement": _placement_info(global_placement(obj)),
             }
             normal = _face_normal(face)
             if normal is not None:
@@ -406,7 +426,7 @@ def get_positioning_info(doc_name, obj_name, element, element_index):
                 "type": _short_type(curve.TypeId),
                 "length": _r(edge.Length),
                 "center": _vec(edge.CenterOfMass),
-                "placement": _placement_info(obj.Placement),
+                "placement": _placement_info(global_placement(obj)),
             }
             verts = edge.Vertexes
             if len(verts) >= 1:
@@ -437,7 +457,7 @@ def get_positioning_info(doc_name, obj_name, element, element_index):
                 "element": "vertex",
                 "name": f"Vertex{idx + 1}",
                 "position": _vec(vert.Point),
-                "placement": _placement_info(obj.Placement),
+                "placement": _placement_info(global_placement(obj)),
             }
         else:
             return {

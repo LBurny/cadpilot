@@ -59,13 +59,54 @@ def resolve_references(doc: FreeCAD.Document, val: Any) -> list[tuple[Any, Any]]
     return refs
 
 
+def set_spreadsheet_cells(ss, cells: dict) -> None:
+    """Write ``{cell: [alias, value]}`` entries onto a Spreadsheet.
+
+    Shared by the ``variables`` feature op and ``edit_object``. A Spreadsheet
+    has a property literally named ``cells``, but assigning it through setattr
+    fails with "Invalid type" — the contents must be written cell by cell.
+    Values: number -> literal, string starting with '=' -> formula, other
+    strings -> quoted text.
+    """
+    if not isinstance(cells, dict) or not cells:
+        raise ValueError("cells must be a non-empty dict of {cell: [alias, value]}.")
+    for cell, entry in cells.items():
+        if not (isinstance(entry, (list, tuple)) and len(entry) == 2):
+            raise ValueError(f"cells['{cell}'] must be [alias, value].")
+        alias, value = entry
+        if isinstance(value, bool):
+            raise ValueError(f"cells['{cell}']: bool is not a valid value.")
+        if isinstance(value, (int, float)):
+            ss.set(cell, repr(value))
+        elif isinstance(value, str):
+            ss.set(cell, value if value.startswith("=") else f'"{value}"')
+        else:
+            raise ValueError(f"cells['{cell}']: unsupported value {value!r}.")
+        try:
+            ss.setAlias(cell, str(alias))
+        except Exception as e:
+            # FreeCAD's own "Invalid alias" names neither the cell nor the
+            # alias, so the caller could not tell which entry was wrong.
+            raise ValueError(
+                f"cells['{cell}']: alias {alias!r} was rejected ({e}). Aliases must "
+                "start with a letter and contain only letters/digits/underscores "
+                "(no spaces, no leading digit, not a cell reference like 'A1')."
+            ) from None
+
+
 def set_object_property(
     doc: FreeCAD.Document, obj: FreeCAD.DocumentObject, properties: dict[str, Any]
 ):
     failures = []
     for prop, val in properties.items():
         try:
-            if prop in obj.PropertiesList:
+            # FIRST, before the PropertiesList branch: a Spreadsheet DOES have a
+            # property literally named "cells" (assigned via getContents), and
+            # the generic setattr path for it fails with "cells: Invalid type".
+            if prop == "cells" and obj.TypeId == "Spreadsheet::Sheet" and isinstance(val, dict):
+                set_spreadsheet_cells(obj, val)
+
+            elif prop in obj.PropertiesList:
                 # Expression binding: "=Spreadsheet.width * 2" routes to the
                 # ExpressionEngine instead of a literal assignment, which is
                 # how Spreadsheet-driven parametrics are wired up.
@@ -96,6 +137,22 @@ def set_object_property(
                         ),
                     )
                     setattr(obj, prop, placement)
+
+                elif prop == "Placement" and isinstance(val, (list, tuple)):
+                    # The dict form is the documented one; [x, y, z] is the
+                    # shorthand a caller reaches for, and it used to fall
+                    # through to the generic branch and die with the opaque
+                    # "'list' object has no attribute 'get'".
+                    if len(val) == 3 and all(isinstance(v, (int, float)) for v in val):
+                        setattr(
+                            obj, prop, FreeCAD.Placement(FreeCAD.Vector(*val), FreeCAD.Rotation())
+                        )
+                    else:
+                        raise ValueError(
+                            "Placement as a list must be [x, y, z]; for a rotation use the "
+                            'dict form {"Base": {"x": .., "y": .., "z": ..}, '
+                            '"Rotation": {"Axis": {"x": .., "y": .., "z": ..}, "Angle": deg}}.'
+                        )
 
                 elif isinstance(getattr(obj, prop), FreeCAD.Vector) and isinstance(val, dict):
                     vector = FreeCAD.Vector(val.get("x", 0), val.get("y", 0), val.get("z", 0))
