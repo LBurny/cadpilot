@@ -1687,6 +1687,23 @@ def _thickness_grew_outward(feat) -> str:
     )
 
 
+def describe_feature_reply(feat, spec) -> dict:
+    """``describe_feature`` plus the shape-check advisory — the RPC layer's call.
+
+    The advisory belongs to the op that JUST ran, so it is merged here rather
+    than in every branch of describe_feature (whose body keeps its own, widely
+    asserted, shape)."""
+    out = describe_feature(feat, spec) or {}
+    note = _take_shape_check_note()
+    if note:
+        warnings = out.get("warnings")
+        if isinstance(warnings, list):
+            warnings.append(note)
+        else:
+            out["warnings"] = [note]
+    return out
+
+
 def describe_feature(feat, spec) -> dict:
     """Extra result fields for the RPC response (sketch, hull, cut no-ops)."""
     op = spec.get("type")
@@ -1876,12 +1893,18 @@ def _status_string(feat) -> str:
     return ""
 
 
-def _invalid_shape_error(feat_type, feat) -> str:
+def _invalid_shape_error(feat_type, feat, detail: str | None = None) -> str:
     """ "<op> produced an invalid Shape" was raised for a self-intersecting
     profile, a dangling reference and a corrupted dependency graph alike — three
     different causes behind one opaque message. Name the object and carry
-    FreeCAD's own reason."""
-    status = _status_string(feat)
+    FreeCAD's own reason.
+
+    ``detail`` overrides the reason read off the feature: when the validity
+    CHECK itself failed there is no status to quote, and quoting FreeCAD's
+    (perfectly healthy) "Valid" produced the self-contradictory "produced an
+    invalid Shape — FreeCAD says: Valid" (live: a fillet whose BRepCheck threw).
+    """
+    status = detail or _status_string(feat)
     reason = f" — FreeCAD says: {status}" if status else ""
     return (
         f"{feat_type} '{feat.Name}' produced an invalid Shape{reason}. "
@@ -1889,6 +1912,21 @@ def _invalid_shape_error(feat_type, feat) -> str:
         "profile self-intersects, or it references a deleted object. Select "
         f"'{feat.Name}' in FreeCAD and use Part > Check geometry for the OCC fault."
     )
+
+
+# A feature whose recompute SUCCEEDED, whose FreeCAD status is "Valid" and whose
+# shape measures correctly, but whose OCC BRepCheck reports it invalid. That
+# combination is a FALSE NEGATIVE of isValid() — refused live for a legitimate
+# 2 mm PartDesign fillet on a patterned flange (volume exactly the analytic
+# roundover, status Valid, isValid() False) — so it is downgraded from a hard
+# failure to a warning the caller can see. Read once, by describe_feature.
+_SHAPE_CHECK_NOTE = ""
+
+
+def _take_shape_check_note() -> str:
+    global _SHAPE_CHECK_NOTE
+    note, _SHAPE_CHECK_NOTE = _SHAPE_CHECK_NOTE, ""
+    return note
 
 
 def create_feature_gui(doc, spec):
@@ -1928,15 +1966,40 @@ def create_feature_gui(doc, spec):
         detail = f" — {status}" if status and status != "Invalid" else ""
         hint = _FAILURE_HINTS.get(ftype, "check parameters/geometry.")
         raise RuntimeError(f"{ftype} failed to recompute{detail} ({hint})")
+    global _SHAPE_CHECK_NOTE
+    _SHAPE_CHECK_NOTE = ""
+    shape = None
+    check_error = ""
     try:
         shape = getattr(feat, "Shape", None)
-        invalid = shape is not None and not shape.isNull() and not shape.isValid()
-    except Exception:
+        valid = True if shape is None or shape.isNull() else shape.isValid()
+    except Exception as e:
         # A feature whose Shape cannot even be read (a broken tip, a dangling
         # link) fails the same way as an invalid one, and must name itself too.
-        invalid = True
-    if invalid:
-        raise RuntimeError(_invalid_shape_error(ftype, feat))
+        valid = False
+        check_error = f"the validity check could not run ({type(e).__name__}: {e})"
+    if not valid:
+        status = _status_string(feat)
+        if check_error or (status and status != "Valid"):
+            raise RuntimeError(_invalid_shape_error(ftype, feat, check_error or status))
+        # FreeCAD says Valid, the shape is non-null, the recompute committed and
+        # the volume is sane: OCC's BRepCheck disagrees, which it does for good
+        # PartDesign fillets (see _SHAPE_CHECK_NOTE). Advisory, not fatal — a
+        # false negative that hard-fails a correct model is worse than a warning.
+        volume_note = ""
+        with contextlib.suppress(Exception):
+            volume_note = (
+                f" — it holds {len(shape.Solids)} solid(s), volume {float(shape.Volume):.1f} mm^3"
+                if shape is not None
+                else ""
+            )
+        _SHAPE_CHECK_NOTE = (
+            f"{ftype} '{feat.Name}' recomputed and FreeCAD reports it Valid, but OCC's "
+            f"own validity check (Shape.isValid) says otherwise{volume_note}. The "
+            "geometry was kept, since that combination is usually a false negative "
+            "(it happens on ordinary PartDesign fillets). Verify with Part > Check "
+            "geometry if this part matters."
+        )
     # A negative volume is never a legitimate solid: OCC returns one for a
     # self-intersecting result (a profile straddling its revolve axis is the
     # classic case) and FreeCAD still calls the feature valid — the caller

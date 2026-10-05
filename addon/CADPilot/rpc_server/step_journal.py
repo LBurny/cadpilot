@@ -261,6 +261,11 @@ def feature_detail(operation: str, params: Any) -> str:
     if scalar is not None:
         key, unit = scalar
         value = p.get(key)
+        if value is None and key == "angle" and op in ("revolution", "groove"):
+            # FreeCAD's default is a full revolve, and the row must not depend
+            # on whether the caller spelled it out: "revolution 'Prof'" and
+            # "revolution 'Prof' 360°" are the same step.
+            value = 360
         if value is None:
             return ""
         text = _num_text(value)

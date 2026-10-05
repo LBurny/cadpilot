@@ -1038,3 +1038,11 @@ def test_set_label_renames_any_step_including_a_done_one():
     assert sj.set_label([done], 1, "") is None
     assert sj.set_label([done], 9, "nope") is None
     assert done.label == "flange plate"
+
+
+def test_revolution_detail_defaults_to_a_full_turn():
+    """FreeCAD's default is a full revolve, and the same geometry must read the
+    same whether or not the caller spelled out angle=360."""
+    assert sj.feature_detail("revolution", {}) == "360°"
+    assert sj.feature_detail("groove", {}) == "360°"
+    assert sj.feature_detail("revolution", {"angle": 180}) == "180°"

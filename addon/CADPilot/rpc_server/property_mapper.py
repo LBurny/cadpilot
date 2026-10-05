@@ -202,6 +202,15 @@ def set_object_property(
                         pos = val["Base"]
                     elif "Position" in val:
                         pos = val["Position"]
+                    elif any(k in val for k in ("x", "y", "z")):
+                        # The flat shorthand {"x": .., "y": .., "z": ..} — the
+                        # same shape every other Vector property accepts — used
+                        # to fall into the empty-pos branch and build an
+                        # IDENTITY Placement: the tool reported success and the
+                        # part never moved (live: a bore tool cylinder stayed at
+                        # the origin, so the "hole" became a quarter-notch at a
+                        # corner and the cut was 75 mm^3 short).
+                        pos = val
                     else:
                         pos = {}
                     rot = val.get("Rotation", {})

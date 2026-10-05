@@ -202,3 +202,87 @@ def test_get_view_asks_for_the_real_failure_reason():
     assert "_last_screenshot_error" in _names(body)
     core = _tree(_SRC / "operations" / "core.py")
     assert "get_last_screenshot_error" in _names(_func(core, "get_view_operation"))
+
+
+# --- found by the complex-model validation runs --------------------------------
+
+
+def test_flat_placement_dict_is_not_silently_ignored():
+    """A primitive tool's Placement given as the flat shorthand
+    {"x": .., "y": .., "z": ..} used to build an IDENTITY Placement: the tool
+    reported success and the part never moved (live: a bore cylinder stayed at
+    the origin, so the "hole" came out as a quarter-notch at a corner and the
+    cut was 75 mm^3 short)."""
+    body = _func(_tree(_ADDON / "property_mapper.py"), "set_object_property")
+    placement_branches = [
+        n
+        for n in ast.walk(body)
+        if isinstance(n, ast.Compare)
+        and any(isinstance(c, ast.Constant) and c.value == "Placement" for c in _walk_compares(n))
+    ]
+    assert placement_branches, "the Placement branch must exist"
+    text = " ".join(_strings(body))
+    # The flat form is recognized by looking for the axis keys on the dict.
+    assert "Rotation" in text
+    flat_check = [
+        n
+        for n in ast.walk(body)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "any"
+        and {"x", "y", "z"} <= set(_strings(n))
+    ]
+    assert flat_check, "a flat {x,y,z} placement dict must be accepted as the position"
+
+
+def _walk_compares(node):
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Compare):
+            yield from sub.comparators
+            yield sub.left
+
+
+def test_axis_anchor_uses_a_point_on_the_axis_not_a_surface_centroid():
+    """A cylindrical face is usually PARTIAL (a bore, a half-shaft) and a partial
+    face's CenterOfMass lies ON the surface: anchoring there put the axis
+    ~2.5 mm off the real bore axis (live: an r=4 quarter bore anchored at
+    (2.546, 2.546) instead of (0, 0)), and axis_mid pointed at the underlying
+    surface's parametric origin — 17 mm below the plate for a boolean bore."""
+    body = _func(_tree(_ADDON / "assembly_ops.py"), "_auto_anchor_map")
+    # The axis point comes from the surface...
+    assert "Center" in _strings(body)
+    # ...and axis_mid is the middle of the face's axial span, not the origin.
+    mid_assigns = [
+        n
+        for n in ast.walk(body)
+        if isinstance(n, ast.Assign)
+        and any(
+            isinstance(t, ast.Subscript)
+            and isinstance(t.slice, ast.Constant)
+            and t.slice.value == "axis_mid"
+            for t in n.targets
+        )
+    ]
+    assert mid_assigns
+    assert any(
+        isinstance(x, ast.BinOp) and isinstance(x.op, ast.Div)
+        for a in mid_assigns
+        for x in ast.walk(a)
+    ), "axis_mid must be the midpoint (lo + hi) / 2 of the axial span"
+
+
+def test_a_valid_status_downgrades_the_occ_validity_false_negative():
+    """OCC's isValid() returns False for ordinary PartDesign fillets while
+    FreeCAD's own status is 'Valid' and the volume measures correctly, so a hard
+    failure refused a legitimate model AND printed the self-contradictory
+    "produced an invalid Shape — FreeCAD says: Valid"."""
+    tree = _tree(_ADDON / "feature_ops.py")
+    body = _func(tree, "create_feature_gui")
+    assert "_SHAPE_CHECK_NOTE" in _names(body)
+    # The hard failure is gated on the status differing from "Valid".
+    assert "Valid" in _strings(body)
+    helper = _func(tree, "_invalid_shape_error")
+    assert "detail" in {a.arg for a in helper.args.args}, "the reason must be overridable"
+    assert "_take_shape_check_note" in _names(_func(tree, "describe_feature_reply")), (
+        "the advisory must reach the reply"
+    )

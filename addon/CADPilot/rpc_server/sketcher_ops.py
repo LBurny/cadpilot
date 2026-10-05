@@ -240,8 +240,18 @@ def _point_ref(item, what="item"):
 
 
 def _geo_id(item, what="item"):
+    """A whole-geometry reference: ``[geo_id]`` or a bare ``geo_id``.
+
+    Both spellings mean the same thing, and a caller writing a constraint by
+    hand naturally writes ``"items": [0]`` (the geometry INDEX), which used to
+    die "item must be [geo_id], got 0" — an error that names the shape but not
+    the intent. A 2-element item is a POINT reference elsewhere, so a bare int
+    can never be ambiguous here.
+    """
+    if isinstance(item, int):
+        return item
     if not (isinstance(item, (list, tuple)) and len(item) == 1):
-        raise ValueError(f"{what} must be [geo_id], got {item!r}")
+        raise ValueError(f"{what} must be a geo_id or [geo_id] (the geometry index), got {item!r}")
     return int(item[0])
 
 
@@ -289,8 +299,14 @@ def _constraint_geometry(ctype: str, items: list):
     if ctype in ("distance_x", "distance_y"):
         fc_type = "DistanceX" if ctype == "distance_x" else "DistanceY"
         if len(items) == 1:
-            g, p = _point_ref(items[0])
-            return (fc_type, g, p)
+            # ONE item is either a point (distance from the origin) or a whole
+            # geometry (FreeCAD's edge form: the x/y position of a line). The
+            # edge form is the natural way to place a vertical/horizontal wall,
+            # and requiring a point ref made it unexpressible.
+            if _is_point_item(items[0]):
+                g, p = _point_ref(items[0])
+                return (fc_type, g, p)
+            return (fc_type, _geo_id(items[0]))
         g1, p1 = _point_ref(items[0])
         g2, p2 = _point_ref(items[1])
         return (fc_type, g1, p1, g2, p2)

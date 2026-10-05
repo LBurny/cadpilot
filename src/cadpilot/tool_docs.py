@@ -256,10 +256,30 @@ Optional: plane, offset, body, construction, external, constraints.
   Supported types: coincident, horizontal, vertical, tangent, perpendicular,
   parallel, equal, symmetric, distance, distance_x, distance_y, radius, angle.
   value accepts numbers or "=expressions".
+  Item shapes per type (a whole-geometry reference is the GeoId or [GeoId]):
+    coincident     [[g,p], [g,p]]                     (two points)
+    horizontal     [g]        vertical     [g]        (one edge)
+    tangent/perpendicular/parallel/equal  [g]  or [g, g]
+    symmetric      [[g,p], [g,p], [g]|  [g,p]]        (about a line or a point)
+    distance       [g] | [[g,p],[g,p]] | [[g,p], g]
+    distance_x / _y  [[g,p]] (that point's x/y from the ORIGIN, the usual way
+                     to place a wall at an absolute coordinate) |
+                     [g] (the edge's own horizontal/vertical EXTENT, i.e. the
+                     separation of its endpoints along that axis — NOT its
+                     position: on a VERTICAL line that extent is 0, so pairing
+                     [g] with a `vertical` constraint conflicts) |
+                     [[g,p],[g,p]]
+    radius         [g]        angle   [g] | [g, g]
+  A bare GeoId (not wrapped in a list) is accepted wherever one edge is meant.
   distance_x/distance_y are SIGNED and measured FROM the first referenced point
   TO the second, so [[0,"start"],[-1,"center"]] with +30 puts the origin at
   (−30, ·) — swapping the two items flips the sign. Write the constraint in the
   order you mean it.
+  A profile of N lines needs its closing point coincidences AND the
+  horizontal/vertical constraints for each axis-aligned edge (a rectangle =
+  4 lines + 4 coincidences + 2 horizontal + 2 vertical), or the solver leaves
+  rotational/positional degrees of freedom and the sketch reports
+  fully_constrained: false.
 - Reusing an existing name does NOT overwrite: FreeCAD de-duplicates
   ("HoleProfile" → "HoleProfile001"); the response carries the actual name,
   so reuse it from there.
@@ -449,7 +469,8 @@ For PERSISTENT joints use assembly_session instead.""",
     "step_plan": """\
 step_plan — submit a plan to FreeCAD's step journal WITHOUT executing it.
 
-Each entry is a cad() argument dict, so the panel can run it later:
+Each entry is a cad() argument dict (or an execute_code snippet — see below),
+so the panel can run it later:
     {"operation": "create_object", "obj_type": "Part::Box", "obj_name": "Base",
      "description": "base plate"}
     {"operation": "pad", "obj_name": "Sketch", "obj_properties": {"Length": 20}}

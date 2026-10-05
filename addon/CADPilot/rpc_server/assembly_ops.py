@@ -90,12 +90,25 @@ def _auto_anchor_map(obj):
         axis = FreeCAD.Vector(face.Surface.Axis)
         if axis.Length > 1e-12:
             axis.normalize()
-        center = face.CenterOfMass
-        pts = [v.Point for v in face.Vertexes] or [center]
+        # The axis POINT must come from the surface, never from the face's
+        # CenterOfMass: a cylindrical face is usually PARTIAL (a bore left by a
+        # boolean, a half-shaft), and a partial face's CenterOfMass lies ON the
+        # surface, r*2/pi off the axis — so the anchor sat ~2.5 mm off a bore's
+        # real axis and a revolute mate built on it was misaligned (live: an
+        # r=4 quarter bore anchored at (2.546, 2.546) instead of (0, 0)).
+        # Surface.Center is a point ON the axis for both cylinders and cones.
+        center = FreeCAD.Vector(getattr(face.Surface, "Center", None) or face.CenterOfMass)
+        pts = [v.Point for v in face.Vertexes] or [face.CenterOfMass]
         projs = [(p - center).dot(axis) for p in pts]
-        anchors["axis_mid"] = (FreeCAD.Vector(center), FreeCAD.Vector(axis))
-        anchors["axis_start"] = (center + axis * min(projs), FreeCAD.Vector(axis))
-        anchors["axis_end"] = (center + axis * max(projs), FreeCAD.Vector(axis))
+        lo, hi = min(projs), max(projs)
+        # mid is the MIDDLE OF THE FACE along its axis, not the surface's
+        # parametric origin: the latter is wherever the underlying surface
+        # happens to be anchored (for a boolean bore it is the tool cylinder's
+        # base, e.g. 17 mm below the plate), so an "axis_mid" anchor landed
+        # outside the part it describes.
+        anchors["axis_mid"] = (center + axis * ((lo + hi) / 2), FreeCAD.Vector(axis))
+        anchors["axis_start"] = (center + axis * lo, FreeCAD.Vector(axis))
+        anchors["axis_end"] = (center + axis * hi, FreeCAD.Vector(axis))
 
     # up to 3 largest planar faces
     planar = sorted(

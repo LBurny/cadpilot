@@ -27,7 +27,11 @@ from rpc_server.assembly_ops import (
     verify_assembly as _verify_assembly,
 )
 from rpc_server.commands import register_commands, schedule_toggle_sync
-from rpc_server.feature_ops import FEATURE_TYPES, create_feature_gui, describe_feature
+from rpc_server.feature_ops import (
+    FEATURE_TYPES,
+    create_feature_gui,
+    describe_feature_reply,
+)
 from rpc_server.geometry_query import (
     align_shapes as _align_shapes,
 )
@@ -355,7 +359,7 @@ class FreeCADRPC:
                 FreeCAD.Console.PrintMessage(
                     f"Feature '{feat.Name}' ({ftype}) created in '{doc_name}' via RPC.\n"
                 )
-                extra = describe_feature(feat, spec)
+                extra = describe_feature_reply(feat, spec)
                 return {"success": True, "object_name": feat.Name, **extra}
             except Exception as e:
                 return str(e)
@@ -576,7 +580,7 @@ class FreeCADRPC:
                     res = {
                         "success": True,
                         "object_name": feat.Name,
-                        **describe_feature(feat, spec),
+                        **describe_feature_reply(feat, spec),
                     }
                 except Exception as e:
                     return {"success": False, "action": action, "error": str(e)}
