@@ -251,6 +251,12 @@ def _build_fillet_chamfer(doc, spec, kind):
     accepted silently while leaving the Body ``['Touched', 'Invalid']``. A base
     that is a bare Part-level object still wants the Part::Fillet path.
     """
+    # Function-top on purpose: the bare-base branch below also writes
+    # _LAST_FEATURE_INFO, and when the declaration lived inside the named_body
+    # branch that write only reached the global through Python's
+    # whole-function scoping — removing that branch would have silenced the
+    # hidden_base report (the same trap _build_color was caught by).
+    global _LAST_FEATURE_INFO
     size_key = tip_policy.dress_spec_key(kind)
     _require(spec, "base", "edges", size_key)
     base = _get_obj(doc, spec["base"], "base")
@@ -288,7 +294,6 @@ def _build_fillet_chamfer(doc, spec, kind):
             # The caller named the BODY, so the reply must say which of its
             # features actually got dressed: "which feature is the Tip" is the
             # one thing a Body-named dress-up resolves for them.
-            global _LAST_FEATURE_INFO
             _LAST_FEATURE_INFO = {"dressed": target.Name, "body": body.Name}
         return feat
     feat = doc.addObject(tip_policy.dress_type(kind, False), label)

@@ -1004,6 +1004,27 @@ def test_row_text_does_not_double_the_description_on_a_composed_label():
     assert sj.tooltip_text(rec) == ("步骤1: 琴身轮廓 + f孔\n样条曲线\n+1 object(s): Body")
 
 
+def test_row_text_swaps_a_stale_description_when_the_comment_is_edited():
+    """Editing the snippet's leading comment updates the row; on a label this
+    addon composed ("desc · effect") the stale description must be REPLACED,
+    not prepended to (which read "new · old · effect")."""
+    rec = sj.StepRecord(
+        index=3,
+        operation="execute_code",
+        label="步骤1: 琴身轮廓 + f孔 · +1 object(s): Body",
+        params={"code": "# 步骤1: 改名后的轮廓\nimport FreeCAD\n"},
+    )
+    assert sj.row_text(rec) == "步骤1: 改名后的轮廓 · +1 object(s): Body"
+    # A legacy record (effect alone) still gets the description composed on top.
+    legacy = sj.StepRecord(
+        index=4,
+        operation="execute_code",
+        label="execute_code: read-only",
+        params={"code": "# 新注释\nimport FreeCAD\n"},
+    )
+    assert sj.row_text(legacy) == "新注释 · read-only"
+
+
 def test_a_planned_snippet_is_executable_when_it_carries_its_code():
     """A planned execute_code step used to be accepted and then silently skipped
     at run time ("skipped: not re-executable"), because the op name is not in

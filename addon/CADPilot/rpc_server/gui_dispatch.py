@@ -430,7 +430,14 @@ def dispatch_to_gui(task: Callable[[], Any], timeout: float = 60) -> Any:
         try:
             result = response_queue.get(timeout=min(remaining, _USER_HOLD_GRACE))
         except queue.Empty:
-            if _defer_reason is not None:
+            # _defer_reason only says a defer was RECORDED since the last clear;
+            # _clear_defer runs after the drain loop ends and heartbeat ticks
+            # return early at the _processing guard, so while a task is actually
+            # running the flag is stale. Without the _processing check, a call
+            # that lands during a brief hold and then runs longer than the grace
+            # slice is misreported as "user holding a mouse button" while the
+            # work completes in FreeCAD — and a retry would duplicate it.
+            if _defer_reason is not None and not _processing:
                 # The guards are holding the queue back on purpose and will keep
                 # doing so while the interaction lasts, so waiting out the rest
                 # of the timeout cannot succeed — report the actionable reason

@@ -682,7 +682,16 @@ def row_text(rec: StepRecord) -> str:
     if rec.operation == "execute_code" and desc:
         first = desc.splitlines()[0]
         if not label.startswith(first):
-            label = f"{first} · {label.removeprefix('execute_code: ')}"
+            if label.startswith("execute_code: "):
+                # A legacy record carries the effect alone; compose on top.
+                label = f"{first} · {label.removeprefix('execute_code: ')}"
+            elif " · " in label:
+                # This addon's label is "desc · effect" and the comment has
+                # since been EDITED: replace the description segment, or the
+                # row grows a stale "new · old · effect".
+                label = f"{first} · {label.split(' · ', 1)[1]}"
+            else:
+                label = f"{first} · {label}"
     if rec.error:
         label += f"  — {rec.error}"
     return label

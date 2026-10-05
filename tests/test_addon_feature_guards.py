@@ -218,6 +218,22 @@ def test_dressup_named_on_a_body_aims_at_the_body_tip():
     assert "dressed_object" in ast.unparse(_func(_FEATURE, "describe_feature"))
 
 
+def test_dressup_declares_its_report_global_unconditionally():
+    """The bare-base branch writes _LAST_FEATURE_INFO (hidden_base), but the
+    only `global` declaration used to sit INSIDE the named_body branch: correct
+    only through Python's whole-function scoping, and dead the moment that
+    branch is removed or reordered (the trap _build_color was caught by). The
+    declaration must be unconditional at function top."""
+    body = _func(_FEATURE, "_build_fillet_chamfer")
+    top_level_globals = [
+        n for n in body.body if isinstance(n, ast.Global) and "_LAST_FEATURE_INFO" in n.names
+    ]
+    assert top_level_globals, (
+        "_LAST_FEATURE_INFO must be declared with a function-top `global` in"
+        " _build_fillet_chamfer (the bare-base write depends on it)"
+    )
+
+
 def test_tip_advance_refreshes_the_body_appearance():
     """A new PartDesign feature rebuilds the Body's display node with FreeCAD's
     DEFAULT material, so an earlier colour visually VANISHES while every stored

@@ -147,18 +147,24 @@ def test_describe_feature_mentions_a_hidden_base():
 def test_dispatch_reports_user_back_pressure_without_burning_the_timeout():
     """Holding a mouse button held the queue back, and the call waited the whole
     timeout in silence before saying so. It now reports the reason as soon as
-    the guard is provably holding the queue."""
+    the guard is provably holding the queue — and ONLY then: _defer_reason is
+    stale while a task is running (_clear_defer runs after the drain), so the
+    early report must also require that no drain is in progress, or a call that
+    lands during a brief hold and then runs long is misreported as user
+    back-pressure while its work actually completes."""
     tree = _tree(_ADDON / "gui_dispatch.py")
     body = _func(tree, "dispatch_to_gui")
     assert "_USER_HOLD_GRACE" in _names(body), "the wait must be bounded by the grace window"
     assert "_defer_reason" in _names(body)
-    # A deferral must short-circuit the wait, not sit inside the timeout branch.
+    # A deferral must short-circuit the wait, not sit inside the timeout branch,
+    # and must exclude a running drain (_processing).
     breaks = [
         n
         for n in ast.walk(body)
         if isinstance(n, ast.If)
-        and isinstance(n.test, ast.Compare)
+        and isinstance(n.test, (ast.Compare, ast.BoolOp))
         and "_defer_reason" in _names(n.test)
+        and "_processing" in _names(n.test)
         and any(isinstance(b, ast.Break) for b in ast.walk(n))
     ]
     assert breaks, "the wait loop must break out early on user-interaction back-pressure"
