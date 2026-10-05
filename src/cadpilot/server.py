@@ -607,7 +607,7 @@ def get_topology(
         limit: Max entries (1 to 200, default 50).
         offset: How many entries to skip.
 
-    Returns: total, returned, and a list of index, name, type, area or length, center, planar-face normal.
+    Returns: total, returned, and a '{element}' list of {index, name, type, area or length, center, planar-face normal}.
     """
     return get_topology_operation(
         get_freecad_connection(), doc_name, obj_name, element, limit, offset
