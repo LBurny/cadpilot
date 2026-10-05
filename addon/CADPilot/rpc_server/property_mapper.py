@@ -13,17 +13,83 @@ class Object:
     properties: dict[str, Any] = field(default_factory=dict)
 
 
-def _to_shape_color(val: Any) -> tuple[float, float, float, float]:
-    """Normalise a color to a 4-float RGBA tuple.
+#: Names accepted by :func:`parse_color`. A short, obvious set only: a big
+#: palette is what hex is for, and every name here is one a caller can guess.
+NAMED_COLORS: dict[str, tuple[float, float, float]] = {
+    "black": (0.0, 0.0, 0.0),
+    "white": (1.0, 1.0, 1.0),
+    "grey": (0.5, 0.5, 0.5),
+    "gray": (0.5, 0.5, 0.5),
+    "red": (0.8, 0.1, 0.1),
+    "orange": (0.9, 0.5, 0.1),
+    "yellow": (0.9, 0.8, 0.15),
+    "green": (0.1, 0.7, 0.25),
+    "blue": (0.15, 0.35, 0.8),
+    "steel": (0.5, 0.6, 0.7),
+}
 
-    Accepts RGB triples (alpha defaults to 1.0) and RGBA quads, matching what
-    FreeCAD's ``ShapeColor`` accepts.
+
+def parse_color(val: Any) -> tuple[float, float, float, float]:
+    """Normalise a color to the 4-float RGBA tuple FreeCAD accepts.
+
+    ONE parser for every color entry point (``create_object``/``edit_object``
+    ShapeColor and the ``color`` op), so the two cannot disagree about what a
+    caller's value means. Accepted forms:
+
+      - ``[r, g, b]`` / ``[r, g, b, a]``, floats in 0..1
+      - ``[r, g, b]`` as INTEGERS with a component > 1 -> the 0-255 scale. The
+        integer rule is what keeps the two scales apart: only [204, 26, 26]
+        can mean 0-255, so a float [1.4, 0.2, 0.2] is reported as out of range
+        instead of silently becoming 1.4/255
+      - ``"#rrggbb"`` / ``"#rrggbbaa"``, ``#`` optional
+      - a name from ``NAMED_COLORS`` ("red", "steel", …), case-insensitive
     """
+    if isinstance(val, str):
+        text = val.strip().lower()
+        if text in NAMED_COLORS:
+            return (*NAMED_COLORS[text], 1.0)
+        hex_text = text[1:] if text.startswith("#") else text
+        if len(hex_text) in (6, 8) and all(c in "0123456789abcdef" for c in hex_text):
+            channels = [int(hex_text[i : i + 2], 16) / 255.0 for i in range(0, len(hex_text), 2)]
+            a = channels[3] if len(channels) == 4 else 1.0
+            return (channels[0], channels[1], channels[2], a)
+        raise ValueError(
+            f"color {val!r} is not recognised. Use [r,g,b] floats 0..1, "
+            f"[r,g,b] ints 0-255, '#rrggbb' hex, or a name: "
+            f"{', '.join(sorted(NAMED_COLORS))}."
+        )
     if not isinstance(val, (list, tuple)) or len(val) not in (3, 4):
-        raise ValueError(f"ShapeColor must be an RGB or RGBA sequence, got {val!r}.")
-    r, g, b = (float(val[0]), float(val[1]), float(val[2]))
-    a = float(val[3]) if len(val) == 4 else 1.0
+        raise ValueError(
+            f"color must be an RGB/RGBA sequence, a '#rrggbb' string or a name, got {val!r}."
+        )
+    try:
+        channels = [float(c) for c in val]
+    except (TypeError, ValueError):
+        raise ValueError(f"color components must be numbers, got {val!r}.") from None
+    is_byte_scale = all(isinstance(c, int) and not isinstance(c, bool) for c in val)
+    if is_byte_scale and max(channels[:3]) > 1.0:
+        # 0-255 ints. FreeCAD stores out-of-range channels as given and clamps
+        # only at render time, so an out-of-range value must be refused here —
+        # it would otherwise be reported as a successful repaint.
+        if not all(0 <= c <= 255 for c in channels):
+            raise ValueError(
+                f"color components must be within 0-255 when any exceeds 1, got {val!r}."
+            )
+        channels = [c / 255.0 for c in channels]
+    elif not all(0.0 <= c <= 1.0 for c in channels):
+        raise ValueError(f"color components must be 0..1 floats or 0-255 ints, got {val!r}.")
+    r, g, b = channels[0], channels[1], channels[2]
+    a = channels[3] if len(channels) == 4 else 1.0
     return (r, g, b, a)
+
+
+def format_color(val: Any) -> str:
+    """A color as "#rrggbb", for readback/echoes ("" when unparseable)."""
+    try:
+        r, g, b, _ = parse_color(val)
+    except ValueError:
+        return ""
+    return "#" + "".join(f"{max(0, min(255, round(c * 255))):02x}" for c in (r, g, b))
 
 
 def parse_reference_entry(entry: Any) -> tuple[str, Any]:
@@ -106,6 +172,24 @@ def set_object_property(
             if prop == "cells" and obj.TypeId == "Spreadsheet::Sheet" and isinstance(val, dict):
                 set_spreadsheet_cells(obj, val)
 
+            # Color, in every form parse_color accepts ([0..1] floats, 0-255
+            # ints, "#rrggbb", a name). This must also come BEFORE the
+            # PropertiesList branch: LineColor/PointColor ARE real properties
+            # there, so a hex string used to reach a bare setattr and die with
+            # FreeCAD's opaque type error. ShapeColor is not in PropertiesList
+            # at all (a dynamic property that writes through to the persisted
+            # ShapeAppearance), which is what the old branch below was for.
+            elif (
+                prop in ("ShapeColor", "LineColor", "PointColor")
+                and isinstance(val, (list, tuple, str))
+                and not (isinstance(val, str) and val.startswith("="))
+            ):
+                if getattr(obj, "ViewObject", None) is None:
+                    raise ValueError(
+                        f"{prop} needs a GUI: '{obj.Name}' has no ViewObject (console mode)."
+                    )
+                setattr(obj.ViewObject, prop, parse_color(val))
+
             elif prop in obj.PropertiesList:
                 # Expression binding: "=Spreadsheet.width * 2" routes to the
                 # ExpressionEngine instead of a literal assignment, which is
@@ -170,14 +254,12 @@ def set_object_property(
 
                 else:
                     setattr(obj, prop, val)
-            # ShapeColor is a property of the ViewObject
-            elif prop == "ShapeColor" and isinstance(val, (list, tuple)):
-                setattr(obj.ViewObject, prop, _to_shape_color(val))
-
+            # ViewObject block: colors go through the same parser, everything
+            # else (Transparency, DisplayMode, LineWidth, …) straight through.
             elif prop == "ViewObject" and isinstance(val, dict):
                 for k, v in val.items():
-                    if k == "ShapeColor":
-                        setattr(obj.ViewObject, k, _to_shape_color(v))
+                    if k in ("ShapeColor", "LineColor", "PointColor"):
+                        setattr(obj.ViewObject, k, parse_color(v))
                     else:
                         setattr(obj.ViewObject, k, v)
 

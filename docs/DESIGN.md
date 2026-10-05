@@ -61,6 +61,7 @@ Every tool definition is injected into the model's context when the client lists
 
 * object level: `create_object`, `edit_object`, `delete_object`, `batch`
 * part features: `boolean` (several tools at once), `fillet`, `chamfer`, `loft`, `sweep`, `mirror`, `pattern`, `move`
+* appearance: `color` (shape color, transparency, line and display settings; one object, a list, or the whole document). It builds no geometry, so it is deliberately not `edit_object` with a ViewObject dict: a dedicated op can validate the color forms, read the result back off the view provider and report every object it painted.
 * Sketcher and PartDesign: `variables`, `sketch`, `pad`, `pocket`, `revolution`, `groove`, `thickness`, `draft`, `datum_plane`, `hull`
 
 ### 4.2 Docstring budget

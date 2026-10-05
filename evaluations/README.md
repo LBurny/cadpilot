@@ -5,9 +5,11 @@ the CADPilot MCP server, following the mcp-builder Phase 4 process.
 
 ## Files
 
-- `cadpilot_eval.xml` — 10 `<qa_pair>` entries. Every question is answerable
+- `cadpilot_eval.xml` — 11 `<qa_pair>` entries. Every question is answerable
   with read-only tool calls and every answer was verified against the shipped
-  server (see the table below).
+  server (see the table below). The two COUNT answers (operation enum, help
+  topics) are pinned by `tests/test_evaluations.py`, because a count rots
+  silently the moment a tool or an operation is added.
 
 ## Running
 
@@ -52,6 +54,7 @@ scratch model, or the evaluation rots the moment the document changes.
 | 5 | `50` | `get_topology` schema default (max 200) |
 | 6 | `384` | `operation_help("screenshots")` / `DEFAULT_MAX_DIM` |
 | 7 | `screenshots/` | `operation_help("screenshots")` |
-| 8 | `22` | `cad` operation enum (`CAD_OPERATIONS`) |
-| 9 | `31` | `operation_help()` topic index (`CAD_OP_DOCS`) |
+| 8 | `23` | `cad` operation enum (`CAD_OPERATIONS`) — pinned by a test |
+| 9 | `33` | `operation_help()` topic index (`CAD_OP_DOCS`) — pinned by a test |
 | 10 | `get_view` | `operation_help("screenshots")` |
+| 11 | `50` | `operation_help("color")` (transparency is a percent, not a fraction) |

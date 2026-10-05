@@ -13,6 +13,7 @@ import Part
 
 from rpc_server import sketcher_ops, tip_policy
 from rpc_server.geometry_query import body_owner
+from rpc_server.property_mapper import format_color, parse_color
 
 # Selector resolution of the most recent face-based build; read once by
 # describe_feature() (mirrors sketcher_ops' sketch-info mechanism).
@@ -27,6 +28,7 @@ FEATURE_TYPES = (
     "mirror",
     "pattern",
     "move",
+    "color",
     "variables",
     "sketch",
     "pad",
@@ -242,7 +244,7 @@ def _require_end_of_chain(body, base, op):
 
 def _build_fillet_chamfer(doc, spec, kind):
     """Build a fillet/chamfer where it belongs: inside the Body when the base
-    lives in one, at the document root otherwise.
+    lives in one, or IS one, at the document root otherwise.
 
     A ``Part::Fillet`` is a document-root object — it is not in the Body's
     Group, it does not follow the Body's Placement, and ``Body.Tip = <it>`` is
@@ -252,17 +254,42 @@ def _build_fillet_chamfer(doc, spec, kind):
     size_key = tip_policy.dress_spec_key(kind)
     _require(spec, "base", "edges", size_key)
     base = _get_obj(doc, spec["base"], "base")
-    names = _resolve_elements(base, spec["edges"], "Edge")
-    size = float(spec[size_key])
     body = _parent_body(base)
+    target = base
+    named_body = False
+    if body is None and getattr(base, "TypeId", "") == "PartDesign::Body":
+        # Naming the BODY is how a caller naturally asks for "round the rim of
+        # this part", but a Body has no parent Body, so this used to fall
+        # through to the root-level ``Part::Fillet``: outside the Body's Group,
+        # Body.Tip still on the last feature, and the Body's displayed shape
+        # never changed while the reply said "created successfully" (live: a 2mm
+        # fillet on a bore rim left the Body at 17591.5 mm^3, the filleted
+        # 17545.9 sitting beside it as a second, invisible solid). The GUI does
+        # the PartDesign thing here: dress the Body's Tip, inside the Body.
+        body = base
+        target = getattr(base, "Tip", None)
+        named_body = True
+        if target is None:
+            raise ValueError(
+                f"Body '{base.Name}' has no Tip, so there is nothing to {kind}: it holds no "
+                "feature yet. Build the feature first (pad/pocket/…), then dress its edges."
+            )
+    names = _resolve_elements(target, spec["edges"], "Edge")
+    size = float(spec[size_key])
     label = spec.get("name") or f"{kind.capitalize()}"
     if body is not None:
-        _require_end_of_chain(body, base, kind)
+        _require_end_of_chain(body, target, kind)
         # FreeCAD 1.1's PartDesign dress-up holds ONE scalar size for all edges
         # (the per-edge tuple form is Part-level only).
         feat = body.newObject(tip_policy.dress_type(kind, True), label)
-        feat.Base = (base, names)
+        feat.Base = (target, names)
         setattr(feat, tip_policy.dress_size_property(kind), size)
+        if named_body:
+            # The caller named the BODY, so the reply must say which of its
+            # features actually got dressed: "which feature is the Tip" is the
+            # one thing a Body-named dress-up resolves for them.
+            global _LAST_FEATURE_INFO
+            _LAST_FEATURE_INFO = {"dressed": target.Name, "body": body.Name}
         return feat
     feat = doc.addObject(tip_policy.dress_type(kind, False), label)
     if hasattr(feat, "EdgeLinks"):
@@ -667,6 +694,371 @@ def _assign_placement(doc, obj, new_base, new_rot):
     return obj
 
 
+# --- appearance ----------------------------------------------------------------
+#
+# A color op writes the ViewObject's appearance properties and nothing else: it
+# adds no feature, needs no recompute and has no geometry to validate. It is a
+# feature op purely so it inherits the whole machinery a step needs — its own
+# transaction (live-verified on 1.1.4: a ViewObject write inside a transaction
+# DOES produce an undo entry, so the color is a rollback-able, replayable step),
+# the journal record, the session step and the label grammar.
+
+#: obj_properties keys the color op understands. A key outside this set is
+#: ignored by the other builders, but here "nothing recognized" would be a
+#: silent no-op, so an unrecognized-only call is refused.
+_APPEARANCE_KEYS = (
+    "color",
+    "transparency",
+    "line_color",
+    "line_width",
+    "point_size",
+    "display_mode",
+    "draw_style",
+    "visible",
+)
+
+#: obj_name values that mean "every object in the document".
+_COLOR_ALL = ("*", "all", "every")
+
+#: How many per-object entries the reply carries. A wildcard sweep on a real
+#: model paints every object, and the answer is the COUNT plus which ones were
+#: redirected or skipped: dumping one entry per object into the model's context
+#: is the same context cost the screenshot pipeline was rebuilt to avoid.
+_COLOR_REPORT_MAX = 20
+
+
+def _parse_transparency(value, key="transparency"):
+    """FreeCAD's ``Transparency`` is a PERCENTAGE 0-100 (an int)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{key} must be a number 0-100 (percent), got {value!r}.")
+    num = float(value)
+    if 0.0 < num < 1.0:
+        raise ValueError(
+            f"{key}={value!r} looks like a fraction; FreeCAD reads this as a percentage. "
+            f"Pass {round(num * 100)} to mean {round(num * 100)}%."
+        )
+    if not 0.0 <= num <= 100.0:
+        raise ValueError(f"{key} must be 0-100 (percent), got {value!r}.")
+    return round(num)
+
+
+def _parse_enum(view, prop, value, key):
+    """Validate an enumerated ViewObject property against FreeCAD's own list.
+
+    The list is read off the live view provider instead of being hardcoded: a
+    Body, a Part feature and a TechDraw view do not share one. A provider that
+    offers no list at all (an exotic custom ViewProvider) cannot be validated,
+    so the value passes through and the write itself decides.
+    """
+    choices = []
+    with contextlib.suppress(Exception):
+        choices = [str(c) for c in view.getEnumerationsOfProperty(prop) or []]
+    text = str(value).strip()
+    if not choices:
+        return text
+    for choice in choices:
+        if choice.lower() == text.lower():
+            return choice
+    raise ValueError(f"{key} must be one of {', '.join(choices)}, got {value!r}.")
+
+
+def _color_targets(doc, spec):
+    """The (object, redirect note, named-explicitly) triples a color op applies to.
+
+    ``obj_name`` names one object, or uses ``*``/``all`` for every object in
+    the document; an optional ``objects`` list names several at once. A
+    PartDesign feature is redirected to its owning Body: the feature's own
+    ViewObject is hidden, so coloring it changes nothing a user or a render ever
+    sees (the same redirect the move op needs, for the same reason — a feature
+    owns neither its display nor its frame).
+
+    The third element says whether the caller NAMED this object. A wildcard sweep
+    meets objects that cannot be painted at all (a Spreadsheet's view provider
+    has no ShapeColor, and `variables` puts one in every parametric document), and
+    failing the whole sweep over one of them would make `obj_name="*"` useless on
+    exactly the models worth coloring. An explicitly named target has no such
+    excuse: it must fail.
+    """
+    raw: list[tuple[str, bool]] = []
+    if spec.get("base"):
+        raw.append((spec["base"], True))
+    extra = spec.get("objects")
+    if isinstance(extra, str):
+        extra = [extra]
+    if isinstance(extra, (list, tuple)):
+        raw.extend((item, True) for item in extra)
+
+    names: list[tuple[str, bool]] = []
+    for item, explicit in raw:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f"color targets must be object names, got {item!r}.")
+        name = item.strip()
+        if name.lower() in _COLOR_ALL:
+            names.extend((o.Name, False) for o in doc.Objects)
+        else:
+            names.append((name, explicit))
+    if not names:
+        raise ValueError(
+            "color requires obj_name (an object name, or '*' for every object in the document)."
+        )
+
+    targets: list[tuple[object, str, bool]] = []
+    seen: set[str] = set()
+    for name, explicit in names:
+        obj = _get_obj(doc, name, "target")
+        note = ""
+        owner = body_owner(obj)
+        if owner is not None and owner is not obj:
+            note = (
+                f"'{obj.Name}' is a PartDesign feature; its own ViewObject is hidden, so the "
+                f"appearance was applied to its Body '{owner.Name}'."
+            )
+            obj = owner
+        if obj.Name in seen:
+            continue
+        seen.add(obj.Name)
+        targets.append((obj, note, explicit))
+    if not targets:
+        raise ValueError("color matched no object in the document.")
+    return targets
+
+
+#: appearance spec key -> the ViewObject property it writes. Used to REFUSE a
+#: target that cannot carry the property at all, instead of letting FreeCAD's
+#: raw AttributeError out (which names the property but not the object).
+_APPEARANCE_PROPS = {
+    "color": "ShapeColor",
+    "transparency": "Transparency",
+    "line_color": "LineColor",
+    "line_width": "LineWidth",
+    "point_size": "PointSize",
+    "display_mode": "DisplayMode",
+    "draw_style": "DrawStyle",
+    "visible": "Visibility",
+}
+
+
+def _fresh_material(src, diffuse=None, transparency=None):
+    """A NEW ``Material`` copying ``src``'s channels, optionally overridden.
+
+    A fresh object is the whole point: FreeCAD treats an identical assignment as
+    a no-op (no ``onChanged``, so no display-node rebuild), which is why a
+    same-value write does not repaint.
+    """
+    factory = getattr(FreeCAD, "Material", None)
+    mat = factory() if factory is not None else src
+    for prop in ("AmbientColor", "EmissiveColor", "SpecularColor", "Shininess"):
+        with contextlib.suppress(Exception):
+            setattr(mat, prop, getattr(src, prop))
+    with contextlib.suppress(Exception):
+        rgb = tuple(diffuse) if diffuse is not None else tuple(src.DiffuseColor)
+        mat.DiffuseColor = rgb
+    with contextlib.suppress(Exception):
+        alpha = (
+            transparency if transparency is not None else float(getattr(src, "Transparency", 0.0))
+        )
+        mat.Transparency = float(alpha)
+    return mat
+
+
+def _uniform_material(entries):
+    """``entries[0]`` when every entry carries the same visible channels, else None.
+
+    None means a genuine per-face design, which must not be flattened.
+    """
+
+    def key(mat):
+        return (
+            *(round(float(c), 4) for c in mat.DiffuseColor),
+            round(float(getattr(mat, "Transparency", 0.0)), 4),
+        )
+
+    if not entries:
+        return None
+    first = key(entries[0])
+    return entries[0] if all(key(m) == first for m in entries) else None
+
+
+def _refresh_appearance(obj) -> bool:
+    """Re-apply an object's appearance in place, forcing a display-node rebuild.
+
+    Measured on 1.1.4: the 3D view draws the PartDesign BODY's node (hiding the
+    Body hides the part; hiding the tip feature does not), and creating a new
+    PartDesign feature makes it rebuild that node with FreeCAD's DEFAULT
+    material. So the colour of a coloured Body visually VANISHES the moment a
+    feature is added, while every stored value still says the new colour — the
+    worst kind of silent state. Re-assigning the appearance with a FRESH material
+    rebuilds the node and the colour comes back (live: (185,45,45) ->
+    (110,116,120) after a fillet -> (184,45,44) after this call).
+
+    A genuine per-face material list is left alone, and its render is NOT
+    recoverable after a tip advance: four attempts all stayed default-gray
+    (re-assigning the Body's list with fresh materials, copying the list onto the
+    tip feature's ViewObject, ``obj.touch()`` + recompute, ``ViewObject.touch()``
+    + ``updateGui()``). Flattening it would destroy a design the caller never
+    asked to change, so the stored design is preserved and the view keeps
+    FreeCAD's default until the caller re-colours (the color op does flatten, on
+    purpose, because a whole-object colour is exactly what it promises).
+    """
+    view = getattr(obj, "ViewObject", None)
+    if view is None:
+        return False
+    entries = list(getattr(view, "ShapeAppearance", ()) or ())
+    src = _uniform_material(entries)
+    if src is None:
+        return False
+    try:
+        view.ShapeAppearance = (_fresh_material(src),)
+        return True
+    except Exception as exc:
+        FreeCAD.Console.PrintWarning(
+            f"CADPilot: could not refresh {obj.Name}'s appearance: {exc}\n"
+        )
+        return False
+
+
+def _apply_appearance(obj, spec) -> dict:
+    """Apply one object's appearance and read it back.
+
+    Raises on anything that would make the write a silent no-op: a view provider
+    that has no such property (a Spreadsheet, a TechDraw view — objects with no
+    3D shape carry no appearance), or one that does not keep the color it was
+    given. The caller decides what a failure means: an explicitly NAMED target
+    fails the step, a wildcard sweep records it as skipped.
+    """
+    view = getattr(obj, "ViewObject", None)
+    if view is None:
+        raise RuntimeError(
+            f"'{obj.Name}' has no ViewObject, so it cannot be colored (console mode / a "
+            "document object without a view provider)."
+        )
+    missing = [
+        f"{key} ({prop})"
+        for key, prop in _APPEARANCE_PROPS.items()
+        if key in spec and not hasattr(view, prop)
+    ]
+    if missing:
+        raise RuntimeError(
+            f"'{obj.Name}' ({type(view).__name__}) cannot take {', '.join(missing)}: it has no "
+            "3D shape to paint (a Spreadsheet or a TechDraw view carries no appearance)."
+        )
+    applied = {}
+    if "color" in spec:
+        wanted = parse_color(spec["color"])
+        view.ShapeColor = wanted  # writes through to the persisted ShapeAppearance
+        applied["color"] = format_color(wanted)
+    if "transparency" in spec:
+        applied["transparency"] = _parse_transparency(spec["transparency"])
+        view.Transparency = applied["transparency"]
+    if "line_color" in spec:
+        view.LineColor = parse_color(spec["line_color"])
+        applied["line_color"] = format_color(spec["line_color"])
+    if "line_width" in spec:
+        width = float(spec["line_width"])
+        if not width > 0:
+            raise ValueError(f"line_width must be greater than 0, got {spec['line_width']!r}.")
+        view.LineWidth = width
+        applied["line_width"] = width
+    if "point_size" in spec:
+        applied["point_size"] = int(spec["point_size"])
+        view.PointSize = applied["point_size"]
+    if "display_mode" in spec:
+        applied["display_mode"] = _parse_enum(
+            view, "DisplayMode", spec["display_mode"], "display_mode"
+        )
+        view.DisplayMode = applied["display_mode"]
+    if "draw_style" in spec:
+        applied["draw_style"] = _parse_enum(view, "DrawStyle", spec["draw_style"], "draw_style")
+        view.DrawStyle = applied["draw_style"]
+    if "visible" in spec:
+        if not isinstance(spec["visible"], bool):
+            raise ValueError(f"visible must be true or false, got {spec['visible']!r}.")
+        view.Visibility = spec["visible"]
+        applied["visible"] = spec["visible"]
+
+    if "color" in spec:
+        # Read it back off the view provider: a color that silently did not stick
+        # must not read as a successful repaint.
+        back = tuple(float(c) for c in view.ShapeColor)
+        wanted = parse_color(spec["color"])
+        if max(abs(back[i] - wanted[i]) for i in range(3)) > 0.02:
+            raise RuntimeError(
+                f"color did not persist on '{obj.Name}': asked for "
+                f"{format_color(wanted)}, the view provider reports {format_color(back)}."
+            )
+
+    entries = list(getattr(view, "ShapeAppearance", ()) or ())
+    if len(entries) > 1:
+        # A per-face material list is NOT repainted by a property write: live,
+        # two colour writes on a 3-entry object left the view drawing the FIRST
+        # one (the stored materials were green, the render stayed blue), because
+        # the node's material array is only rebuilt by an actual ShapeAppearance
+        # assignment. Collapsing to ONE uniform entry is this op's semantics
+        # anyway (a whole-object appearance), so do it and say so.
+        view.ShapeAppearance = (
+            _fresh_material(
+                entries[0],
+                diffuse=parse_color(spec["color"]) if "color" in spec else None,
+                transparency=(
+                    applied["transparency"] / 100.0 if "transparency" in applied else None
+                ),
+            ),
+        )
+        applied["normalized_appearance"] = f"{len(entries)} materials -> 1 uniform"
+    return {"object": obj.Name, **applied}
+
+
+def _build_color(doc, spec):
+    """Set appearance (color/transparency/line/display) on one or more objects.
+
+    Spec keys (obj_properties): color, transparency, line_color, line_width,
+    point_size, display_mode, draw_style, visible — see operation_help("color").
+    Colors accept 0..1 floats, 0-255 ints, "#rrggbb" or a name.
+    """
+    if not [k for k in _APPEARANCE_KEYS if k in spec]:
+        raise ValueError(
+            "color needs at least one appearance key in obj_properties: "
+            + ", ".join(_APPEARANCE_KEYS)
+            + "."
+        )
+    colored = []
+    skipped = []
+    for obj, note, explicit in _color_targets(doc, spec):
+        try:
+            entry = _apply_appearance(obj, spec)
+        except Exception as e:
+            if explicit:
+                raise
+            # A wildcard sweep meets objects that cannot be painted at all (a
+            # Spreadsheet's view provider has no ShapeColor, and `variables` puts
+            # one in every parametric document). Failing the whole sweep over one
+            # of them would make obj_name="*" useless on exactly the models worth
+            # coloring — but the caller must still be told which ones it missed.
+            skipped.append({"object": obj.Name, "reason": f"{type(e).__name__}: {e}"})
+            continue
+        if note:
+            entry["note"] = note
+        colored.append(entry)
+    if not colored:
+        raise RuntimeError(
+            "color matched no object it could paint: "
+            + "; ".join(f"{s['object']} ({s['reason']})" for s in skipped[:4])
+        )
+
+    # `global` is load-bearing: without it this assignment binds a LOCAL and
+    # describe_feature's pop finds nothing, so the reply's `colored` readback
+    # came back empty on every call (live-caught).
+    global _LAST_FEATURE_INFO
+    _LAST_FEATURE_INFO = {"color": colored, "skipped": skipped}
+    first = doc.getObject(colored[0]["object"])
+    FreeCAD.Console.PrintMessage(
+        "CADPilot: appearance applied to "
+        + ", ".join(f"{c['object']} ({c.get('color', 'unchanged')})" for c in colored[:6])
+        + "\n"
+    )
+    return first
+
+
 # --- Sketcher / PartDesign -------------------------------------------------------
 
 
@@ -778,13 +1170,32 @@ def _build_padlike(doc, spec, fc_type, default_name):
     sketch = _profile_sketch(doc, spec, fc_type)
     ptype = str(spec.get("pad_type", "length")).lower()
     if ptype not in _PAD_TYPES:
-        raise ValueError(f"pad_type must be one of {_PAD_TYPES}, got {ptype!r}")
+        raise ValueError(
+            f"pad_type must be one of {_PAD_TYPES}, got {ptype!r} — for a parametric "
+            "through cut pass through_all=true instead."
+        )
     doc.recompute()
     _require_closed_profile(sketch, fc_type)
     _ensure_material_base(doc, body, sketch, fc_type.split("::")[-1].lower())
     feat = body.newObject(fc_type, spec.get("name") or default_name)
     feat.Profile = sketch
-    _set_length(feat, fc_type.split("::")[-1].lower(), spec.get("length", 10.0))
+    if spec.get("through_all"):
+        # PartDesign's OWN parametric through-all, not a big numeric length.
+        # `through_all` used to be ignored here, so the pocket silently took
+        # `length`'s default 10 mm: the hole looked through on a plate thinner
+        # than 10 and quietly grew a floor the moment the model passed it (live:
+        # a Ø6 "through" hole in a flange was exact at 8 mm, then left a 2 mm
+        # floor at 12 mm and a 10 mm floor at 20 mm — +1696 mm³ of uncut material
+        # and 6 extra bottom faces, with the volume formula the only clue).
+        # `length` is ignored while this is set, by FreeCAD's own semantics.
+        try:
+            feat.Type = "ThroughAll"
+        except Exception as e:
+            raise ValueError(
+                f"through_all is not available on {fc_type}: {e}. Drop it and give length instead."
+            ) from None
+    else:
+        _set_length(feat, fc_type.split("::")[-1].lower(), spec.get("length", 10.0))
     feat.Reversed = bool(spec.get("reversed", False))
     feat.Midplane = bool(spec.get("midplane", False))
     return feat
@@ -1270,6 +1681,40 @@ def describe_feature(feat, spec) -> dict:
     if op == "hull":
         sh = feat.Shape
         return {"volume_mm3": round(sh.Volume, 2), "solids": len(sh.Solids)}
+    if op == "color":
+        # One entry per object actually painted, with the values READ BACK off
+        # the ViewObject: the reply is the only place a multi-object or
+        # redirected (feature -> Body) call becomes visible, and `skipped` is the
+        # only place a wildcard sweep says what it could not paint. Both lists
+        # are capped (the counts always ride along) so a whole-document sweep
+        # cannot dump hundreds of rows into the caller's context.
+        info = pop_last_feature_info() or {}
+        colored = info.get("color") or []
+        skipped = info.get("skipped") or []
+        out = {"colored_count": len(colored), "colored": colored[:_COLOR_REPORT_MAX]}
+        if len(colored) > _COLOR_REPORT_MAX:
+            out["colored_truncated"] = len(colored) - _COLOR_REPORT_MAX
+        if skipped:
+            out["skipped_count"] = len(skipped)
+            out["skipped"] = skipped[:_COLOR_REPORT_MAX]
+            names = ", ".join(s["object"] for s in skipped[:5])
+            out["warnings"] = [
+                f"color skipped {len(skipped)} object(s) it cannot paint: {names} "
+                f"— first reason: {skipped[0]['reason']}"
+            ]
+        return out
+    if op in ("fillet", "chamfer"):
+        info = pop_last_feature_info() or {}
+        if info.get("dressed"):
+            # A Body was named: name the feature that was dressed, or "which
+            # feature is the Body's Tip" stays a guess.
+            return {
+                "dressed_object": info["dressed"],
+                "note": f"the {op} was built on '{info['dressed']}', the Tip of Body "
+                f"'{info['body']}' (a PartDesign dress-up lives inside its Body and "
+                "becomes its new Tip).",
+            }
+        return {}
     warnings: list[str] = []
     resolved = pop_last_feature_info() if op in ("thickness", "draft", "datum_plane") else None
     if op in _CUT_TYPES:
@@ -1333,6 +1778,7 @@ _BUILDERS = {
     "mirror": _build_mirror,
     "pattern": _build_pattern,
     "move": _build_move,
+    "color": _build_color,
     "variables": _build_variables,
     "sketch": _build_sketch,
     "pad": _build_pad,
@@ -1436,12 +1882,21 @@ def create_feature_gui(doc, spec):
     if builder is None:
         raise ValueError(f"unknown feature type {ftype!r}; supported: {', '.join(FEATURE_TYPES)}")
     feat = builder(doc, spec)
-    # "move" directly modifies Placement — no recompute or validity check needed
-    if ftype == "move":
+    # "move" directly modifies Placement and "color" only the ViewObject —
+    # neither builds a feature, so the recompute/validity/volume checks below do
+    # not apply. They must not either: a color op has no business failing
+    # because the object it decorates is a half-built or invalid leftover.
+    if ftype in ("move", "color"):
         return feat
     doc.recompute()
     if _advance_body_tip(feat):
         doc.recompute()
+    # A tip advance rebuilds the Body's display node with FreeCAD's DEFAULT
+    # material, so a colour set earlier visually vanishes (see
+    # _refresh_appearance). Refresh BEFORE the caller reads anything back.
+    body = _parent_body(feat)
+    if body is not None and getattr(body, "Tip", None) is feat:
+        _refresh_appearance(body)
     state = [str(s) for s in getattr(feat, "State", [])]
     if "Invalid" in state:
         # FreeCAD's actual failure reason (bad support, missing subelement,

@@ -833,6 +833,11 @@ def test_feature_detail_names_the_ops_a_scalar_cannot():
     assert sj.feature_detail("hull", {"sketches": {"top": "A", "front": "B"}}) == "2 views"
     assert sj.feature_detail("loft", {"profiles": ["A"]}) == "1 profiles"
     assert sj.feature_detail("datum_plane", {"plane": "XZ"}) == "XZ"
+    # A through-all cut has no length to show, and must not degrade to a bare op
+    # name (the row would stop saying what the step does).
+    assert sj.feature_detail("pocket", {"through_all": True}) == "through"
+    assert sj.feature_detail("pocket", {"through_all": True, "length": 5}) == "through"
+    assert sj.feature_detail("pad", {"through_all": True}) == "through"
 
 
 def test_batch_label_names_the_distinct_sub_ops():

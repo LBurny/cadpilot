@@ -29,14 +29,18 @@
   </qa_pair>
   <qa_pair>
     <question>List the exact set of operations the unified cad() tool accepts (from its operation enum). How many of them are there?</question>
-    <answer>22</answer>
+    <answer>23</answer>
   </qa_pair>
   <qa_pair>
     <question>Call operation_help with no argument to get the topic index. How many help topics are listed?</question>
-    <answer>31</answer>
+    <answer>33</answer>
   </qa_pair>
   <qa_pair>
     <question>An agent needs a picture of the model but the documentation insists only one tool can capture one. Which tool is the sole screenshot entry point?</question>
     <answer>get_view</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>You ask for a part that should be half see-through. FreeCAD's Transparency is a percentage, and the color operation accepts it in the same unit. What number must you pass for 50% transparency?</question>
+    <answer>50</answer>
   </qa_pair>
 </evaluation>

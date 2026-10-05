@@ -61,6 +61,7 @@ FreeCAD 的文档树与 GUI 非线程安全：文档操作必须在主线程执�
 
 * 对象级：`create_object`、`edit_object`、`delete_object`、`batch`
 * Part 特征：`boolean`（可同时多个工具体）、`fillet`、`chamfer`、`loft`、`sweep`、`mirror`、`pattern`、`move`
+* 外观：`color`（形状颜色、透明度、边线与显示设置；单个对象、一组对象或整个文档）。它不产生几何，因此刻意不做成“带 ViewObject 字典的 `edit_object`”：独立操作才能校验颜色写法、从视图提供者回读结果，并报告实际上了色的每个对象。
 * Sketcher 与 PartDesign：`variables`、`sketch`、`pad`、`pocket`、`revolution`、`groove`、`thickness`、`draft`、`datum_plane`、`hull`
 
 ### 4.2 docstring 预算

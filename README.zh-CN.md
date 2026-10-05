@@ -147,7 +147,7 @@ RPC 服务器默认只监听 `localhost`。要从局域网内另一台机器控�
 
 ## 工具
 
-* **`cad`**：统一 CAD 变更工具：`create_object` / `edit_object` / `delete_object` / `batch`，参数化特征（`boolean` / `fillet` / `chamfer` / `loft` / `sweep` / `mirror` / `pattern` / `move`），Sketcher/PartDesign 操作（`variables` / `sketch` / `pad` / `pocket` / `revolution` / `groove` / `thickness` / `draft` / `datum_plane` / `hull`）。边/面选择器由 `get_topology` 提供；每个变更都在事务内执行、可回滚。
+* **`cad`**：统一 CAD 变更工具：`create_object` / `edit_object` / `delete_object` / `batch`，参数化特征（`boolean` / `fillet` / `chamfer` / `loft` / `sweep` / `mirror` / `pattern` / `move`）、外观（`color`：形状颜色、透明度、边线与显示设置，可指定单个对象或整个文档），Sketcher/PartDesign 操作（`variables` / `sketch` / `pad` / `pocket` / `revolution` / `groove` / `thickness` / `draft` / `datum_plane` / `hull`）。边/面选择器由 `get_topology` 提供；每个变更都在事务内执行、可回滚。
 * **`execute_code` / `execute_code_async` / `get_task_result`**：在 FreeCAD 中执行任意 Python（GUI 线程安全），或对耗时 OCCT 计算使用后台执行 + 轮询。改动文档的运行是事务化的，因此与其它步骤一样可回滚、可重放；失败的片段会被干净回滚。
 * **建模会话**：`session`（动作 `start` / `status` / `get_steps` / `rollback` / `redo` / `add_note` / `pause` / `resume` / `list` / `complete`）：步骤记录 + 基于 FreeCAD 原生事务撤销的回滚。
 * **步骤日志**：`step_control` 驱动与 Steps 面板共享的 FreeCAD 侧评审循环：`run_next` / `run_all` / `rollback_to` / `reexecute` / `accept` / `reject` / `update` / `insert` / `replay` / `snapshot`。日志存在文档上，RPC 服务器停掉时面板照常工作。

@@ -142,6 +142,59 @@ Optional in obj_properties (vectors accept [x,y,z] or {"x":..,"y":..,"z":..}):
     object's OWN origin (its Placement Base), NOT the world origin; translate
     first if you want to orbit another point
   placement — absolute Placement override (same format as obj_properties.Placement)""",
+    "color": """\
+color — set appearance: color, transparency, line, display (obj_name = the
+object, or "*" for every object in the document).
+Optional in obj_properties (at least one required):
+  color        — the shape color. Accepted forms, shared with
+                 create_object/edit_object's ShapeColor:
+                   [r,g,b] / [r,g,b,a] floats 0..1
+                   [r,g,b] ints 0-255 (any component > 1 switches to 0-255)
+                   "#rrggbb" / "#rrggbbaa"
+                   a name: black white grey/gray red orange yellow green
+                           blue steel
+  transparency — PERCENT 0-100 (FreeCAD's unit). 50 is 50%, not 0.5.
+  line_color   — edge color, same forms as color
+  line_width   — edge width in px (> 0)
+  point_size   — vertex size in px
+  display_mode — "Flat Lines" | "Shaded" | "Wireframe" | "Points"
+  draw_style   — "Solid" | "Dashed" | "Dotted" | "Dashdot"
+  visible      — false hides the object, true shows it
+  objects      — a list of extra object names to color the same way
+
+The color is written to the ViewObject and writes THROUGH to ShapeAppearance,
+FreeCAD 1.1's persisted per-shape material, so it survives save/reopen. A
+PartDesign feature is redirected to its owning Body (a feature's own
+ViewObject is hidden, so coloring it changes nothing you can see), and the
+reply's `colored` list names every object actually painted with the values
+read back off the view provider.
+
+Two FreeCAD rendering rules the reply reports instead of hiding:
+  - an object carrying a PER-FACE material list is not repainted by a property
+    write, so the op collapses it to one uniform entry (whole-object colour is
+    what this op promises) and says so in `normalized_appearance`;
+  - a PartDesign feature that advances a Body's Tip rebuilds the Body's display
+    with FreeCAD's default material, so a colour set EARLIER visually vanishes
+    until the appearance is re-applied. The engine re-applies it automatically
+    for every feature it creates, so "colour, then pad/fillet" keeps its colour.
+
+With "*" the objects that cannot be painted are SKIPPED and reported (a
+Spreadsheet's view provider has no color at all, and `variables` puts one in
+every parametric document) — see `skipped` and the warning in the summary. An
+object you NAME is never skipped: if it cannot be painted, the step fails and
+rolls back. The per-object lists are capped at 20 rows; `colored_count` and
+`skipped_count` always carry the real numbers.
+
+Example (paint one part, then the whole document):
+    {"operation": "color", "doc_name": "MyDoc", "obj_name": "Body",
+     "obj_properties": {"color": "steel", "transparency": 20}}
+    {"operation": "color", "doc_name": "MyDoc", "obj_name": "*",
+     "obj_properties": {"color": "#1a6ecc", "line_width": 1.5}}
+
+A color step is a normal undoable/rollback-able/replayable step. Note: a
+manual color change made in FreeCAD's GUI afterwards is NOT synced back into
+the step's parameters (unlike geometry), so reexecute/replay re-applies the
+recorded color.""",
     "variables": """\
 variables — create/update a Spreadsheet parameter table (idempotent).
 obj_name = spreadsheet name (default "Spreadsheet", may be omitted).
@@ -241,6 +294,9 @@ Example (parametric plate: variables -> sketch -> pad):
     "pad": """\
 pad — extrude a closed sketch profile (obj_name = profile sketch).
 Optional in obj_properties: length (default 10), reversed, midplane, body, name.
+through_all (true) asks for PartDesign's parametric through-all instead of a
+length, and `length` is then ignored (it is meant for cuts, so it rarely makes
+sense on a pad).
 Numeric params accept "=expressions". The profile must have a closed wire.
 A NEGATIVE length is legal and extrudes the other way (the result warns).
 A profile that does not touch the base still succeeds (the Body allows
@@ -249,8 +305,12 @@ Attachment fusion: on a face-attached sketch, pad FUSES into the supporting
 solid automatically — do not pad-then-boolean.""",
     "pocket": """\
 pocket — cut a closed sketch profile out of a solid (obj_name = profile sketch).
-Optional: length (default 10), reversed, midplane, body, name.
+Optional: length (default 10) OR through_all (true = PartDesign's parametric
+through-all, and `length` is then ignored), reversed, midplane, body, name.
 A NEGATIVE length is legal and cuts the other way (the result warns).
+through_all is the right choice for a hole that must stay open when the model
+gets thicker: a numeric length only goes "through" while the body is thinner
+than it, and silently leaves a floor once it is not.
 Attachment fusion: on a face-attached sketch, pocket CUTS the supporting
 solid via attachment — no boolean needed.""",
     "revolution": """\

@@ -186,6 +186,7 @@ _DERIVED_OPS = frozenset(
         "mirror",
         "pattern",
         "move",
+        "color",
         "variables",
         "sketch",
         "pad",
@@ -224,6 +225,25 @@ def _params_ci(params: Any) -> dict[str, Any]:
     return {str(k).lower(): v for k, v in params.items()}
 
 
+def _color_text(value: Any) -> str:
+    """A color parameter as it should read in a label: [0.8,.1,.1] -> "#cc1a1a".
+
+    Local to this module on purpose: the label grammar is pure and must stay
+    importable without FreeCAD, and property_mapper's parser imports it.
+    """
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (list, tuple)) and len(value) in (3, 4):
+        try:
+            channels = [float(c) for c in value]
+        except (TypeError, ValueError):
+            return str(value)
+        if max(channels[:3]) > 1.0:
+            channels = [c / 255.0 for c in channels]
+        return "#" + "".join(f"{max(0, min(255, round(c * 255))):02x}" for c in channels[:3])
+    return str(value)
+
+
 def feature_detail(operation: str, params: Any) -> str:
     """The ONE parameter that identifies a step ("6mm", "polar ×8"), else "".
 
@@ -233,6 +253,10 @@ def feature_detail(operation: str, params: Any) -> str:
     """
     p = _params_ci(params)
     op = str(operation or "")
+    if p.get("through_all") and op in ("pocket", "pad"):
+        # No length to show: this is PartDesign's through-all (parametric), and
+        # the row must say so rather than fall back to a bare op name.
+        return "through"
     scalar = _SCALAR_DETAIL.get(op)
     if scalar is not None:
         key, unit = scalar
@@ -266,6 +290,20 @@ def feature_detail(operation: str, params: Any) -> str:
     if op == "variables":
         cells = p.get("cells")
         return f"{len(cells)} cell(s)" if isinstance(cells, dict) and cells else ""
+    if op == "color":
+        bits = []
+        if p.get("color") is not None:
+            bits.append(_color_text(p["color"]))
+        if p.get("transparency") is not None:
+            bits.append(f"{_num_text(p['transparency'])}%")
+        if not bits:
+            for key in ("line_color", "display_mode", "draw_style"):
+                if p.get(key) is not None:
+                    bits.append(_color_text(p[key]) if key == "line_color" else str(p[key]))
+                    break
+        if not bits and p.get("visible") is not None:
+            bits.append("show" if p["visible"] else "hide")
+        return " ".join(bits)
     if op == "sketch":
         bits = []
         for key, word in (("geometry", "geom"), ("constraints", "con")):

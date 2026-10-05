@@ -230,6 +230,7 @@ def cad(
         "mirror",
         "pattern",
         "move",
+        "color",
         "variables",
         "sketch",
         "pad",

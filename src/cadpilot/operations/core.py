@@ -397,6 +397,7 @@ CAD_FEATURE_OPERATIONS = (
     "mirror",
     "pattern",
     "move",
+    "color",
     "variables",
     "sketch",
     "pad",
@@ -596,7 +597,18 @@ def cad_operation(
             params_summary = f"'{obj_name}'"
             default_desc = f"delete '{obj_name}'"
         elif operation in CAD_FEATURE_OPERATIONS:
-            if not obj_name and operation not in CAD_NO_BASE_OPERATIONS:
+            # Every feature op names its base, except the ones whose obj_name is
+            # the object they CREATE and `color`, whose targets may instead come
+            # from obj_properties.objects (obj_name="*" covers the whole document).
+            needs_obj_name = operation not in CAD_NO_BASE_OPERATIONS and not (
+                operation == "color" and (obj_properties or {}).get("objects")
+            )
+            if needs_obj_name and not obj_name:
+                if operation == "color":
+                    return text_response(
+                        "color requires obj_name (the object to color, or '*' for every object "
+                        "in the document) or obj_properties.objects"
+                    )
                 return text_response(f"{operation} requires obj_name (the base object)")
             params = dict(obj_properties or {})
             reserved = {"type", "base"} & set(params)
@@ -615,11 +627,29 @@ def cad_operation(
                 spec["description"] = description
             res = freecad.create_feature(doc_name, spec)
             success = bool(res.get("success"))
-            summary = (
-                f"{operation} '{res['object_name']}' created successfully"
-                if success
-                else f"Failed to create {operation}: {res.get('error')}"
-            )
+            if operation == "color":
+                # Not a feature: nothing was created, so say what was painted.
+                # A multi-object or redirected (feature -> Body) call would
+                # otherwise read as a plain single-object success. The addon
+                # caps the per-object list, so the COUNT is the honest number.
+                colored = res.get("colored") or []
+                count = int(res.get("colored_count", len(colored)) or 0)
+                if count > 1:
+                    names = ", ".join(c.get("object", "?") for c in colored[:4])
+                    where = f"{count} objects ({names}, …)"
+                else:
+                    where = f"'{res.get('object_name')}'"
+                summary = (
+                    f"Appearance applied to {where}"
+                    if success
+                    else f"Failed to set appearance: {res.get('error')}"
+                )
+            else:
+                summary = (
+                    f"{operation} '{res['object_name']}' created successfully"
+                    if success
+                    else f"Failed to create {operation}: {res.get('error')}"
+                )
             params_summary = f"on '{obj_name}' {list(params.keys())}"
             default_desc = f"{operation} on '{obj_name}'"
         elif operation == "batch":

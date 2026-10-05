@@ -191,6 +191,66 @@ def test_dressup_inside_a_body_builds_the_partdesign_feature():
     }, "PartDesign::Fillet takes a scalar Radius, not the Part-level Edges tuples"
 
 
+def test_dressup_named_on_a_body_aims_at_the_body_tip():
+    """Naming the BODY is how a caller naturally asks for "round this part's
+    rim", but a Body has no parent Body, so the Part-vs-PartDesign choice fell
+    to the ROOT branch: a Part::Fillet outside Body.Group, Body.Tip still on the
+    last feature, and the Body's displayed shape unchanged while the reply said
+    "created successfully" (live: a 2 mm fillet on a bore rim left the Body at
+    17591.5 mm^3, the filleted 17545.9 sitting beside it as a second solid).
+    A Body base must resolve to its Tip and be dressed INSIDE the body."""
+    body = _func(_FEATURE, "_build_fillet_chamfer")
+    assert "PartDesign::Body" in ast.unparse(body), "the Body-as-base case must be detected"
+    names = {n.id for n in ast.walk(body) if isinstance(n, ast.Name)}
+    assert "named_body" in names and "target" in names
+    # getattr(base, "Tip", None) — the Tip probe is a string constant
+    assert "Tip" in _strings(body), "the Body's Tip is what a dress-up can be built on"
+    # The edges must be resolved against the dress-up TARGET (the Tip), not the
+    # named base: resolving first and redirecting after would read edge names
+    # off a different shape.
+    resolve = next(
+        c
+        for c in ast.walk(body)
+        if isinstance(c, ast.Call) and getattr(c.func, "id", "") == "_resolve_elements"
+    )
+    assert getattr(resolve.args[0], "id", "") == "target"
+    # ...and the reply must say which feature was dressed.
+    assert "dressed_object" in ast.unparse(_func(_FEATURE, "describe_feature"))
+
+
+def test_tip_advance_refreshes_the_body_appearance():
+    """A new PartDesign feature rebuilds the Body's display node with FreeCAD's
+    DEFAULT material, so an earlier colour visually VANISHES while every stored
+    value still reports it — the worst kind of silent state (live, pixel-sampled:
+    a red body rendered (185,45,45), a fillet on it made the view draw
+    (110,116,120), and re-applying the appearance brought back (184,45,44)).
+    create_feature_gui must refresh when the new feature became the Body's Tip."""
+    text = ast.unparse(_func(_FEATURE, "create_feature_gui"))
+    assert "_refresh_appearance" in text, "a tip advance must re-apply the appearance"
+    assert "Tip" in text
+    helper = ast.unparse(_func(_FEATURE, "_refresh_appearance"))
+    # A FRESH Material is the point: FreeCAD treats an identical assignment as a
+    # no-op, which is exactly why a same-value write does not repaint.
+    assert "_fresh_material" in helper
+    # ...and a genuine per-face design must survive untouched.
+    assert "_uniform_material" in helper
+
+
+def test_through_all_is_freecads_parametric_through_all():
+    """`through_all` used to be IGNORED by the pad/pocket builder, which always
+    set a numeric Length (default 10). A "through" hole therefore only went
+    through while the body was thinner than 10 mm and silently grew a floor the
+    moment a dimension changed: live on a flange, exact at 8 mm, +339 mm^3 of
+    uncut material at 12 mm and +1696 mm^3 with 6 extra bottom faces at 20 mm —
+    a blind hole, with the volume formula the only clue. The builder must set
+    PartDesign's own Type, which stays through at any thickness."""
+    body = _func(_FEATURE, "_build_padlike")
+    assert "through_all" in ast.unparse(body)
+    assert "ThroughAll" in _strings(body), "must use FreeCAD's parametric through-all"
+    # The numeric-length path must become the ELSE branch, not the only branch.
+    assert "_set_length" in ast.unparse(body)
+
+
 def test_invalid_shape_error_names_the_object_and_reason():
     """Reported live: 'shape is invalid' was raised for a self-intersecting
     meridian, a broken reference and a corrupted dependency graph alike — three
