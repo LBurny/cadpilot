@@ -10,6 +10,7 @@ from typing import Any
 
 import FreeCAD
 import FreeCADGui
+import Part  # noqa: F401 - pre-imported for execute_code snippets (exec_snippet copies globals)
 from PySide import QtCore
 
 from rpc_server import dbglog, step_engine, step_journal
@@ -66,11 +67,23 @@ rpc_server_thread = None
 rpc_server_instance = None
 _stop_thread = None  # drains shutdown off the GUI thread; see stop_rpc_server
 
+# ``App`` is FreeCAD's ubiquitous alias for the FreeCAD module, and snippets
+# written against the GUI console or the docs use it constantly. Snippets get a
+# COPY of this module's globals (exec_snippet), so module-level names here are
+# pre-imported inside execute_code — FreeCAD, FreeCADGui, Part and App.
+App = FreeCAD
+
 # Background-task registry for execute_code_async / get_task_result.
 # Insertion-ordered dict doubles as the FIFO eviction order.
 _async_tasks: dict[str, dict] = {}
 _async_tasks_lock = threading.Lock()
 _ASYNC_TASKS_MAX = 50
+
+# Why the last get_active_screenshot returned None. get_view cannot say in its
+# return value (it is base64-or-None on the wire, and an old MCP server would
+# feed a dict to the base64 decoder), so the reason rides out of band through
+# get_last_screenshot_error.
+_last_screenshot_error = ""
 
 
 def _ok(res) -> bool:
@@ -104,8 +117,9 @@ def exec_snippet(code: str, out=None) -> None:
 
     Assignments must not leak into (and corrupt) the RPC server's globals, and
     a journal-replayed snippet must see exactly the names it was written
-    against — ``FreeCAD``, ``FreeCADGui``, ``Part`` and the rest live in this
-    module's globals. Shared by the ``execute_code`` RPC and by journal replay.
+    against: ``FreeCAD`` (also ``App``), ``FreeCADGui`` and ``Part`` are
+    imported at module level here, so they are pre-imported for every snippet.
+    Shared by the ``execute_code`` RPC and by journal replay.
     """
     ns = {**globals()}
     if out is None:
@@ -359,9 +373,7 @@ class FreeCADRPC:
                 ),
                 "params": {
                     "obj_name": base,
-                    "obj_properties": {
-                        k: v for k, v in spec.items() if k not in ("type", "base")
-                    },
+                    "obj_properties": {k: v for k, v in spec.items() if k not in ("type", "base")},
                 },
             },
         )
@@ -1251,9 +1263,15 @@ class FreeCADRPC:
         concurrent agent holding another tab in the foreground cannot swap
         the framed model.
 
-        Returns None if the active view does not support screenshots
-        (e.g., TechDraw or Spreadsheet workbench).
+        Returns None on ANY failure — the caller asks
+        ``get_last_screenshot_error`` for the reason, because the bare None
+        cannot distinguish "this view type cannot be captured" (TechDraw,
+        Spreadsheet) from "the window was occluded", "the PNG could not be read
+        back" or a GUI-dispatch timeout, and the old single message blamed the
+        view type for all of them.
         """
+        global _last_screenshot_error
+        _last_screenshot_error = ""
         tmp_path = _make_tmp_png()
 
         def task():
@@ -1267,29 +1285,57 @@ class FreeCADRPC:
                     active_view = gdoc.activeView() if gdoc is not None else None
                 else:
                     active_view = FreeCADGui.ActiveDocument.ActiveView
-            except Exception:
+            except Exception as e:
+                global _last_screenshot_error
+                _last_screenshot_error = f"the document's view could not be resolved ({e})"
                 return False
             if active_view is None or not hasattr(active_view, "saveImage"):
                 view_type = type(active_view).__name__ if active_view is not None else "None"
+                _last_screenshot_error = (
+                    f"the active view is '{view_type}', which has no saveImage — "
+                    "TechDraw/Spreadsheet pages and other non-3D views cannot be captured"
+                )
                 FreeCAD.Console.PrintWarning(
                     f"CADPilot: view type '{view_type}' does not support screenshots\n"
                 )
                 return False
-            return save_active_screenshot(
+            res = save_active_screenshot(
                 tmp_path, view_name, width, height, focus_object, doc_name=doc_name
             )
+            if res is not True:
+                _last_screenshot_error = f"the capture failed ({res or 'no detail'})"
+            return res
 
         try:
             res = dispatch_to_gui(task)
             if _ok(res):
-                return _read_b64(tmp_path)
-            if res is False:
-                return None
-            FreeCAD.Console.PrintWarning(f"CADPilot: screenshot failed: {res}\n")
+                b64 = _read_b64(tmp_path)
+                if b64 is None:
+                    _last_screenshot_error = (
+                        "the PNG was written but could not be read back "
+                        "(empty file or a permissions problem)"
+                    )
+                return b64
+            if not _last_screenshot_error:
+                if isinstance(res, dict) and res.get("error"):
+                    _last_screenshot_error = str(res["error"])
+                elif isinstance(res, str) and res:
+                    _last_screenshot_error = res
+            FreeCAD.Console.PrintWarning(
+                f"CADPilot: screenshot failed: {_last_screenshot_error or res}\n"
+            )
             return None
         finally:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
+
+    def get_last_screenshot_error(self) -> str:
+        """Why the last ``get_active_screenshot`` returned None ("" = none).
+
+        Best-effort same-process diagnostic: call it immediately after a None
+        to turn the generic "cannot get screenshot" into the actual cause.
+        """
+        return _last_screenshot_error
 
     # --- GUI-thread handlers --------------------------------------------------
 

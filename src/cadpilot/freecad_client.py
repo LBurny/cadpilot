@@ -360,6 +360,14 @@ class FreeCADConnection:
             logger.error(f"Error getting screenshot: {e}")
             return None
 
+    def get_last_screenshot_error(self) -> str:
+        """Why the last get_active_screenshot returned None ("" = no failure).
+
+        An old addon has no such RPC; the caller must treat a failure here as
+        "no reason available" rather than as an error.
+        """
+        return self._invoke("get_last_screenshot_error")
+
     def get_objects(self, doc_name: str) -> list[dict[str, Any]]:
         res = self._invoke("get_objects", doc_name)
         # New addon returns {"success": ..., "objects": [...]};

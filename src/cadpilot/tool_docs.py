@@ -98,14 +98,18 @@ Selectors accept "all", an index list [0,2], or a name list ["Edge1"] —
 use get_topology to find indices.
 A base inside a PartDesign Body yields a PartDesign::Fillet inside that Body
 (it follows the Body's Placement and becomes its Tip); a bare Part-level base
-yields a Part::Fillet at the document root. A base inside a Body must BE that
+yields a Part::Fillet at the document root, and that base object's Visibility
+is turned OFF (the result is the same solid with rounded edges, so showing
+both means two overlapping parts — the reply names it as hidden_base; its
+data is untouched). A base inside a Body must BE that
 Body's Tip: dressing a mid-chain feature is refused, because FreeCAD moves the
 Body's Tip onto the new dress-up and would silently drop every later feature
 (pockets, patterns).""",
     "chamfer": """\
 chamfer — parametric chamfer (obj_name = base object).
 Required in obj_properties: edges (selector), size. Optional: name.
-Same selector syntax and the same Body-Tip rule as fillet.""",
+Same selector syntax, the same Body-Tip rule and the same bare-base hiding as
+fillet.""",
     "loft": """\
 loft — parametric loft through profiles (obj_name names the NEW loft, may be omitted).
 Required in obj_properties: profiles (list of >= 2 object names).
@@ -460,7 +464,13 @@ discards whatever part of the plan has not run yet, because it was planned
 against a document state that no longer exists.
 
 Batch steps work too: {"operation": "batch", "ops": [...]} runs the ops in one
-transaction as one step.""",
+transaction as one step.
+
+An execute_code step is plannable when it carries the code it will run
+({"operation": "execute_code", "code": "import FreeCAD; …"}); a planned
+snippet without `code` is refused, because it could never run. A planned
+snippet runs through the same executor as the execute_code tool, in its own
+transaction, and can be re-run/replayed like any other step.""",
     "step_control": """\
 step_control — run, review, and edit steps in a document's journal.
 
@@ -489,9 +499,16 @@ Review loop (the point of the panel: plan, release, review, fix):
                 deliberate act of destruction
   update        edit a PLANNED/FAILED step without running it: params merge
                 top-level (obj_properties is replaced wholesale — send the
-                full dict), params.label renames the row
+                full dict), params.label renames the row. params.label alone
+                also renames a DONE step (a label is presentation, not
+                history: it is the only way to fix a wrong row without
+                re-running the step)
   reexecute     roll back to just before `index`, then run it with `params`
-                merged in; the planned tail survives (reject drops it)
+                merged in (params.label renames the step). The planned tail
+                survives (reject drops it), but the DONE steps after `index`
+                are rolled back to planned and must be released again — the
+                reply says so in `rewound` and `warning`, and a re-run needs a
+                clean base
 
 Housekeeping:
   rollback_to   put the model back at step `index` (0 = before every recorded
@@ -505,8 +522,15 @@ Housekeeping:
   insert        add steps (params.steps) after `index`; the planned tail is
                 insert/append-only — to change history, reject and re-plan
   clear_plan    drop not-yet-executed steps (never touches the model)
-  reset         forget the whole journal (pass confirm=true)
-  status        full records incl. params + meta (plan description)
+  reset         forget the whole journal (pass confirm=true). It only empties
+                the log: it never touches the document, the undo stack or any
+                object's visibility
+  status        full records incl. params + meta (plan description).
+                params.summary=true returns one compact row per step
+                (index/state/operation/label/result, no params) instead —
+                use it to see where the session stands without paying for
+                every recorded snippet; params.limit/offset page the full
+                records
 
 Every mutating action's reply carries a compact `journal` snapshot (counts,
 drift flag, per-step index/state/label/error/accepted) — one call tells you
@@ -540,6 +564,7 @@ What is worth grepping for when debugging:
   "GUI dispatch timed out"   — the GUI thread never picked the task up
   "wake/heartbeat chain"     — timeout with an idle GUI thread: the waker died
   "mouse guard:"             — a drag (or a phantom hold) deferred the queue
+  "reported after"           — a call gave up early on user back-pressure
   "aborted transaction"      — a modeling op failed and was rolled back
   "journal <op> failed"      — a steps-panel button did not take effect
 
@@ -583,7 +608,16 @@ and Linux:
 A listening port that does not answer ping is the one case that is not a
 setup problem: FreeCAD is up but its GUI thread is busy or wedged (modal
 dialog, long recompute, deadlock). The addon log stays readable exactly
-there — grep it with get_addon_log before restarting.""",
+there — grep it with get_addon_log before restarting.
+
+One "busy" case is deliberate, not a fault: while the user holds a mouse
+button in the FreeCAD window (or a popup/modal is open) the queue is held
+back, because acting on the document mid-interaction is what feels like a
+freeze. A call that lands in that window now answers within a couple of
+seconds with "could not act on the document within 2s because the user is
+holding a mouse button… release it and retry" instead of waiting out its
+whole timeout in silence. Release the button (or close the dialog) and
+issue the call again; nothing is stuck.""",
     "session": """\
 session — modeling session bound to a document (step recording + rollback).
 
@@ -639,7 +673,16 @@ says so in text.
 --only-text-feedback forbids screenshots entirely (get_view then returns a
 text notice). Captures are capped at 384px on the long edge unless
 width/height are given; TechDraw and Spreadsheet views yield no screenshot
-at all.""",
+at all.
+
+When a capture fails, get_view returns the REASON the addon recorded, not a
+guess: "the active view is 'SpreadsheetView', which has no saveImage", "the
+PNG was written but could not be read back", a GUI-dispatch timeout (see
+the mouse-guard note under operation_help("diagnose")), and so on. An
+occluded or minimized FreeCAD window, or a model that changed in the same
+breath, is the common non-view-type case: pass focus_object=<object name>.
+Framing an object skips the automatic fit and forces a repaint before
+saveImage, which is what turns a stale frame into a capture.""",
     "step_labels": """\
 step_labels: what the Steps panel's "Step" column says, and how to write it.
 
@@ -658,6 +701,14 @@ so every step carries ONE line that states its intent. Two sources fill it:
    - Same convention inside step_plan: a per-step `description`, plus the
      plan-level `description` as its title. An execute_code snippet states it
      as its leading `# comment` block.
+
+   An execute_code step IS one label everywhere, built the same way in the
+   panel, in step_control(status) and in the MCP reply: the snippet's leading
+   `# comment` first line, then what the code did —
+     "# 琴身轮廓\nimport FreeCAD…"  ->  "琴身轮廓 · read-only"
+   (an older journal, or a snippet with no comment, shows the effect alone as
+   "execute_code: read-only"). Editing the comment in the panel's detail pane
+   and pressing Re-run updates the row.
 
 2. The derived label, when no description was written. Every op then reads as
      <verb> '<target>' <detail>

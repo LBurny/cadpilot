@@ -327,7 +327,7 @@ def feature_detail(operation: str, params: Any) -> str:
 
 
 def batch_label(ops: Any) -> str:
-    """"batch ×5: pad, pocket, fillet" — what a batch row should say.
+    """ "batch ×5: pad, pocket, fillet" — what a batch row should say.
 
     "batch (5 ops)" described the container, not the step; the distinct
     sub-op verbs make the row scannable without opening it.
@@ -432,6 +432,10 @@ def describe_step(step: dict[str, Any]) -> str:
     step after it ran read identically instead of drifting apart.
     """
     op = str(step.get("operation") or step.get("action") or "")
+    if op == "execute_code":
+        # A planned snippet has no effect yet, so its row is its own leading
+        # comment; without one there is nothing honest to show.
+        return snippet_description(str(step.get("code") or "")) or "execute_code"
     if op not in _DERIVED_OPS:
         # Ops outside the grammar (align_shapes, assemble, …) keep the plain
         # "<op> '<target>'" form rather than losing their target entirely.
@@ -604,6 +608,24 @@ def snippet_description(code: str) -> str:
     return "\n".join(lines).strip()
 
 
+def execute_code_label(code: str, changed: bool, before: list[str], after: list[str]) -> str:
+    """The row label recorded for an execute_code step.
+
+    One label, wherever it is read: the snippet's LEADING comment block says
+    what the code IS (the documented convention), the effect says what it DID.
+    The label used to be the effect alone, so the panel showed the description
+    (composed in row_text) while step_control(status) and the MCP journal
+    snapshot showed "execute_code: read-only" for the same step — two names for
+    one row. Legacy labels of that old form are still rendered correctly by
+    row_text, so reading a journal written by an older addon stays lossless.
+    """
+    effect = effect_label(changed, before, after)
+    desc = snippet_description(code)
+    if desc:
+        return f"{desc.splitlines()[0]} · {effect}"
+    return f"execute_code: {effect}"
+
+
 # A recorded snippet captures the document NAME it ran against
 # ("App.getDocument('MideaDeskFan')"). Save the file under a new name and
 # reopening hands FreeCAD a document named after the FILE — every reference
@@ -644,14 +666,18 @@ def row_text(rec: StepRecord) -> str:
     """The panel tree row for one step.
 
     An execute_code row leads with its description (what the snippet IS) and
-    keeps the effect (what it DID) behind it. The description is read off the
-    CURRENT params, so editing the snippet's leading comment updates the row on
-    the next refresh. Pure so the display rule is unit-testable without Qt.
+    keeps the effect (what it DID) behind it. A record written by this addon
+    already carries that composed label; a legacy record carries only the
+    effect, so the description is composed here. The description is read off
+    the CURRENT params, so editing the snippet's leading comment updates the row
+    on the next refresh. Pure so the display rule is unit-testable without Qt.
     """
     label = rec.label
     desc = step_description(rec)
     if rec.operation == "execute_code" and desc:
-        label = f"{desc.splitlines()[0]} · {rec.label.removeprefix('execute_code: ')}"
+        first = desc.splitlines()[0]
+        if not label.startswith(first):
+            label = f"{first} · {label.removeprefix('execute_code: ')}"
     if rec.error:
         label += f"  — {rec.error}"
     return label
@@ -667,8 +693,16 @@ def tooltip_text(rec: StepRecord) -> str:
     """
     if rec.operation == "execute_code":
         desc = step_description(rec)
-        if desc and desc != rec.label:
-            return f"{desc}\n{rec.label.removeprefix('execute_code: ')}"
+        if desc:
+            first = desc.splitlines()[0]
+            # The label is "description · effect" (this addon) or "execute_code:
+            # effect" (legacy); either way the effect is what follows the
+            # description, so the tooltip can show the full comment block.
+            if rec.label.startswith(first):
+                effect = rec.label[len(first) :].lstrip(" ·")
+            else:
+                effect = rec.label.removeprefix("execute_code: ")
+            return f"{desc}\n{effect}" if effect else desc
         return rec.label
     derived = derived_label(rec)
     if derived and derived != rec.label:
@@ -684,13 +718,19 @@ def build_record(
     label: str = "",
 ) -> StepRecord:
     op = str(step.get("operation", ""))
+    # A planned execute_code step is executable when it CARRIES its snippet:
+    # _execute_one re-runs recorded code through the same executor the RPC
+    # handler uses, so the op name simply was not in EXECUTABLE_OPS — a plan
+    # holding a snippet used to be accepted and then silently skipped at run
+    # time ("skipped: not re-executable").
+    executable = op in executable_ops or (op == "execute_code" and bool(step.get("code")))
     return StepRecord(
         index=index,
         state=state,
         operation=op,
         label=label or describe_step(step),
         params=params_for(step),
-        executable=op in executable_ops,
+        executable=executable,
         timestamp=stamp(),
     )
 
@@ -823,6 +863,23 @@ def update_planned(
         rec.params = {**(rec.params or {}), **params}
     if label:
         rec.label = label
+    return rec
+
+
+def set_label(records: list[StepRecord], index: int, label: str) -> StepRecord | None:
+    """Rename any recorded step (planned, failed or DONE).
+
+    ``update`` edits planned/failed params, and a done step's params must not
+    be edited out of the review loop (its transaction is history) — but its
+    LABEL is presentation, and "the row says something wrong" is a reason to
+    fix the row, not to re-run the step. None = unknown step or empty label.
+    """
+    if not label:
+        return None
+    rec = next((r for r in records if r.index == index), None)
+    if rec is None:
+        return None
+    rec.label = label
     return rec
 
 

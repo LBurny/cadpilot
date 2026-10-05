@@ -841,7 +841,7 @@ def test_feature_detail_names_the_ops_a_scalar_cannot():
 
 
 def test_batch_label_names_the_distinct_sub_ops():
-    """"batch (5 ops)" described the container, not the step."""
+    """ "batch (5 ops)" described the container, not the step."""
     ops = [{"action": "pad"}, {"action": "pocket"}, {"operation": "pad"}]
     assert sj.batch_label(ops) == "batch ×3: pad, pocket"
     assert sj.batch_label([]) == "batch ×0"
@@ -854,9 +854,10 @@ def test_describe_step_matches_the_committed_label():
     assert sj.describe_step({"operation": "batch", "ops": [{"action": "fillet"}]}) == (
         "batch ×1: fillet"
     )
-    assert sj.describe_step(
-        {"operation": "create_object", "obj_name": "Box", "obj_type": "Part::Box"}
-    ) == "create 'Box' (Part::Box)"
+    assert (
+        sj.describe_step({"operation": "create_object", "obj_name": "Box", "obj_type": "Part::Box"})
+        == "create 'Box' (Part::Box)"
+    )
     # Ops outside the grammar keep their target rather than losing it.
     assert sj.describe_step({"operation": "align_shapes", "obj_name": "A"}) == "align_shapes 'A'"
 
@@ -962,9 +963,78 @@ def test_from_json_leaves_a_label_it_cannot_improve():
     journal = json.dumps(
         {
             "records": [
-                {"index": 1, "state": sj.STATE_DONE, "operation": "boolean",
-                 "label": "boolean 'Body'"},
+                {
+                    "index": 1,
+                    "state": sj.STATE_DONE,
+                    "operation": "boolean",
+                    "label": "boolean 'Body'",
+                },
             ]
         }
     )
     assert sj.from_json(journal)[0].label == "boolean 'Body'"
+
+
+# --- one label for an execute_code step, and plannable snippets --------------
+
+
+def test_execute_code_label_uses_the_description_then_the_effect():
+    """The stored label and the panel row used to disagree for the same step:
+    the panel composed "<comment> · <effect>" while step_control(status) and the
+    MCP reply showed "execute_code: <effect>". One label now, everywhere."""
+    code = "# 琴身轮廓\nimport FreeCAD\n"
+    assert sj.execute_code_label(code, False, ["A"], ["A"]) == "琴身轮廓 · read-only"
+    assert sj.execute_code_label(code, True, ["A"], ["A", "B"]) == "琴身轮廓 · +1 object(s): B"
+    # No leading comment: the effect alone, in the legacy shape.
+    assert sj.execute_code_label("import FreeCAD\n", True, ["A"], ["A", "B"]) == (
+        "execute_code: +1 object(s): B"
+    )
+
+
+def test_row_text_does_not_double_the_description_on_a_composed_label():
+    """A record written by this addon already carries the composed label; the
+    row must show it once (a legacy record still gets the description added)."""
+    rec = sj.StepRecord(
+        index=3,
+        operation="execute_code",
+        label="步骤1: 琴身轮廓 + f孔 · +1 object(s): Body",
+        params={"code": "# 步骤1: 琴身轮廓 + f孔\n# 样条曲线\nimport FreeCAD\n"},
+    )
+    assert sj.row_text(rec) == "步骤1: 琴身轮廓 + f孔 · +1 object(s): Body"
+    assert sj.tooltip_text(rec) == ("步骤1: 琴身轮廓 + f孔\n样条曲线\n+1 object(s): Body")
+
+
+def test_a_planned_snippet_is_executable_when_it_carries_its_code():
+    """A planned execute_code step used to be accepted and then silently skipped
+    at run time ("skipped: not re-executable"), because the op name is not in
+    EXECUTABLE_OPS — although _execute_one does re-run recorded code. It is
+    executable when the step carries what it will run, and the refusal for a
+    bare one happens at plan time (see the addon guard)."""
+    with_code = sj.build_record(
+        {"operation": "execute_code", "code": "# 步骤\nimport FreeCAD\n"},
+        1,
+        sj.STATE_PLANNED,
+        OPS,
+    )
+    assert with_code.executable
+    bare = sj.build_record({"operation": "execute_code"}, 2, sj.STATE_PLANNED, OPS)
+    assert not bare.executable
+
+
+def test_describe_step_names_a_planned_snippet_by_its_comment():
+    assert sj.describe_step({"operation": "execute_code", "code": "# 加厚外壳\nx = 1\n"}) == (
+        "加厚外壳"
+    )
+    # No comment: nothing honest to show, so the op name is the row.
+    assert sj.describe_step({"operation": "execute_code", "code": "x = 1\n"}) == "execute_code"
+
+
+def test_set_label_renames_any_step_including_a_done_one():
+    """`update` edits planned/failed params; a wrong ROW on a done step is
+    presentation, not history, so renaming it must not require a re-run."""
+    done = sj.StepRecord(index=1, state=sj.STATE_DONE, operation="pad", label="pad 'Pad'")
+    assert sj.set_label([done], 1, "flange plate") is done
+    assert done.label == "flange plate"
+    assert sj.set_label([done], 1, "") is None
+    assert sj.set_label([done], 9, "nope") is None
+    assert done.label == "flange plate"

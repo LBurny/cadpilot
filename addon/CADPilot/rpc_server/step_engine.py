@@ -416,10 +416,10 @@ def append_execute_code(
                 index=len(records) + 1,
                 state=sj.STATE_DONE,
                 operation="execute_code",
-                # A step row should say what the snippet DID — its first line is
-                # usually `import FreeCAD` boilerplate. The full code lives in
-                # params and is shown in the panel's detail pane.
-                label=f"execute_code: {sj.effect_label(changed, list(objects_before or []), after)}",
+                # One label, wherever it is read (panel row, status, the reply's
+                # journal snapshot): the snippet's leading comment when it wrote
+                # one, then what it DID. See sj.execute_code_label.
+                label=sj.execute_code_label(code, changed, list(objects_before or []), after),
                 # The code is ALWAYS kept, read-only or not: the panel shows it
                 # as the step's detail, and without it a row is an opaque "{}".
                 params={"code": code},
@@ -775,9 +775,26 @@ def _apply_op(doc, spec: dict[str, Any]) -> dict[str, Any]:
     records = read_journal(doc)
 
     if operation == "status":
-        return _status(doc, records)
+        return _status(doc, records, spec)
     if operation == "set_plan":
-        added = sj.set_plan(records, list(spec.get("steps") or []), EXECUTABLE_OPS)
+        steps = list(spec.get("steps") or [])
+        # A planned snippet MUST carry its code: op name alone would be accepted
+        # and then skipped at run time, so the refusal has to happen here.
+        bare = [
+            i
+            for i, s in enumerate(steps, 1)
+            if sj.sub_operation(s) == "execute_code" and not s.get("code")
+        ]
+        if bare:
+            return {
+                "success": False,
+                "error": (
+                    f"plan step(s) {bare} are execute_code without a 'code' key: a planned "
+                    "snippet needs the code it will run, e.g. {'operation': 'execute_code', "
+                    "'code': 'import FreeCAD; ...'}"
+                ),
+            }
+        added = sj.set_plan(records, steps, EXECUTABLE_OPS)
         meta = read_meta(doc)
         if spec.get("description"):
             meta["description"] = str(spec["description"])
@@ -829,13 +846,22 @@ def _apply_op(doc, spec: dict[str, Any]) -> dict[str, Any]:
         params = dict(spec.get("params") or {})
         label = str(params.pop("label", "") or "")
         rec = sj.update_planned(records, int(spec.get("index") or 0), params, label)
+        if rec is None and label and not params:
+            # A label is presentation, not history: renaming a DONE step is a
+            # legitimate fix of a wrong row, and it cannot invalidate the step's
+            # transaction. params changes still require planned/failed (they
+            # only take effect on a re-run).
+            rec = sj.set_label(records, int(spec.get("index") or 0), label)
         if rec is None:
             return {
                 "success": False,
-                "error": f"step {spec.get('index')} is not planned/failed — done steps take reexecute",
+                "error": (
+                    f"step {spec.get('index')} is not planned/failed — done steps take "
+                    "reexecute for params (update accepts params.label alone to rename one)"
+                ),
             }
         write_journal(doc, records)
-        return {"success": True, "index": rec.index}
+        return {"success": True, "index": rec.index, "label": rec.label}
     if operation == "insert":
         steps = list(spec.get("steps") or (spec.get("params") or {}).get("steps") or [])
         if not steps:
@@ -885,7 +911,9 @@ def _apply_op(doc, spec: dict[str, Any]) -> dict[str, Any]:
     return {"success": False, "error": f"unknown journal operation '{operation}'"}
 
 
-def _status(doc, records: list[sj.StepRecord]) -> dict[str, Any]:
+def _status(
+    doc, records: list[sj.StepRecord], spec: dict[str, Any] | None = None
+) -> dict[str, Any]:
     names = _undo_names(doc)
     # Anchor on the last ATOMIC step: a trailing non-atomic execute_code record
     # carries no transaction, so using the last completed record outright would
@@ -895,7 +923,7 @@ def _status(doc, records: list[sj.StepRecord]) -> dict[str, Any]:
     # If it is not, work was undone (or redone past) behind the journal's back
     # — Ctrl+Z in the GUI — and counts derived from the log are suspect.
     drift = bool(last and last.transaction not in names)
-    return {
+    out: dict[str, Any] = {
         "success": True,
         "document": doc.Name,
         "count": len(records),
@@ -903,8 +931,38 @@ def _status(doc, records: list[sj.StepRecord]) -> dict[str, Any]:
         "planned": sj.pending_count(records),
         "drift": drift,
         "meta": read_meta(doc),
-        "records": [r.to_dict() for r in records],
     }
+    # Read-only options, so the tool signature (and its docstring budget) stays
+    # as it is. A long session's full records — every inspection step carries
+    # its whole snippet in params — ran to tens of KB, which the caller pays for
+    # as context just to learn "which step is next".
+    p = dict((spec or {}).get("params") or {})
+    if p.get("summary"):
+        out["summary"] = True
+        out["steps"] = [
+            {
+                "index": r.index,
+                "state": r.state,
+                "operation": r.operation,
+                "label": sj.row_text(r),
+                "accepted": r.accepted,
+                "executable": r.executable,
+                "result": r.result,
+            }
+            for r in records
+        ]
+        return out
+    offset = max(0, int(p.get("offset") or 0))
+    limit = int(p.get("limit") or 0)
+    page = (
+        records[offset : offset + limit] if limit > 0 else (records[offset:] if offset else records)
+    )
+    if limit > 0:
+        out["offset"] = offset
+        out["limit"] = limit
+        out["has_more"] = offset + len(page) < len(records)
+    out["records"] = [r.to_dict() for r in page]
+    return out
 
 
 def _run_steps(doc, records, limit: int | None, upto: int | None) -> dict[str, Any]:
@@ -929,7 +987,11 @@ def _run_steps(doc, records, limit: int | None, upto: int | None) -> dict[str, A
             # its effects, if any) and continue past it.
             rec.state = sj.STATE_DONE
             rec.error = ""
-            rec.result = "skipped: not re-executable"
+            rec.result = (
+                "skipped: no recorded code"
+                if rec.operation == "execute_code"
+                else "skipped: not re-executable"
+            )
             skipped.append({"index": rec.index, "operation": rec.operation})
             logger.info("step %d (%s): skipped, not re-executable", rec.index, rec.operation)
             continue
@@ -1289,6 +1351,10 @@ def _reject(doc, records, index: int, force: bool, reason: str) -> dict[str, Any
 def _reexecute(
     doc, records, index: int, params: dict[str, Any], force: bool = False
 ) -> dict[str, Any]:
+    params = dict(params or {})
+    # A label is presentation, so it is applied to the record and never merged
+    # into the op's params (where a stray "label" key would do nothing).
+    label = str(params.pop("label", "") or "")
     rec = next((r for r in records if r.index == index), None)
     if rec is None:
         return {"success": False, "error": f"no step {index}"}
@@ -1350,9 +1416,25 @@ def _reexecute(
         sj.rewind(records, extra)
     rec.state = sj.STATE_PLANNED
     rec.params = {**(rec.params or {}), **(params or {})}
+    if label:
+        rec.label = label
     write_journal(doc, records)
     res = run_record(doc, records, rec)
-    return {**res, "index": index, "count": len(records), "done": sj.done_count(records)}
+    out = {**res, "index": index, "count": len(records), "done": sj.done_count(records)}
+    if extra > 0:
+        # A re-run happens on a clean base, so the steps after it are undone and
+        # returned to `planned`. That is by design, but it used to happen
+        # silently: the reply carried a done-count and nothing else, so a caller
+        # watched its later model disappear (live: "the model was down to the
+        # first step").
+        out["rewound"] = extra
+        note = (
+            f"re-running step {index} rolled the {extra} step(s) after it back to "
+            "planned: their work is undone and they must be released again "
+            "(step_control run_all or run_to)."
+        )
+        out["warning"] = f"{out['warning']} {note}".strip() if out.get("warning") else note
+    return out
 
 
 # --- manual-edit sync ----------------------------------------------------------

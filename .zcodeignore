@@ -9,6 +9,12 @@ build/
 
 # FreeCAD addon runtime diagnostics
 addon/CADPilot/initgui_debug.log
+*.log
+
+# Tool caches / crash dumps
+.pytest_cache/
+.ruff_cache/
+*.stackdump
 
 # FreeCAD working files (demos / backups)
 *.FCStd
@@ -33,8 +39,11 @@ Thumbs.db
 # Local secrets
 .env
 
-# Allow the demo model in examples/
-!examples/ModernBicycle.FCStd
+# Allow the demo models in examples/
+!examples/Backpack.FCStd
+!examples/DeskFan.FCStd
+!examples/Leaf.FCStd
+!examples/Violin.FCStd
 
 # Local blog drafts (not for publication)
 docs/blog*.md

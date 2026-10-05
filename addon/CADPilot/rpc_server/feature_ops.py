@@ -300,6 +300,18 @@ def _build_fillet_chamfer(doc, spec, kind):
     else:
         feat.Base = (base, names)
         setattr(feat, tip_policy.dress_size_property(kind), size)
+    # The base is redundant once its own rim is dressed (same solid, sharper
+    # edges) and FreeCAD draws BOTH, so the caller was left with two
+    # overlapping solids and no hint which one to keep (live: a fillet on a
+    # bare Part::Box left both visible). The color is inherited first, so
+    # hiding the base cannot expose a default-gray feature where a colored
+    # part was. The base's data is untouched — only its display.
+    _inherit_appearance(feat, base)
+    view = getattr(base, "ViewObject", None)
+    if view is not None:
+        with contextlib.suppress(Exception):
+            view.Visibility = False
+        _LAST_FEATURE_INFO = {"hidden_base": base.Name}
     return feat
 
 
@@ -1713,6 +1725,14 @@ def describe_feature(feat, spec) -> dict:
                 "note": f"the {op} was built on '{info['dressed']}', the Tip of Body "
                 f"'{info['body']}' (a PartDesign dress-up lives inside its Body and "
                 "becomes its new Tip).",
+            }
+        if info.get("hidden_base"):
+            return {
+                "hidden_base": info["hidden_base"],
+                "note": f"the {op} replaced '{info['hidden_base']}' in the display: the "
+                "base object is the same solid with sharper edges, so its Visibility was "
+                "turned off to avoid two overlapping solids. Its data is untouched; set "
+                "Visibility back on if you need to see it.",
             }
         return {}
     warnings: list[str] = []

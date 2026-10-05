@@ -308,12 +308,12 @@ def execute_code(
     code: str,
     doc_name: str | None = None,
 ) -> list[TextContent]:
-    """Run Python in FreeCAD's GUI thread (FreeCAD, FreeCADGui, Part pre-imported); print() output is returned.
+    """Run Python in FreeCAD's GUI thread (FreeCAD/App, FreeCADGui, Part pre-imported); print() output is returned.
 
     The run is transactional: a mutating snippet commits as one undoable step, a read-only run is not recorded.
 
     Args:
-        code: Code to run; start with a # comment naming the step, which becomes the Steps panel row label.
+        code: Code to run; start with a # comment naming the step, which becomes the step's row label and description.
         doc_name: Bind the transaction, step journal and App.ActiveDocument to this document; defaults to the session's document, else the process's home document.
     """
     return execute_code_operation(

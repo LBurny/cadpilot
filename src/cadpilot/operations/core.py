@@ -323,8 +323,25 @@ def get_view_operation(
         )
         if screenshot is not None:
             return [screenshot_content(screenshot)]
+        reason = ""
+        try:
+            reason = str(freecad.get_last_screenshot_error() or "")
+        except Exception:
+            # Old addon without the diagnostic RPC (or a dead connection): fall
+            # back to the generic explanation instead of turning a failed
+            # capture into a confusing secondary error.
+            reason = ""
+        if reason:
+            return text_response(
+                f"Cannot capture the current view: {reason}. "
+                "If the FreeCAD window is occluded or minimized, or the model just "
+                "changed, retry with focus_object=<object name>: framing the object "
+                "skips the automatic fit and forces a repaint."
+            )
         return text_response(
-            "Cannot get screenshot in the current view type (such as TechDraw or Spreadsheet)"
+            "Cannot capture the current view (the view type may not support screenshots, "
+            "or the capture failed). Retry with focus_object=<object name>, which forces "
+            "a repaint first."
         )
     except Exception as e:
         logger.error(f"Failed to get view: {e!s}")

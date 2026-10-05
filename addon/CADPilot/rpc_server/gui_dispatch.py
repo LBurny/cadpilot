@@ -95,6 +95,15 @@ _defer_reason: "str | None" = None
 _defer_since: float = 0.0
 _defer_warned = False
 
+# How long a dispatch waits before it reports user-interaction back-pressure
+# instead of waiting out its whole timeout. The guard will not drain the queue
+# while the interaction lasts, so a 60s wait only turns an already-known outcome
+# into a late one: the caller sat in silence for a minute to be told "release
+# the mouse button". Long enough that an ordinary click (a few hundred ms)
+# still completes normally.
+_USER_HOLD_GRACE = 2.0
+_MISSING = object()
+
 
 def _note_defer(reason: str) -> None:
     """Record a deferral, warning once when it outlasts _DEFER_WARN_SECONDS.
@@ -411,8 +420,25 @@ def dispatch_to_gui(task: Callable[[], Any], timeout: float = 60) -> Any:
     if _waker is not None:
         _waker.wake()  # immediate wake via Qt signal (thread-safe)
 
-    try:
-        result = response_queue.get(timeout=timeout)
+    deadline = queued_at + timeout
+    result: Any = _MISSING
+    deferred_reason: str | None = None
+    while result is _MISSING:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            result = response_queue.get(timeout=min(remaining, _USER_HOLD_GRACE))
+        except queue.Empty:
+            if _defer_reason is not None:
+                # The guards are holding the queue back on purpose and will keep
+                # doing so while the interaction lasts, so waiting out the rest
+                # of the timeout cannot succeed — report the actionable reason
+                # now. A short click still lands inside _USER_HOLD_GRACE above.
+                deferred_reason = _defer_reason
+                break
+            # Otherwise keep waiting: a busy GUI thread finishes on its own.
+    if result is not _MISSING:
         waited = (time.monotonic() - queued_at) * 1000
         if waited > 1000:
             logger.warning(
@@ -425,55 +451,72 @@ def dispatch_to_gui(task: Callable[[], Any], timeout: float = 60) -> Any:
             # every 500ms tick during a drag.
             logger.info("GUI task ran after %.1fms", waited)
         return result
-    except queue.Empty:
-        cancelled.set()  # a not-yet-started task must not run after we give up
-        # Diagnose why: if _processing is still True, the GUI thread is occupied
-        # by a long-running task that was queued before this one.
-        if _processing:
-            busy_for = time.monotonic() - _processing_since
-            hint = (
-                f" (GUI thread has been busy for {busy_for:.1f}s — "
-                "consider execute_code_async for heavy OCCT operations)"
-            )
-            logger.error("GUI dispatch timed out after %ss%s", timeout, hint)
-            return {"success": False, "error": f"GUI dispatch timed out after {timeout}s{hint}"}
-        if _defer_reason is not None:
-            # The guards are holding the queue back on purpose: the user is
-            # mid-interaction. Nothing is broken and nothing needs restarting.
-            label = _DEFER_LABELS.get(_defer_reason, _defer_reason)
-            deferred_for = time.monotonic() - _defer_since
-            logger.error(
-                "GUI dispatch timed out after %ss — %s (queue depth %d, deferred %.1fs); "
-                "back-pressure from user interaction, not a dead dispatcher",
-                timeout,
-                label,
-                _rpc_request_queue.qsize(),
-                deferred_for,
-            )
-            return {
-                "success": False,
-                "error": (
-                    f"GUI dispatch timed out after {timeout}s because {label} — CADPilot must "
-                    "not act on the document mid-interaction, so the queued work is held back. "
-                    "Nothing is stuck: close the dialog or menu (or release the mouse button) "
-                    "and retry; the queue drains by itself."
-                ),
-            }
-        # Idle GUI thread + timeout means the waker/heartbeat chain is dead,
-        # not that FreeCAD is busy — the failure mode that used to wedge the
-        # addon with nothing in any log to show for it.
+
+    # Timed out (or gave up early on user interaction): diagnose why.
+    cancelled.set()  # a not-yet-started task must not run after we give up
+    if deferred_reason is not None:
+        # The guards are holding the queue back on purpose: the user is
+        # mid-interaction. Nothing is broken and nothing needs restarting.
+        label = _DEFER_LABELS.get(deferred_reason, deferred_reason)
+        deferred_for = time.monotonic() - _defer_since
         logger.error(
-            "GUI dispatch timed out after %ss with an idle GUI thread (queue depth %d) "
-            "— the waker/heartbeat chain may be dead",
+            "GUI dispatch reported after %.1fs — %s (queue depth %d, deferred %.1fs); "
+            "back-pressure from user interaction, not a dead dispatcher",
+            _USER_HOLD_GRACE,
+            label,
+            _rpc_request_queue.qsize(),
+            deferred_for,
+        )
+        return {
+            "success": False,
+            "error": (
+                f"CADPilot could not act on the document within {_USER_HOLD_GRACE:.0f}s because "
+                f"{label}. The queued work is held back deliberately while the user interacts, "
+                "so nothing is stuck: close the dialog or menu (or release the mouse button) "
+                "and retry; the queue drains by itself."
+            ),
+        }
+    if _processing:
+        busy_for = time.monotonic() - _processing_since
+        hint = (
+            f" (GUI thread has been busy for {busy_for:.1f}s — "
+            "consider execute_code_async for heavy OCCT operations)"
+        )
+        logger.error("GUI dispatch timed out after %ss%s", timeout, hint)
+        return {"success": False, "error": f"GUI dispatch timed out after {timeout}s{hint}"}
+    if _defer_reason is not None:
+        # Defensive: the deferral started in the last moments of the wait.
+        label = _DEFER_LABELS.get(_defer_reason, _defer_reason)
+        logger.error(
+            "GUI dispatch timed out after %ss — %s (queue depth %d)",
             timeout,
+            label,
             _rpc_request_queue.qsize(),
         )
         return {
             "success": False,
             "error": (
-                f"GUI dispatch timed out after {timeout}s: nothing is holding the queue and "
-                "the GUI thread is idle, so the waker/heartbeat chain may be dead. Repair it "
-                "with execute_code_async (its worker needs no GUI dispatch); see the addon "
-                "section of AGENTS.md."
+                f"GUI dispatch timed out after {timeout}s because {label} — CADPilot must "
+                "not act on the document mid-interaction, so the queued work is held back. "
+                "Nothing is stuck: close the dialog or menu (or release the mouse button) "
+                "and retry; the queue drains by itself."
             ),
         }
+    # Idle GUI thread + timeout means the waker/heartbeat chain is dead,
+    # not that FreeCAD is busy — the failure mode that used to wedge the
+    # addon with nothing in any log to show for it.
+    logger.error(
+        "GUI dispatch timed out after %ss with an idle GUI thread (queue depth %d) "
+        "— the waker/heartbeat chain may be dead",
+        timeout,
+        _rpc_request_queue.qsize(),
+    )
+    return {
+        "success": False,
+        "error": (
+            f"GUI dispatch timed out after {timeout}s: nothing is holding the queue and "
+            "the GUI thread is idle, so the waker/heartbeat chain may be dead. Repair it "
+            "with execute_code_async (its worker needs no GUI dispatch); see the addon "
+            "section of AGENTS.md."
+        ),
+    }
