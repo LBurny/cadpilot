@@ -331,23 +331,57 @@ def get_view_operation(
         return text_response(f"Failed to get view: {e!s}")
 
 
+def _page_envelope(items: list[Any], limit: int, offset: int, *, key: str) -> dict[str, Any]:
+    """Spec-shaped page: items under *key* plus total/count/offset/has_more.
+
+    mcp-builder pagination guidance (total, count, offset, items, has_more,
+    next_offset). The item list stays under its domain key ("objects",
+    "documents", "steps") so existing consumers keep working.
+    """
+    offset = max(0, offset)
+    limit = max(1, limit)
+    page = items[offset : offset + limit]
+    consumed = offset + len(page)
+    has_more = consumed < len(items)
+    return {
+        key: page,
+        "total": len(items),
+        "count": len(page),
+        "offset": offset,
+        "has_more": has_more,
+        "next_offset": consumed if has_more else None,
+    }
+
+
 def get_objects_operation(
     freecad: FreeCADConnection,
     doc_name: str,
     obj_name: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
 ) -> ToolResponse:
     try:
         if obj_name is not None:
             return json_response(freecad.get_object(doc_name, obj_name))
-        return json_response(freecad.get_objects(doc_name))
+        objects = freecad.get_objects(doc_name)
+        objects = objects if isinstance(objects, list) else []
+        return json_response(
+            {"success": True, **_page_envelope(objects, limit, offset, key="objects")}
+        )
     except Exception as e:
         target = f"object '{obj_name}'" if obj_name is not None else "objects"
         logger.error(f"Failed to get {target}: {e!s}")
         return text_response(f"Failed to get {target}: {e!s}")
 
 
-def list_documents_operation(freecad: FreeCADConnection) -> ToolResponse:
-    return json_response({"success": True, "documents": freecad.list_documents()})
+def list_documents_operation(
+    freecad: FreeCADConnection, limit: int = 50, offset: int = 0
+) -> ToolResponse:
+    documents = freecad.list_documents()
+    documents = documents if isinstance(documents, list) else []
+    return json_response(
+        {"success": True, **_page_envelope(documents, limit, offset, key="documents")}
+    )
 
 
 # ============================================================================
@@ -755,18 +789,19 @@ def session_status_operation(freecad: FreeCADConnection) -> ToolResponse:
     )
 
 
-def session_get_steps_operation() -> ToolResponse:
+def session_get_steps_operation(limit: int = 50, offset: int = 0) -> ToolResponse:
     sess, err = _require_session()
     if err:
         return err
+    steps = [s.to_dict() for s in sess.steps]
     return json_response(
         {
             "success": True,
             "session_id": sess.session_id,
-            "steps": [s.to_dict() for s in sess.steps],
             "notes": sess.notes,
             "redo_buffer": [s.to_dict() for s in sess.redo_buffer],
-            "count": sess.step_count,
+            "step_count": sess.step_count,
+            **_page_envelope(steps, limit, offset, key="steps"),
         }
     )
 
@@ -1255,6 +1290,8 @@ def session_action_operation(
     save_path: str | None = None,
     description: str = "",
     tags: list[str] | None = None,
+    limit: int = 50,
+    offset: int = 0,
 ) -> ToolResponse:
     """Dispatch the unified ``session`` tool to the per-action operation."""
     if action == "start":
@@ -1273,7 +1310,7 @@ def session_action_operation(
     if action == "status":
         return session_status_operation(freecad)
     if action == "get_steps":
-        return session_get_steps_operation()
+        return session_get_steps_operation(limit, offset)
     if action == "rollback":
         if to_step is None:
             # No safe default here: 0 undoes ALL steps, so omitting to_step

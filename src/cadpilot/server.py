@@ -1,10 +1,13 @@
+import json
 import logging
 import os
 import threading
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
+
+from pydantic import Field
 
 try:
     # mcp 1.x
@@ -46,9 +49,11 @@ from .operations import (
     step_plan_operation,
     verify_assembly_operation,
 )
+from .pattern_store import get_pattern, list_patterns
 from .prompt_text import ASSET_CREATION_STRATEGY
 from .responses import text_response
 from .server_state import ServerState
+from .tool_docs import operation_help_text
 
 logging.basicConfig(
     level=logging.WARNING, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -77,6 +82,33 @@ logger.setLevel(_resolve_mcp_log_level(os.environ.get("CADPILOT_LOG_LEVEL")))
 addon_logger = logging.getLogger("CADPilot.addon")
 
 state = ServerState()
+
+
+# --- tool annotations (mcp-builder) -----------------------------------------
+# Every tool advertises the four MCP hints so a client can tell read-only
+# introspection from a document mutation without guessing. openWorldHint is
+# True wherever the call reaches the FreeCAD process over XML-RPC — an entity
+# outside this server; the purely local knowledge/pattern tools are closed.
+
+
+def _read_only(title: str, *, open_world: bool = True) -> dict[str, Any]:
+    return {
+        "title": title,
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": open_world,
+    }
+
+
+def _mutating(title: str, *, destructive: bool = True) -> dict[str, Any]:
+    return {
+        "title": title,
+        "readOnlyHint": False,
+        "destructiveHint": destructive,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
 
 
 @asynccontextmanager
@@ -166,10 +198,10 @@ def _maybe_start_log_forwarder() -> None:
     logger.info("Forwarding the addon log to this process's stderr every %ss", _FORWARD_INTERVAL)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_mutating("Create Document", destructive=False))
 def create_document(
     ctx: Context,
-    name: str,
+    name: Annotated[str, Field(min_length=1)],
 ) -> list[TextContent]:
     """Create a new document in FreeCAD.
 
@@ -182,7 +214,7 @@ def create_document(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=_mutating("CAD Modeling Operation"))
 def cad(
     ctx: Context,
     operation: Literal[
@@ -244,7 +276,7 @@ def cad(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=_mutating("Execute Code (Background)"))
 def execute_code_async(ctx: Context, code: str) -> list[TextContent]:
     """Execute Python code without waiting (background thread, NOT the GUI
     thread): the code must not touch FreeCADGui, view/selection, document
@@ -258,8 +290,10 @@ def execute_code_async(ctx: Context, code: str) -> list[TextContent]:
     return execute_code_async_operation(get_freecad_connection(), code)
 
 
-@mcp.tool()
-def get_task_result(ctx: Context, task_id: str) -> list[TextContent]:
+@mcp.tool(annotations=_read_only("Get Async Task Result"))
+def get_task_result(
+    ctx: Context, task_id: Annotated[str, Field(min_length=1)]
+) -> list[TextContent]:
     """Get the status and captured output of an execute_code_async task.
 
     Args:
@@ -270,7 +304,7 @@ def get_task_result(ctx: Context, task_id: str) -> list[TextContent]:
     return get_task_result_operation(get_freecad_connection(), task_id)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_mutating("Execute Code (GUI Thread)"))
 def execute_code(
     ctx: Context,
     code: str,
@@ -289,14 +323,14 @@ def execute_code(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=_read_only("Capture View Screenshot"))
 def get_view(
     ctx: Context,
     view_name: Literal[
         "Isometric", "Front", "Top", "Right", "Back", "Left", "Bottom", "Dimetric", "Trimetric"
     ],
-    width: int | None = None,
-    height: int | None = None,
+    width: Annotated[int, Field(ge=16, le=8192)] | None = None,
+    height: Annotated[int, Field(ge=16, le=8192)] | None = None,
     focus_object: str | None = None,
     doc_name: str | None = None,
 ) -> list[TextContent]:
@@ -317,29 +351,38 @@ def get_view(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=_read_only("List Objects / Get Object"))
 def get_objects(
     ctx: Context,
-    doc_name: str,
+    doc_name: Annotated[str, Field(min_length=1)],
     obj_name: str | None = None,
+    limit: Annotated[int, Field(ge=1, le=500)] = 50,
+    offset: Annotated[int, Field(ge=0)] = 0,
 ) -> list[TextContent]:
     """Get the objects in a document, or one object's properties.
 
     Args:
         obj_name: omit to list all objects; pass a name for that object's
             full properties.
+        limit/offset: page the object list (a real model has hundreds).
     """
     return get_objects_operation(
         get_freecad_connection(),
         doc_name,
         obj_name,
+        limit,
+        offset,
     )
 
 
-@mcp.tool()
-def list_documents(ctx: Context) -> list[TextContent]:
+@mcp.tool(annotations=_read_only("List Documents"))
+def list_documents(
+    ctx: Context,
+    limit: Annotated[int, Field(ge=1, le=500)] = 50,
+    offset: Annotated[int, Field(ge=0)] = 0,
+) -> list[TextContent]:
     """Get the names of open documents in FreeCAD."""
-    return list_documents_operation(get_freecad_connection())
+    return list_documents_operation(get_freecad_connection(), limit, offset)
 
 
 # ---------------------------------------------------------------------------
@@ -347,7 +390,7 @@ def list_documents(ctx: Context) -> list[TextContent]:
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@mcp.tool(annotations=_mutating("Modeling Session"))
 def session(
     ctx: Context,
     action: Literal[
@@ -366,8 +409,8 @@ def session(
     session_id: str = "",
     name: str = "",
     create_document: bool = False,
-    to_step: int | None = None,
-    n: int = 1,
+    to_step: Annotated[int, Field(ge=0)] | None = None,
+    n: Annotated[int, Field(ge=1)] = 1,
     force: bool = False,
     note: str = "",
     note_type: str = "observation",
@@ -375,6 +418,8 @@ def session(
     save_path: str | None = None,
     description: str = "",
     tags: list[str] | None = None,
+    limit: Annotated[int, Field(ge=1, le=500)] = 50,
+    offset: Annotated[int, Field(ge=0)] = 0,
 ) -> list[TextContent]:
     """Modeling session bound to a document: cad() mutations become
     transaction-backed steps you can roll back and redo.
@@ -382,7 +427,8 @@ def session(
     Actions: start (doc_name, create_document?) | status | get_steps |
     rollback (to_step, force?) | redo (n?) | add_note (note, note_type?) |
     pause | resume (session_id) | list | complete (save?, save_path?,
-    description?, tags?). Reference: operation_help("session").
+    description?, tags?). get_steps pages with limit/offset.
+    Reference: operation_help("session").
     """
     return session_action_operation(
         get_freecad_connection(),
@@ -400,10 +446,12 @@ def session(
         save_path=save_path,
         description=description,
         tags=tags,
+        limit=limit,
+        offset=offset,
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=_mutating("Plan Modeling Steps", destructive=False))
 def step_plan(
     ctx: Context,
     doc_name: str,
@@ -418,12 +466,12 @@ def step_plan(
     return step_plan_operation(get_freecad_connection(), doc_name, steps, description)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_mutating("Control Step Journal"))
 def step_control(
     ctx: Context,
     doc_name: str,
     action: str,
-    index: int = 0,
+    index: Annotated[int, Field(ge=0)] = 0,
     params: dict[str, Any] | None = None,
     force: bool = False,
     confirm: bool = False,
@@ -439,13 +487,13 @@ def step_control(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=_read_only("Read Addon Log"))
 def get_addon_log(
     ctx: Context,
     level: str = "INFO",
     grep: str = "",
-    since_seq: int = 0,
-    limit: int = 100,
+    since_seq: Annotated[int, Field(ge=0)] = 0,
+    limit: Annotated[int, Field(ge=1, le=1000)] = 100,
 ) -> list[TextContent]:
     """Read the FreeCAD addon's debug log (newest last). Use it when a call
     misbehaves or hangs: RPC timings, GUI dispatch, transactions, journal ops.
@@ -461,7 +509,7 @@ def get_addon_log(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=_read_only("Diagnose Connection"))
 def diagnose(ctx: Context, host: str | None = None) -> list[TextContent]:
     """Diagnose why CADPilot cannot reach FreeCAD — runs while FreeCAD is down
     or frozen. Probes the RPC port, the FreeCAD process, the addon install and
@@ -473,11 +521,11 @@ def diagnose(ctx: Context, host: str | None = None) -> list[TextContent]:
     return diagnose_operation(host or state.rpc_host)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_mutating("Save Pattern", destructive=False))
 def save_pattern(
     ctx: Context,
-    name: str,
-    description: str,
+    name: Annotated[str, Field(min_length=1)],
+    description: Annotated[str, Field(min_length=1)],
     code: str = "",
     tags: list[str] | None = None,
 ) -> list[TextContent]:
@@ -495,11 +543,11 @@ def save_pattern(
     return save_pattern_operation(name, description, code, tags)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_read_only("Recall Patterns", open_world=False))
 def recall_patterns(
     ctx: Context,
     query: str,
-    limit: int = 3,
+    limit: Annotated[int, Field(ge=1, le=50)] = 3,
 ) -> list[TextContent]:
     """Search the pattern memory for workflows/code similar to your task;
     use before trial-and-error when your own knowledge is insufficient.
@@ -514,7 +562,7 @@ def recall_patterns(
     return recall_patterns_operation(query, limit)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_read_only("Operation Reference Help", open_world=False))
 def operation_help(ctx: Context, operation: str | None = None) -> list[TextContent]:
     """Full parameter reference for a cad() operation or assembly_session.
     Call with an operation name (e.g. "sketch", "hull") or none for the
@@ -523,7 +571,7 @@ def operation_help(ctx: Context, operation: str | None = None) -> list[TextConte
     return operation_help_operation(operation)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_read_only("Inspect FreeCAD API"))
 def inspect_freecad(
     ctx: Context,
     doc_name: str | None = None,
@@ -540,7 +588,7 @@ def inspect_freecad(
     return inspect_freecad_operation(get_freecad_connection(), doc_name, obj_name, dotted_name)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_read_only("Measure Geometry"))
 def measure_geometry(ctx: Context, doc_name: str, obj_name: str) -> list[TextContent]:
     """Measure an object's Shape (must have one); use to verify design
     targets quantitatively after modeling steps.
@@ -552,14 +600,14 @@ def measure_geometry(ctx: Context, doc_name: str, obj_name: str) -> list[TextCon
     return measure_geometry_operation(get_freecad_connection(), doc_name, obj_name)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_read_only("Get Topology"))
 def get_topology(
     ctx: Context,
     doc_name: str,
     obj_name: str,
     element: Literal["faces", "edges", "vertices"] = "faces",
-    limit: int = 50,
-    offset: int = 0,
+    limit: Annotated[int, Field(ge=1, le=200)] = 50,
+    offset: Annotated[int, Field(ge=0)] = 0,
 ) -> list[TextContent]:
     """List an object's faces/edges/vertices for selection — faces by area,
     edges by length, vertices by distance (largest first). Use the
@@ -578,7 +626,7 @@ def get_topology(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=_read_only("Check Interference"))
 def check_interference(ctx: Context, doc_name: str, obj_a: str, obj_b: str) -> list[TextContent]:
     """Distance and intersection (common volume) between two objects; use
     to verify clearance or detect collisions.
@@ -588,13 +636,13 @@ def check_interference(ctx: Context, doc_name: str, obj_a: str, obj_b: str) -> l
     return check_interference_operation(get_freecad_connection(), doc_name, obj_a, obj_b)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_read_only("Get Positioning Info"))
 def get_positioning_info(
     ctx: Context,
     doc_name: str,
     obj_name: str,
     element: Literal["face", "edge", "vertex"],
-    element_index: int,
+    element_index: Annotated[int, Field(ge=0)],
 ) -> list[TextContent]:
     """Global-coordinate spatial info for one face/edge/vertex (center,
     normal, axis, radius, endpoints — the object's Placement already
@@ -610,16 +658,16 @@ def get_positioning_info(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=_mutating("Align Shapes"))
 def align_shapes(
     ctx: Context,
     doc_name: str,
     obj_name: str,
     element: Literal["face", "edge", "vertex"],
-    element_index: int,
+    element_index: Annotated[int, Field(ge=0)],
     target_obj: str,
     target_element: Literal["face", "edge", "vertex"],
-    target_element_index: int,
+    target_element_index: Annotated[int, Field(ge=0)],
     mode: Literal["touch", "center", "axis"] = "touch",
     offset: float = 0.0,
 ) -> list[TextContent]:
@@ -646,7 +694,7 @@ def align_shapes(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=_read_only("Get Anchors"))
 def get_anchors(ctx: Context, doc_name: str, obj_name: str) -> list[TextContent]:
     """List an object's assembly anchors in GLOBAL coordinates (read-only):
     auto-derived (bbox_center/min/max, com, axis_mid/start/end for the
@@ -661,7 +709,7 @@ def get_anchors(ctx: Context, doc_name: str, obj_name: str) -> list[TextContent]
     return get_anchors_operation(get_freecad_connection(), doc_name, obj_name)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_mutating("Set Anchors"))
 def set_anchors(
     ctx: Context,
     doc_name: str,
@@ -689,12 +737,12 @@ def set_anchors(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=_mutating("Assemble (Snap Anchors)"))
 def assemble(
     ctx: Context,
     doc_name: str,
     mates: list[dict[str, Any]],
-    tolerance: float = 0.1,
+    tolerance: Annotated[float, Field(ge=0)] = 0.1,
     stop_on_error: bool = True,
 ) -> list[TextContent]:
     """Assemble parts by snapping named anchors together (ONE transaction);
@@ -715,13 +763,13 @@ def assemble(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=_read_only("Verify Assembly"))
 def verify_assembly(
     ctx: Context,
     doc_name: str,
     checks: list[dict[str, Any]] | None = None,
-    float_threshold: float = 1.0,
-    interference_min_volume: float = 1.0,
+    float_threshold: Annotated[float, Field(ge=0)] = 1.0,
+    interference_min_volume: Annotated[float, Field(ge=0)] = 1.0,
 ) -> list[TextContent]:
     """Audit the document's spatial sanity (read-only): floating parts,
     interferences, and distances for requested anchor pairs. Hidden objects
@@ -744,7 +792,7 @@ def verify_assembly(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=_mutating("Assembly Session (Joints)"))
 def assembly_session(
     ctx: Context,
     operation: str,
@@ -756,8 +804,8 @@ def assembly_session(
     b: dict[str, Any] | None = None,
     joint_type: str = "fixed",
     trim: dict[str, Any] | None = None,
-    to_step: int | None = None,
-    gap_samples: int = 8,
+    to_step: Annotated[int, Field(ge=0)] | None = None,
+    gap_samples: Annotated[int, Field(ge=2, le=64)] = 8,
 ) -> list[TextContent]:
     """Independent assembly state machine with PERSISTENT joints (FreeCAD
     Assembly workbench) — the mate-based counterpart to one-shot `assemble`.
@@ -788,6 +836,63 @@ def assembly_session(
 @mcp.prompt()
 def asset_creation_strategy() -> str:
     return ASSET_CREATION_STRATEGY
+
+
+# --- resources (mcp-builder: expose semi-static data without a tool call) ----
+# The long operation reference is otherwise reachable only through
+# operation_help; as a resource it can be pulled in by URI, and the pattern
+# memory becomes browsable read-only. Both are cheap local reads.
+
+
+@mcp.resource(
+    "cadpilot://operations",
+    name="operation-index",
+    title="CADPilot operation reference index",
+    description="Every cad() operation and tool topic served by operation_help.",
+    mime_type="text/markdown",
+)
+def operations_index_resource() -> str:
+    return operation_help_text(None)
+
+
+@mcp.resource(
+    "cadpilot://docs/{operation}",
+    name="operation-doc",
+    title="CADPilot operation reference",
+    description="Full parameter reference for one cad() operation or tool topic.",
+    mime_type="text/markdown",
+)
+def operation_doc_resource(operation: str) -> str:
+    return operation_help_text(operation)
+
+
+@mcp.resource(
+    "cadpilot://patterns",
+    name="pattern-memory",
+    title="CADPilot pattern memory",
+    description="Stored reusable modeling patterns (id, name, description, tags).",
+    mime_type="application/json",
+)
+def patterns_resource() -> str:
+    entries = [
+        {k: p.get(k) for k in ("pattern_id", "name", "description", "tags")}
+        for p in list_patterns(limit=200)
+    ]
+    return json.dumps({"count": len(entries), "patterns": entries}, ensure_ascii=False, default=str)
+
+
+@mcp.resource(
+    "cadpilot://patterns/{pattern_id}",
+    name="pattern",
+    title="CADPilot stored pattern",
+    description="One stored pattern, including its code/steps.",
+    mime_type="application/json",
+)
+def pattern_resource(pattern_id: str) -> str:
+    entry = get_pattern(pattern_id)
+    if entry is None:
+        return json.dumps({"found": False, "pattern_id": pattern_id})
+    return json.dumps(entry, ensure_ascii=False, default=str)
 
 
 def _validate_host(value: str) -> str:

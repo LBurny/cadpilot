@@ -183,12 +183,22 @@ def test_execute_operations_reports_per_op_results(fake_freecad):
 # --- misc read operations ----------------------------------------------------
 
 
-def test_get_objects_returns_compact_json(fake_freecad):
+def test_get_objects_returns_paginated_json(fake_freecad):
     fake_freecad.objects_by_doc["Doc"] = ["Box"]
     resp = get_objects_operation(fake_freecad, "Doc")
     assert fake_freecad.called_methods() == ["get_objects"]
     data = json.loads(resp[0].text)
-    assert data[0]["Name"] == "Box"
+    assert data["objects"][0]["Name"] == "Box"
+    assert data["total"] == 1 and data["count"] == 1
+    assert data["has_more"] is False and data["next_offset"] is None
+
+
+def test_get_objects_pagination_window(fake_freecad):
+    fake_freecad.objects_by_doc["Doc"] = ["A", "B", "C", "D"]
+    data = json.loads(get_objects_operation(fake_freecad, "Doc", None, 2, 1)[0].text)
+    assert [o["Name"] for o in data["objects"]] == ["B", "C"]
+    assert data["total"] == 4 and data["offset"] == 1
+    assert data["has_more"] is True and data["next_offset"] == 3
 
 
 def test_get_objects_with_obj_name_returns_one_object(fake_freecad):

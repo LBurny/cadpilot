@@ -51,8 +51,9 @@ addon/CADPilot/             # FreeCAD workbench addon (copied to FreeCAD's Mod/ 
     dbglog.py             # Ring-buffer debug log + rotating file (readable while GUI is wedged)
     request_log.py        # Tags log records with the RPC request that caused them
 
-examples/                 # Usage examples (adk/agent.py, langchain/react.py)
+examples/                 # Showcase models (.FCStd) and their PNG renders
 tests/                    # pytest suite for the MCP server side (fake XML-RPC connection)
+evaluations/              # mcp-builder Phase 4: read-only QA pairs + run notes
 assets/                   # Demo GIFs and images for README
 ```
 
@@ -217,6 +218,7 @@ During development you can reload the addon **without restarting FreeCAD**:
 - Addon code uses `FreeCAD.Console.PrintMessage/PrintError/PrintWarning` for FreeCAD's Report View.
 - Settings persisted as JSON via `cadpilot_settings.json` (in FreeCAD's user data dir).
 - **Docstring budget (prompt economy)**: every `@mcp.tool()` docstring is injected into the AI client's context on `tools/list`. Keep docstrings to a 1-3 line summary + brief Args (drop zero-information lines like "doc_name: Document name."; inline short Returns) — long parameter/semantics references go in `src/cadpilot/tool_docs.py` (`CAD_OP_DOCS`) and are served on demand via the `operation_help` tool. `tests/test_operation_help.py::test_tool_docstring_budget` enforces a total budget (9,000 chars at the current 27 tools, +150 per added tool); it fails if docstrings creep back up.
+- **MCP surface conventions (mcp-builder)**: every `@mcp.tool()` carries `annotations` (title + `readOnlyHint`/`destructiveHint`/`idempotentHint`/`openWorldHint`) so a client can tell introspection from a mutation; the `_read_only`/`_mutating` helpers in `server.py` keep the classification in one place (`openWorldHint=True` for anything reaching FreeCAD over XML-RPC, `False` for the purely local `operation_help`/`recall_patterns`). Numeric/range params use `Annotated[..., Field(ge=…, le=…)]` so constraints land in the generated JSON Schema (validated at the tool boundary; the addon still clamps defensively). Listing tools (`get_objects`, `list_documents`, `session(get_steps)`, `get_topology`, `get_addon_log`) return a spec-shaped page — `total`, `count`, `offset`, `has_more`, `next_offset` plus the items under their domain key (`objects`/`documents`/`steps`) — built by `operations/core._page_envelope`. Resources expose the semi-static references without a tool call: `cadpilot://operations`, `cadpilot://docs/{operation}` (template), `cadpilot://patterns`, `cadpilot://patterns/{pattern_id}` (template). `tests/test_tool_surface_meta.py` pins all of it; `evaluations/` holds the Phase 4 read-only QA pairs. Deliberate deviations from the guide: failures stay inside the result (`success:false` + diagnostics) rather than protocol-level `isError`, because that guidance text is the payload an agent needs and a raised error would hide it; handlers stay sync `def` (FastMCP runs them on a thread pool), so there is no async `ctx.report_progress`; no `outputSchema`/`structuredContent`, to keep the `mcp.server.mcpserver` 2.x fallback working; the server name stays `"CADPilot"` rather than `cadpilot_mcp`, since clients namespace by server and renaming would break existing configs and docs.
 
 ## Adding a New MCP Tool
 

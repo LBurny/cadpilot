@@ -1,0 +1,42 @@
+<evaluation>
+  <qa_pair>
+    <question>A user sketches a lathe profile and asks you to revolve it into a solid, but does not name an axis. What axis does the revolution operation use by default?</question>
+    <answer>Y</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>A caller tries to revolve a flat profile about the sketch's own normal (axis="Z") and asks why it produced a zero-volume shell. Which axis value does the revolution reference say is REFUSED for exactly this reason?</question>
+    <answer>Z</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>You want to roll a modeling session back, but the tool refuses a bare rollback. Which session parameter must you pass (it keeps steps 1..N, and 0 means undo all)?</question>
+    <answer>to_step</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>A mate's residual exceeds the assembly tolerance and the snap fails. What is the DEFAULT tolerance, in millimetres, for the one-shot assemble tool?</question>
+    <answer>0.1</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>You call get_topology on a face-heavy part without passing a page size and want to know how many faces you got back per page. How many entries does get_topology return by default (and what is its maximum)? Answer with the default value.</question>
+    <answer>50</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>You take an isometric screenshot without specifying width or height. The long edge is capped at how many pixels?</question>
+    <answer>384</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Screenshots are delivered as files, not as image data in the conversation. Name the directory (relative to $CADPILOT_HOME) the PNG is written to.</question>
+    <answer>screenshots/</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>List the exact set of operations the unified cad() tool accepts (from its operation enum). How many of them are there?</question>
+    <answer>22</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Call operation_help with no argument to get the topic index. How many help topics are listed?</question>
+    <answer>31</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>An agent needs a picture of the model but the documentation insists only one tool can capture one. Which tool is the sole screenshot entry point?</question>
+    <answer>get_view</answer>
+  </qa_pair>
+</evaluation>
