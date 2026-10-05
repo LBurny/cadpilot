@@ -585,10 +585,11 @@ QLabel#PanelStatus {{ color: {c["dim"]}; padding: 5px 8px 4px 8px; }}
         last = sj.last_atomic_done(records)
         drifted = bool(last and last.transaction not in names)
         if drifted and not self._drifted:
+            # Default kind (dim), not "error": a heads-up about the undo
+            # stack, not a failed action — red is reserved for failures.
             self._log(
                 "out of sync with FreeCAD's undo stack (undone manually?) — "
                 "rollback may rebuild instead of undoing cleanly",
-                "error",
             )
         self._drifted = drifted
 
