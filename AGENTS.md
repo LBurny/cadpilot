@@ -82,64 +82,30 @@ During development you can reload the addon **without restarting FreeCAD**:
 
 1. Copy the updated addon files to the live `Mod/` directory:
    ```bash
-   cp -rf "H:/My_Software/FreeCAD-MCP/addon/CADPilot/." \
+   cp -rf "H:/My_Software/CADPilot/addon/CADPilot/." \
           "C:/Users/intel/AppData/Roaming/FreeCAD/v1-1/Mod/CADPilot/"
    ```
 
-2. In FreeCAD's Python console (or via `execute_code`) run:
+2. In FreeCAD's Python console (or via `execute_code`) run the one-call restart:
    ```python
-   import sys, importlib
-   import rpc_server.rpc_server as rs_old
+   import rpc_server.rpc_server as rs
 
-   print("stop:", rs_old.stop_rpc_server())
-
-   from PySide import QtCore  # or PySide6 / PySide2
-
-
-   def _start(rs):
-       result = rs.start_rpc_server(9875)
-       print("start:", result)
-       if "still stopping" in str(result):
-           # Previous stop is still draining; retry instead of giving up
-           # (giving up here leaves a half-restarted server: socket dead,
-           # no heartbeat, every GUI-dispatched call hangs).
-           QtCore.QTimer.singleShot(4000, lambda: _start(rs))
-
-
-   def restart():
-       for sub in [
-           "ip_filter",
-           "settings",
-           "gui_dispatch",
-           "object_factory",
-           "property_mapper",
-           "serialize",
-           "view_manager",
-           "commands",
-           "geometry_query",
-           "assembly_ops",
-           "trim_ops",
-           "joint_ops",
-           "sketcher_ops",
-           "tip_policy",
-           "feature_ops",
-           "request_log",
-           "dbglog",
-           "step_journal",
-           "step_engine",
-           "step_panel",
-       ]:
-           name = f"rpc_server.{sub}"
-           if name in sys.modules:
-               importlib.reload(sys.modules[name])
-       rs = importlib.reload(rs_old)
-       _start(rs)
-
-
-   # Deferred restart: the in-flight XML-RPC request blocks shutdown drain,
-   # so we wait 4s for server_close() to finish before re-binding the port.
-   QtCore.QTimer.singleShot(4000, restart)
+   print(rs.restart_rpc_server())
    ```
+   It stops the server, reloads every loaded `rpc_server.*` module in
+   `_RELOAD_ORDER` (dependencies before importers, main module last; a reload
+   error is reported in the result and never aborts the restart), then starts
+   the server from a deferred self-healing retry loop. The start must be
+   deferred because the in-flight XML-RPC request (this call) blocks the old
+   server's shutdown drain; attempts run 1 s apart for up to a minute, after
+   which the watchdog (`rpc_server/watchdog.py`) keeps retrying every 3 s.
+
+   The watchdog also covers accidents on its own: a start that failed at
+   boot, a `serve_forever` thread that died, a port that was briefly stolen.
+   It revives the endpoint whenever it is down but wanted. Intent is a
+   main-window property, so it survives hot reloads; a toolbar Stop records
+   "stay down", while a PROGRAMMATIC stop (this recipe, any execute_code) is
+   treated as transient and gets revived within one tick.
 
 3. Wait ~8 seconds before issuing the next MCP call so the new server is ready.
 

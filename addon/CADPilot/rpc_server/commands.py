@@ -49,7 +49,7 @@ class ToggleRPCServerCommand:
         }
 
     def Activated(self, checked=0):
-        from . import rpc_server  # late import: avoids circular at module load
+        from . import rpc_server, watchdog  # late import: avoids circular at module load
 
         if checked:
             msg = rpc_server.start_rpc_server()
@@ -60,12 +60,19 @@ class ToggleRPCServerCommand:
                 QtCore.QTimer.singleShot(0, lambda: _set_actions_checked("Toggle_RPC_Server", True))
             elif "still stopping" in msg:
                 # Start refused: the old socket hasn't drained yet. Uncheck so
-                # the UI invites a retry instead of showing a false "running".
+                # the UI invites a retry instead of showing a false "running";
+                # the watchdog completes the start once the drain is over (the
+                # attempt itself already recorded the intent).
                 QtCore.QTimer.singleShot(
                     0, lambda: _set_actions_checked("Toggle_RPC_Server", False)
                 )
             return
 
+        # A toolbar Stop is a decision that must stick: record the intent
+        # BEFORE stopping, or the watchdog would revive the endpoint within
+        # one tick. (A programmatic stop, e.g. from a hot-reload snippet, is
+        # deliberately treated as transient instead.)
+        watchdog.set_desired(False)
         msg = rpc_server.stop_rpc_server()
         FreeCAD.Console.PrintMessage(msg + "\n")
         if "was not running" in msg:
@@ -177,6 +184,11 @@ class ToggleAutoStartCommand:
             )
         else:
             FreeCAD.Console.PrintMessage("CADPilot server auto-start disabled.\n")
+            # The auto-start promise is withdrawn: also stop the watchdog from
+            # reviving a down endpoint (e.g. one that keeps failing to bind).
+            from . import watchdog
+
+            watchdog.set_desired(False)
 
     def IsActive(self):
         return True

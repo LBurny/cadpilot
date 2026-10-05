@@ -172,3 +172,61 @@ def test_remote_hosts_are_passed_through(monkeypatch):
     assert (
         FreeCADConnection(host="build-box.local", port=9999)._uri == "http://build-box.local:9999"
     )
+
+
+# --- connection-refused grace window -----------------------------------------
+
+
+class RefusingProxy:
+    """Fails the first `fail_times` calls with ConnectionRefusedError.
+
+    A refusal happens on the TCP connect, before anything is sent, so unlike
+    a reset mid-request it may be retried repeatedly within the grace window.
+    """
+
+    def __init__(self, fail_times: int):
+        self.fail_times = fail_times
+        self.attempts = 0
+
+    def create_document(self, name):
+        self.attempts += 1
+        if self.fail_times > 0:
+            self.fail_times -= 1
+            raise ConnectionRefusedError(10061, "refused")
+        return {"success": True, "document_name": name}
+
+
+def test_connection_refused_retries_within_grace(monkeypatch):
+    sleeps: list[float] = []
+    monkeypatch.setattr("cadpilot.freecad_client.time.sleep", sleeps.append)
+    proxy = RefusingProxy(fail_times=3)
+    conn, _made = _make_conn(monkeypatch, lambda n: proxy)
+    res = conn.create_document("Doc")
+    assert res == {"success": True, "document_name": "Doc"}
+    assert proxy.attempts > 1  # retried instead of failing on first refusal
+    assert sleeps  # the retries waited out the outage
+
+
+def test_connection_refused_gives_up_after_grace(monkeypatch):
+    monkeypatch.setattr("cadpilot.freecad_client.time.sleep", lambda _s: None)
+    proxy = RefusingProxy(fail_times=10**9)
+    conn, _made = _make_conn(monkeypatch, lambda n: proxy)
+    conn._connect_grace = 0.0
+    with pytest.raises(ConnectionRefusedError, match="refused connections"):
+        conn.create_document("Doc")
+
+
+def test_zero_grace_still_names_the_check_to_run(monkeypatch):
+    monkeypatch.setattr("cadpilot.freecad_client.time.sleep", lambda _s: None)
+    conn, _made = _make_conn(monkeypatch, lambda n: RefusingProxy(fail_times=1))
+    conn._connect_grace = 0.0
+    with pytest.raises(ConnectionRefusedError, match="RPC server is started"):
+        conn.create_document("Doc")
+
+
+def test_connect_grace_env_override(monkeypatch):
+    monkeypatch.setattr(FreeCADConnection, "_make_proxy", lambda self, timeout: None)
+    monkeypatch.setenv("CADPILOT_CONNECT_GRACE", "2.5")
+    assert FreeCADConnection()._connect_grace == 2.5
+    monkeypatch.setenv("CADPILOT_CONNECT_GRACE", "bogus")
+    assert FreeCADConnection()._connect_grace == 10.0  # invalid value → default

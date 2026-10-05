@@ -304,6 +304,18 @@ def _bootstrap():
         except Exception:
             dbg_err("setup_panel FAILED")
 
+    def setup_watchdog():
+        # The RPC watchdog must run no matter which workbench is active, so it
+        # lives here (InitGui is the one addon file a hot reload never
+        # touches). The timer is parented to the main window and survives
+        # module reloads; see rpc_server/watchdog.py.
+        try:
+            from rpc_server import watchdog
+
+            dbg(f"rpc {watchdog.ensure_started()}")
+        except Exception:
+            dbg_err("rpc watchdog setup FAILED")
+
     def autostart():
         try:
             from rpc_server import rpc_server
@@ -325,6 +337,7 @@ def _bootstrap():
         QtCore.QTimer.singleShot(1000, setup_toolbar)
         QtCore.QTimer.singleShot(1200, autostart)
         QtCore.QTimer.singleShot(1400, setup_panel)
+        QtCore.QTimer.singleShot(1600, setup_watchdog)
         dbg("deferred setup scheduled")
     except Exception:
         dbg_err("schedule deferred setup FAILED")

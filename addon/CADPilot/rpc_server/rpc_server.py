@@ -2,8 +2,10 @@ import base64
 import contextlib
 import io
 import os
+import sys
 import tempfile
 import threading
+import time
 import traceback
 import uuid
 from typing import Any
@@ -13,7 +15,7 @@ import FreeCADGui
 import Part  # noqa: F401 - pre-imported for execute_code snippets (exec_snippet copies globals)
 from PySide import QtCore
 
-from rpc_server import dbglog, step_engine, step_journal
+from rpc_server import dbglog, step_engine, step_journal, watchdog
 from rpc_server.assembly_ops import (
     assemble as _assemble,
 )
@@ -1372,6 +1374,11 @@ class FreeCADRPC:
 def start_rpc_server(port=9875):
     global rpc_server_thread, rpc_server_instance
 
+    # A start attempt IS the intent to have the endpoint up: record it before
+    # anything can fail, so the watchdog completes a start that this call
+    # cannot (a drain-in-progress refusal, a stolen port at boot).
+    watchdog.set_desired(True)
+
     if rpc_server_instance:
         return "RPC Server already running."
 
@@ -1454,6 +1461,137 @@ def stop_rpc_server():
     _stop_thread = threading.Thread(target=_shutdown_and_close, daemon=True)
     _stop_thread.start()
     return "RPC Server stopping…"
+
+
+# Hot-reload order: dependencies BEFORE importers. importlib.reload does not
+# rebind `from X import name` in the modules that imported X, so reloading an
+# importer before its dependency silently keeps the OLD function alive (the
+# property_mapper trap). tests/test_addon_gui_wiring.py pins every top-level
+# `from rpc_server.X import ...` against this list.
+_RELOAD_ORDER = [
+    "rpc_server.dbglog",
+    "rpc_server.ip_filter",
+    "rpc_server.settings",
+    "rpc_server.property_mapper",
+    "rpc_server.serialize",
+    "rpc_server.sketcher_ops",
+    "rpc_server.tip_policy",
+    "rpc_server.step_journal",
+    "rpc_server.geometry_query",
+    "rpc_server.gui_dispatch",
+    "rpc_server.trim_ops",
+    "rpc_server.commands",
+    "rpc_server.object_factory",
+    "rpc_server.feature_ops",
+    "rpc_server.assembly_ops",
+    "rpc_server.request_log",
+    "rpc_server.joint_ops",
+    "rpc_server.view_manager",
+    "rpc_server.step_engine",
+    "rpc_server.watchdog",
+    "rpc_server.step_panel",
+]
+_RESTART_MAX_ATTEMPTS = 60  # 1 s apart; then the watchdog takes over
+_RESTART_SUPPRESS_S = _RESTART_MAX_ATTEMPTS + 30
+
+
+def restart_rpc_server(port: int = 9875) -> dict:
+    """Hot-restart the RPC server: stop, reload the addon modules, start again.
+
+    Replaces the manual execute_code recipe. The reload happens HERE, in
+    ``_RELOAD_ORDER`` (dependencies before importers, the main module last),
+    and a reload error is reported but never aborts the restart. The start is
+    deferred to a main-window QTimer because the in-flight RPC request (this
+    call) blocks the old server's shutdown drain — the first attempt cannot
+    succeed before this function returns. Every attempt resolves
+    ``rpc_server.rpc_server`` FRESH, so it binds the reloaded code.
+
+    desired is set True up front and the watchdog is suppressed for the
+    restart window; if all attempts fail, the watchdog keeps retrying every
+    3 s. Poll ``ping`` or read ``get_addon_log`` to see the endpoint return.
+    """
+    import importlib
+
+    if time.time() < watchdog.suppress_until():
+        return {"success": False, "error": "a restart is already in progress"}
+
+    watchdog.set_desired(True)
+    watchdog.suppress(_RESTART_SUPPRESS_S)
+
+    result: dict = {
+        "success": True,
+        "stopped": stop_rpc_server(),
+        "reloaded": [],
+        "reload_errors": [],
+    }
+
+    names = [n for n in _RELOAD_ORDER if n in sys.modules]
+    names += sorted(
+        n
+        for n in sys.modules
+        if n.startswith("rpc_server.")
+        and n not in _RELOAD_ORDER
+        and n != "rpc_server.rpc_server"
+        and not n.endswith(".__init__")
+    )
+    names.append("rpc_server.rpc_server")
+    for name in names:
+        try:
+            importlib.reload(sys.modules[name])
+            result["reloaded"].append(name)
+        except Exception as e:
+            result["reload_errors"].append(f"{name}: {e}")
+            FreeCAD.Console.PrintError(f"CADPilot restart: reloading {name} failed: {e}\n")
+
+    timer_holder: dict = {}
+
+    attempts = 0
+
+    def _cancel_timer():
+        timer = timer_holder.get("timer")
+        if timer is not None:
+            timer.stop()
+            timer.deleteLater()
+            timer_holder["timer"] = None
+
+    def _try_start():
+        nonlocal attempts
+        attempts += 1
+        try:
+            fresh = importlib.import_module("rpc_server.rpc_server")
+            msg = str(fresh.start_rpc_server(port))
+        except Exception as e:
+            msg = f"start raised: {e}"
+        if "started at" in msg or "already running" in msg:
+            watchdog.suppress(0)
+            dbglog.get_logger("rpc").info(
+                "restart: RPC server is back after %d attempt(s)", attempts
+            )
+            _cancel_timer()
+            return
+        if attempts >= _RESTART_MAX_ATTEMPTS:
+            # Hand the remaining retries to the watchdog: desired is True and
+            # the suppress window is spent, so its 3 s tick keeps trying.
+            watchdog.suppress(0)
+            dbglog.get_logger("rpc").error(
+                "restart: server did not come back after %d attempts (%s); "
+                "the watchdog keeps retrying",
+                attempts,
+                msg,
+            )
+            _cancel_timer()
+
+    timer = QtCore.QTimer(FreeCADGui.getMainWindow())
+    timer.setInterval(1000)
+    timer.timeout.connect(_try_start)
+    timer_holder["timer"] = timer
+    timer.start()
+
+    result["note"] = (
+        "start is deferred (the shutdown drain waits for this call to return); "
+        f"up to {_RESTART_MAX_ATTEMPTS} attempts 1 s apart, then the watchdog takes over"
+    )
+    return result
 
 
 register_commands()

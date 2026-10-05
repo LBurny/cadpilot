@@ -1,5 +1,7 @@
 import http.client
 import logging
+import os
+import time
 import xmlrpc.client
 from typing import Any
 
@@ -10,6 +12,13 @@ logger = logging.getLogger("CADPilot")
 # socket.timeout is deliberately excluded: a timeout may mean FreeCAD is
 # still executing the request, and retrying would double-execute it.
 _RECOVERABLE_ERRORS = (ConnectionError, http.client.HTTPException)
+
+# Connection-refused means the TCP connect itself failed, so nothing was sent
+# and retrying cannot double-execute an operation. The addon's watchdog
+# revives a dead RPC server within seconds and a FreeCAD restart takes ~10 s,
+# so refusals get a bounded grace window instead of failing on first sight.
+_CONNECT_GRACE_DEFAULT = 10.0
+_CONNECT_RETRY_DELAY = 0.5
 
 _IPV4_LOOPBACK = "127.0.0.1"
 
@@ -44,9 +53,23 @@ class _TimeoutTransport(xmlrpc.client.Transport):
 
 
 class FreeCADConnection:
-    def __init__(self, host: str = "localhost", port: int = 9875, timeout: float = 150):
+    def __init__(
+        self,
+        host: str = "localhost",
+        port: int = 9875,
+        timeout: float = 150,
+        connect_grace: float | None = None,
+    ):
         self._uri = f"http://{_resolve_connect_host(host)}:{port}"
         self._timeout = timeout
+        if connect_grace is None:
+            try:
+                connect_grace = float(
+                    os.environ.get("CADPILOT_CONNECT_GRACE", _CONNECT_GRACE_DEFAULT)
+                )
+            except ValueError:
+                connect_grace = _CONNECT_GRACE_DEFAULT
+        self._connect_grace = float(connect_grace)
         self.server = self._make_proxy(timeout)
 
     def _make_proxy(self, timeout: float) -> xmlrpc.client.ServerProxy:
@@ -57,8 +80,39 @@ class FreeCADConnection:
         )
 
     def _invoke(self, method: str, *args):
-        """Call an RPC method, rebuilding the proxy and retrying once if the
-        connection died (e.g. FreeCAD or the addon was restarted)."""
+        """Call an RPC method with connection-loss recovery.
+
+        A dead connection (FreeCAD or the addon was restarted) rebuilds the
+        proxy and retries once. A connection REFUSAL additionally waits out a
+        grace window, because it happens before anything is sent and the
+        endpoint comes back on its own (the addon watchdog, or FreeCAD
+        restarting). Refusing after the grace is exhausted names the check to
+        run instead of a bare traceback.
+        """
+        deadline = time.monotonic() + self._connect_grace
+        warned = False
+        while True:
+            try:
+                return self._invoke_once(method, *args)
+            except ConnectionRefusedError as e:
+                if time.monotonic() >= deadline:
+                    raise ConnectionRefusedError(
+                        f"the FreeCAD RPC endpoint refused connections for "
+                        f"{self._connect_grace:.0f}s ({e}); check that FreeCAD is "
+                        f"running, the CADPilot addon is installed and its RPC "
+                        f"server is started (toolbar toggle or auto-start)"
+                    ) from e
+                if not warned:
+                    warned = True
+                    logger.warning(
+                        "RPC '%s': connection refused (%s); retrying for up to %.0fs",
+                        method,
+                        e,
+                        self._connect_grace,
+                    )
+                time.sleep(_CONNECT_RETRY_DELAY)
+
+    def _invoke_once(self, method: str, *args):
         try:
             return getattr(self.server, method)(*args)
         except _RECOVERABLE_ERRORS as e:

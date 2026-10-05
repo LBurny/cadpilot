@@ -17,6 +17,7 @@ test.
 """
 
 import ast
+import contextlib
 from pathlib import Path
 
 _ADDON = Path(__file__).resolve().parents[1] / "addon" / "CADPilot"
@@ -302,3 +303,77 @@ def test_bootstrap_helpers_never_read_module_level_names():
         "bare-exec(): import these inside _bootstrap() instead — "
         f"module-level names are not visible here: {sorted(set(offenders))}"
     )
+
+
+# --- RPC watchdog + hot-restart wiring ---------------------------------------
+
+
+def _module_consts(tree):
+    consts = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
+            with contextlib.suppress(ValueError):
+                consts[node.targets[0].id] = ast.literal_eval(node.value)
+    return consts
+
+
+def test_watchdog_property_names_are_single_sourced():
+    watchdog = ast.parse((_ADDON / "rpc_server" / "watchdog.py").read_text(encoding="utf-8"))
+    consts = _module_consts(watchdog)
+    assert consts.get("PROPERTY") == "CADPilot_RPC_Watchdog"
+    assert consts.get("DESIRED_PROPERTY") == "CADPilot_RPC_Desired"
+    assert consts.get("SUPPRESS_PROPERTY") == "CADPilot_RPC_SuppressUntil"
+
+    # InitGui (the one file a hot reload never touches) installs the timer.
+    initgui_calls = {_dotted(c.func) for c in _calls(_INITGUI)}
+    assert "watchdog.ensure_started" in initgui_calls
+
+    # The toolbar toggles record user intent through the same helpers, so a
+    # deliberate stop sticks while a programmatic one is treated as transient.
+    commands = ast.parse((_ADDON / "rpc_server" / "commands.py").read_text(encoding="utf-8"))
+    command_calls = {_dotted(c.func) for c in _calls(commands)}
+    assert "watchdog.set_desired" in command_calls
+
+
+def _top_level_rpc_deps(tree):
+    """Sibling rpc_server.* modules a file imports at TOP LEVEL.
+
+    Lazy imports inside functions are exempt: they resolve the module object
+    at call time and always see the reloaded code.
+    """
+    deps = set()
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module:
+            if node.module.startswith("rpc_server."):
+                deps.add(node.module)
+            elif node.module == "rpc_server":
+                deps.update(f"rpc_server.{a.name}" for a in node.names)
+        elif isinstance(node, ast.Import):
+            deps.update(a.name for a in node.names if a.name.startswith("rpc_server."))
+    return deps
+
+
+def test_restart_reload_order_imports_every_dependency_first():
+    # importlib.reload does not rebind `from X import name` in the modules
+    # that imported X, so an importer must be reloaded AFTER its dependency.
+    rpc_source = (_ADDON / "rpc_server" / "rpc_server.py").read_text(encoding="utf-8")
+    order = _module_consts(ast.parse(rpc_source)).get("_RELOAD_ORDER")
+    assert order, "_RELOAD_ORDER not found in rpc_server.py"
+    # The main module is reloaded last by restart_rpc_server itself.
+    assert "rpc_server.rpc_server" not in order
+
+    index = {name: i for i, name in enumerate(order)}
+    assert len(index) == len(order), "duplicate entries in _RELOAD_ORDER"
+
+    for path in sorted((_ADDON / "rpc_server").glob("*.py")):
+        mod = f"rpc_server.{path.stem}"
+        if path.stem == "__init__" or mod == "rpc_server.rpc_server":
+            continue
+        for dep in _top_level_rpc_deps(ast.parse(path.read_text(encoding="utf-8"))):
+            assert dep in index, f"{mod} imports {dep}; add it to _RELOAD_ORDER"
+            if mod in index:
+                assert index[dep] < index[mod], (
+                    f"{mod} is reloaded before its dependency {dep}; move "
+                    f"{dep} first in _RELOAD_ORDER or its from-imports keep "
+                    f"the OLD code alive after a hot restart"
+                )
