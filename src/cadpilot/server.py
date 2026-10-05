@@ -251,13 +251,13 @@ def cad(
 ) -> list[TextContent]:
     """Run one CAD modeling operation; the unified mutation entry point.
 
-    obj_name is the BASE object, except for loft/sketch/variables/datum_plane/hull where it names the NEW object; params go in obj_properties. With an active session the mutation is recorded as a rollback-able step.
+    obj_name is the BASE object, except for loft/sketch/variables/datum_plane/hull (the NEW object); params go in obj_properties. Committed mutations are rollback-able session steps.
 
     Args:
         obj_type: Object type for create_object, e.g. "Part::Box".
         ops: Operation dicts for batch.
         stop_on_error: Stop a batch at the first failure.
-        description: Note recorded into the session step log.
+        description: One-line purpose of the step; the Steps panel's row label.
 
     Reference: operation_help("<operation>").
     """

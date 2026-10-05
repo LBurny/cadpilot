@@ -12,7 +12,7 @@ import FreeCAD
 import FreeCADGui
 from PySide import QtCore
 
-from rpc_server import dbglog, step_engine
+from rpc_server import dbglog, step_engine, step_journal
 from rpc_server.assembly_ops import (
     assemble as _assemble,
 )
@@ -310,7 +310,12 @@ class FreeCADRPC:
             transaction=f"CADPilot: create_object {obj.name}",
             journal={
                 "operation": "create_object",
-                "label": f"create {obj.type} '{obj.name}'",
+                "label": step_journal.step_label(
+                    "create",
+                    obj.name,
+                    description=obj_data.get("description"),
+                    detail=f"({obj.type})",
+                ),
                 "params": {
                     "obj_name": obj.name,
                     "obj_type": obj.type,
@@ -320,17 +325,23 @@ class FreeCADRPC:
         )
 
     def create_feature(self, doc_name, feature_spec: dict, screenshot: dict | None = None):
+        # The caller's one-line intent is presentation, not geometry — keep it
+        # out of the spec the builders and describe_feature are handed.
+        spec = {k: v for k, v in feature_spec.items() if k != "description"}
+        ftype = str(spec.get("type", "feature"))
+        base = spec.get("base")
+
         def task():
             try:
                 doc = FreeCAD.getDocument(doc_name)
             except Exception:
                 return f"Document '{doc_name}' not found."
             try:
-                feat = create_feature_gui(doc, feature_spec)
+                feat = create_feature_gui(doc, spec)
                 FreeCAD.Console.PrintMessage(
-                    f"Feature '{feat.Name}' ({feature_spec.get('type')}) created in '{doc_name}' via RPC.\n"
+                    f"Feature '{feat.Name}' ({ftype}) created in '{doc_name}' via RPC.\n"
                 )
-                extra = describe_feature(feat, feature_spec)
+                extra = describe_feature(feat, spec)
                 return {"success": True, "object_name": feat.Name, **extra}
             except Exception as e:
                 return str(e)
@@ -340,14 +351,16 @@ class FreeCADRPC:
             {"success": True},
             screenshot,
             doc_name=doc_name,
-            transaction=f"CADPilot: {feature_spec.get('type', 'feature')} {feature_spec.get('base', '')}",
+            transaction=f"CADPilot: {ftype} {base or ''}",
             journal={
-                "operation": feature_spec.get("type", "feature"),
-                "label": f"{feature_spec.get('type')} on '{feature_spec.get('base')}'",
+                "operation": ftype,
+                "label": step_journal.step_label(
+                    ftype, base, spec, description=feature_spec.get("description")
+                ),
                 "params": {
-                    "obj_name": feature_spec.get("base"),
+                    "obj_name": base,
                     "obj_properties": {
-                        k: v for k, v in feature_spec.items() if k not in ("type", "base")
+                        k: v for k, v in spec.items() if k not in ("type", "base")
                     },
                 },
             },
@@ -406,7 +419,9 @@ class FreeCADRPC:
             transaction=f"CADPilot: edit_object {obj.name}",
             journal={
                 "operation": "edit_object",
-                "label": f"edit '{obj.name}'",
+                "label": step_journal.step_label(
+                    "edit", obj.name, description=properties.get("description")
+                ),
                 "params": {"obj_name": obj.name, "obj_properties": obj.properties},
             },
         )
@@ -495,7 +510,7 @@ class FreeCADRPC:
             commit_if=lambda res: any(r.get("success") for r in res.get("results", [])),
             journal={
                 "operation": "batch",
-                "label": f"batch ({len(ops)} ops)",
+                "label": step_journal.batch_label(ops),
                 "params": {"ops": ops},
             },
         )
@@ -535,7 +550,11 @@ class FreeCADRPC:
                     spec = {
                         "type": action,
                         "base": op.get("obj_name"),
-                        **(op.get("obj_properties") or {}),
+                        **{
+                            k: v
+                            for k, v in (op.get("obj_properties") or {}).items()
+                            if k != "description"
+                        },
                     }
                     feat = create_feature_gui(doc, spec)
                     # Same payload the single-op path returns. Without dof/

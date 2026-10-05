@@ -792,3 +792,174 @@ def test_next_planned_walks_by_state_behind_done_records():
     ]
     assert sj.next_planned(recs).index == 2
     assert sj.pending_count(recs) == 2
+
+
+# --- one row-label grammar ----------------------------------------------------
+
+
+def test_step_label_prefers_the_callers_description():
+    """The description IS the intent, so it beats the derived text — and only
+    its first line, because a label is one line."""
+    assert (
+        sj.step_label("pad", "FlangeProfile", {"length": 6}, description="flange body\nsecond line")
+        == "flange body"
+    )
+    assert sj.step_label("pad", "FlangeProfile", {"length": 6}, description="  \n ") == (
+        "pad 'FlangeProfile' 6mm"
+    )
+
+
+def test_step_label_derives_the_identifying_parameter():
+    assert sj.step_label("pad", "FlangeProfile", {"length": 6}) == "pad 'FlangeProfile' 6mm"
+    assert sj.step_label("fillet", "PolarPattern", {"radius": 2.0}) == "fillet 'PolarPattern' 2mm"
+    # cad() passes user params through verbatim, so the spec key's case varies.
+    assert sj.step_label("pad", "S", {"Length": 6}) == "pad 'S' 6mm"
+    # No identifying parameter: the target still names the step.
+    assert sj.step_label("pocket", "Bore", {}) == "pocket 'Bore'"
+    # An expression carries its own text and must not get "mm" glued on.
+    assert sj.step_label("pad", "S", {"length": "=Vars.Thickness"}) == "pad 'S' =Vars.Thickness"
+    assert sj.step_label("pad", "S", {"length": "6 mm"}) == "pad 'S' 6 mm"
+
+
+def test_feature_detail_names_the_ops_a_scalar_cannot():
+    assert sj.feature_detail("pattern", {"pattern_type": "polar", "count": 8}) == "polar ×8"
+    assert sj.feature_detail("boolean", {"op": "cut"}) == "cut"
+    assert sj.feature_detail("mirror", {"plane": "xz"}) == "across XZ"
+    assert sj.feature_detail("variables", {"cells": {"A1": ["a", 1]}}) == "1 cell(s)"
+    assert sj.feature_detail("sketch", {"geometry": [1, 2], "constraints": [1, 2, 3]}) == (
+        "2 geom / 3 con"
+    )
+    assert sj.feature_detail("move", {"translate": [0, 0, 12]}) == "Δ(0, 0, 12)"
+    assert sj.feature_detail("hull", {"sketches": {"top": "A", "front": "B"}}) == "2 views"
+    assert sj.feature_detail("loft", {"profiles": ["A"]}) == "1 profiles"
+    assert sj.feature_detail("datum_plane", {"plane": "XZ"}) == "XZ"
+
+
+def test_batch_label_names_the_distinct_sub_ops():
+    """"batch (5 ops)" described the container, not the step."""
+    ops = [{"action": "pad"}, {"action": "pocket"}, {"operation": "pad"}]
+    assert sj.batch_label(ops) == "batch ×3: pad, pocket"
+    assert sj.batch_label([]) == "batch ×0"
+
+
+def test_describe_step_matches_the_committed_label():
+    """A planned row and the same step after it ran must read identically."""
+    planned = {"operation": "pad", "obj_name": "S", "obj_properties": {"length": 6}}
+    assert sj.describe_step(planned) == sj.step_label("pad", "S", {"length": 6})
+    assert sj.describe_step({"operation": "batch", "ops": [{"action": "fillet"}]}) == (
+        "batch ×1: fillet"
+    )
+    assert sj.describe_step(
+        {"operation": "create_object", "obj_name": "Box", "obj_type": "Part::Box"}
+    ) == "create 'Box' (Part::Box)"
+    # Ops outside the grammar keep their target rather than losing it.
+    assert sj.describe_step({"operation": "align_shapes", "obj_name": "A"}) == "align_shapes 'A'"
+
+
+def test_describe_step_reads_a_planned_steps_description():
+    rec = sj.build_record(
+        {
+            "operation": "pad",
+            "obj_name": "S",
+            "obj_properties": {"length": 6},
+            "description": "flange body, 6mm",
+        },
+        1,
+        sj.STATE_PLANNED,
+        OPS,
+    )
+    assert rec.label == "flange body, 6mm"
+
+
+def test_tooltip_keeps_the_derived_label_behind_a_description():
+    """When the row is the caller's description, the operation + parameters
+    survive nowhere else — the tooltip is the only place left for them."""
+    rec = sj.StepRecord(
+        index=1,
+        operation="pad",
+        label="flange body, 6mm",
+        params={"obj_name": "FlangeProfile", "obj_properties": {"length": 6}},
+    )
+    assert sj.tooltip_text(rec) == "flange body, 6mm\npad 'FlangeProfile' 6mm"
+
+
+def test_tooltip_is_just_the_label_without_a_description():
+    rec = sj.StepRecord(
+        index=1,
+        operation="pad",
+        label="pad 'FlangeProfile' 6mm",
+        params={"obj_name": "FlangeProfile", "obj_properties": {"length": 6}},
+    )
+    assert sj.tooltip_text(rec) == "pad 'FlangeProfile' 6mm"
+    # Params that cannot reproduce the label must not append a stray line.
+    bare = sj.StepRecord(index=2, operation="pad", label="pad 'Pad'")
+    assert sj.tooltip_text(bare) == "pad 'Pad'"
+
+
+def test_derived_label_leaves_foreign_ops_alone():
+    """assemble/set_anchors write richer labels of their own; the tooltip must
+    not "correct" them into the generic grammar."""
+    rec = sj.StepRecord(index=1, operation="assemble", label="assemble 2 mate(s)", params={})
+    assert sj.derived_label(rec) == ""
+
+
+def test_from_json_upgrades_a_legacy_auto_label():
+    """A model recorded before the grammar existed reads as steps, not calls,
+    the moment it is opened — the upgrade is display-only and lossless."""
+    import json
+
+    journal = json.dumps(
+        {
+            "version": 1,
+            "records": [
+                {
+                    "index": 1,
+                    "state": sj.STATE_DONE,
+                    "operation": "pad",
+                    "label": "pad on 'FlangeProfile'",
+                    "params": {"obj_name": "FlangeProfile", "obj_properties": {"length": 6}},
+                },
+                {
+                    "index": 2,
+                    "state": sj.STATE_DONE,
+                    "operation": "boolean",
+                    "label": "boolean 'Body'",
+                },
+                {
+                    "index": 3,
+                    "state": sj.STATE_DONE,
+                    "operation": "variables",
+                    "label": "flange parameter table",
+                    "params": {"obj_name": "Vars", "obj_properties": {"cells": {"A1": ["t", 6]}}},
+                },
+                {
+                    "index": 4,
+                    "state": sj.STATE_DONE,
+                    "operation": "batch",
+                    "label": "batch (2 ops)",
+                    "params": {"ops": [{"action": "pad"}, {"action": "fillet"}]},
+                },
+            ],
+        }
+    )
+    recs = sj.from_json(journal)
+    assert recs[0].label == "pad 'FlangeProfile' 6mm"
+    # A caller's own description is never mistaken for a legacy label.
+    assert recs[2].label == "flange parameter table"
+    assert recs[3].label == "batch ×2: pad, fillet"
+
+
+def test_from_json_leaves_a_label_it_cannot_improve():
+    """A hand-written label that only LOOKS legacy stays put when the derived
+    form would be no better (no params to derive from)."""
+    import json
+
+    journal = json.dumps(
+        {
+            "records": [
+                {"index": 1, "state": sj.STATE_DONE, "operation": "boolean",
+                 "label": "boolean 'Body'"},
+            ]
+        }
+    )
+    assert sj.from_json(journal)[0].label == "boolean 'Body'"

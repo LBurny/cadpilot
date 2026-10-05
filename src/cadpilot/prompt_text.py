@@ -61,7 +61,13 @@ For any non-trivial modeling task, work inside a session:
 
 1. session(action="start", doc_name=..., create_document=True) — binds a session to the document.
 2. Build with cad() — every successful mutation is recorded as a step
-   (backed by a FreeCAD transaction).
+   (backed by a FreeCAD transaction). Give each call a one-line
+   description stating the step's INTENT, e.g.
+   description="flange body, 6mm thick". It becomes that step's row label
+   in the CADPilot Steps panel, which a human reviews step by step, so name
+   the DESIGN DECISION rather than the call. With no description the panel
+   falls back to a derived label ("pad 'FlangeProfile' 6mm") that says what
+   ran but never why.
 3. Trial and error: use session(action="rollback", to_step=N) to backtrack instead of
    deleting and rebuilding. session(action="redo") restores rolled-back steps until a
    new cad() call. Check session(action="status") when unsure — it shows step count,
@@ -130,5 +136,8 @@ computing Placement values; use relative moves and alignment instead:
    computations use execute_code_async() + get_task_result().
    ALWAYS start an execute_code snippet with a one-line `# comment` stating
    what the step does (e.g. `# Cut the f-holes`) — the Steps panel shows
-   that leading comment block as the step's description.
+   that leading comment block as the step's description. cad() has the same
+   rule through its `description` argument (e.g.
+   description="cut the f-holes"). operation_help("step_labels") has the
+   wording convention.
 """

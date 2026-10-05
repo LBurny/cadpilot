@@ -172,3 +172,58 @@ def test_op_without_extras_keeps_its_plain_summary(fake_freecad, isolated_home):
     resp = cad_operation(fake_freecad, "create_object", "Doc", obj_type="Part::Box", obj_name="B")
     text = _text(resp)
     assert text.strip() == "Object 'B' created successfully"
+
+
+def test_feature_description_rides_along_in_the_spec(fake_freecad, isolated_home):
+    """The addon turns spec["description"] into the Steps panel's row label,
+    so the MCP layer must put it IN the payload. It used to reach only the
+    MCP-side session log, which the panel never reads — the human watching
+    the panel then saw "pad on 'Sketch'" no matter what the model intended."""
+    cad_operation(
+        fake_freecad,
+        "pad",
+        "Doc",
+        obj_name="Sketch",
+        obj_properties={"length": 6},
+        description="flange body, 6mm thick",
+    )
+    _, args, _ = fake_freecad.calls[0]
+    assert args[1] == {
+        "type": "pad",
+        "base": "Sketch",
+        "length": 6,
+        "description": "flange body, 6mm thick",
+    }
+
+
+def test_no_description_leaves_the_feature_spec_untouched(fake_freecad, isolated_home):
+    cad_operation(fake_freecad, "pad", "Doc", obj_name="Sketch", obj_properties={"length": 6})
+    _, args, _ = fake_freecad.calls[0]
+    assert args[1] == {"type": "pad", "base": "Sketch", "length": 6}
+
+
+def test_create_and_edit_object_carry_the_description(fake_freecad, isolated_home):
+    cad_operation(
+        fake_freecad,
+        "create_object",
+        "Doc",
+        obj_type="Part::Box",
+        obj_name="Box",
+        obj_properties={"Length": 10},
+        description="stock for the fixture",
+    )
+    create = next(c for c in fake_freecad.calls if c[0] == "create_object")
+    assert create[1][1]["description"] == "stock for the fixture"
+    assert create[1][1]["Properties"] == {"Length": 10}
+
+    cad_operation(
+        fake_freecad,
+        "edit_object",
+        "Doc",
+        obj_name="Box",
+        obj_properties={"Length": 20},
+        description="thicker plate",
+    )
+    edit = next(c for c in fake_freecad.calls if c[0] == "edit_object")
+    assert edit[1][2]["description"] == "thicker plate"
+    assert edit[1][2]["Properties"] == {"Length": 20}

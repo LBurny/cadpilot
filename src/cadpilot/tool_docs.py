@@ -393,7 +393,8 @@ Each entry is a cad() argument dict, so the panel can run it later:
 The plan lands in the document's journal as `planned` steps and shows up in
 the CADPilot Steps panel; `description` becomes the panel's plan title, and a
 per-step `description` becomes its row label — write both for the human
-watching the panel. Nothing touches the model until a step is released — by
+watching the panel (see operation_help("step_labels") for how to word them).
+Nothing touches the model until a step is released — by
 the user clicking Next in the panel, or via step_control. A new cad() call
 discards whatever part of the plan has not run yet, because it was planned
 against a document state that no longer exists.
@@ -579,6 +580,36 @@ says so in text.
 text notice). Captures are capped at 384px on the long edge unless
 width/height are given; TechDraw and Spreadsheet views yield no screenshot
 at all.""",
+    "step_labels": """\
+step_labels: what the Steps panel's "Step" column says, and how to write it.
+
+The CADPilot Steps panel is read by a human reviewing the model step by step,
+so every step carries ONE line that states its intent. Two sources fill it:
+
+1. Your `description` argument — the intent, and what a reviewer needs.
+   cad(operation="pad", obj_name="FlangeProfile",
+       description="flange body, 6mm thick")
+   - One line, <= ~40 characters, a noun phrase or short imperative, in the
+     language the user is writing in.
+   - Name the DESIGN DECISION, not the call: "flange body, 6mm" tells the
+     reviewer what this step is for; "pad on FlangeProfile" only restates the
+     operation, which the panel's Op column already shows.
+   - Only the first line is used as the row label; the tooltip keeps the rest.
+   - Same convention inside step_plan: a per-step `description`, plus the
+     plan-level `description` as its title. An execute_code snippet states it
+     as its leading `# comment` block.
+
+2. The derived label, when no description was written. Every op then reads as
+     <verb> '<target>' <detail>
+   where <detail> is the one parameter that identifies the step:
+     pad 'FlangeProfile' 6mm        pocket 'BoreProfile' 20mm
+     fillet 'PolarPattern' 2mm      pattern 'BoltHoleCut' polar ×8
+     sketch 'FlangeProfile' 12 geom / 24 con
+     variables 'Vars' 5 cell(s)     boolean 'Body' cut
+     revolution 'Profile' 360°      mirror 'Half' across XZ
+     move 'Cover' Δ(0, 0, 12)       batch ×5: pad, pocket, fillet, …
+   Accurate but mechanical: it says what ran, never why. Write the
+   `description` whenever a reviewer would care why.""",
 }
 
 HELP_TOPICS: dict[str, str] = {
@@ -595,6 +626,7 @@ HELP_TOPICS: dict[str, str] = {
             "multi_agent",
             "session",
             "screenshots",
+            "step_labels",
         )
     },
     "assembly_session": "assembly_session tool (persistent-joint assembly)",
@@ -605,6 +637,7 @@ HELP_TOPICS: dict[str, str] = {
     "multi_agent": "running several agents against one FreeCAD without cross-talk",
     "session": "session tool (step recording + rollback state machine)",
     "screenshots": "get_view is the only capture tool (file path delivery)",
+    "step_labels": "how to write a step's one-line description (Steps panel)",
 }
 
 

@@ -553,6 +553,8 @@ def cad_operation(
                 "Type": obj_type,
                 "Properties": obj_properties or {},
             }
+            if description:
+                obj_data["description"] = description
             res = freecad.create_object(doc_name, obj_data)
             success = bool(res.get("success"))
             summary = (
@@ -567,7 +569,10 @@ def cad_operation(
         elif operation == "edit_object":
             if not obj_name:
                 return text_response("edit_object requires obj_name")
-            res = freecad.edit_object(doc_name, obj_name, {"Properties": obj_properties or {}})
+            edit_data: dict[str, Any] = {"Properties": obj_properties or {}}
+            if description:
+                edit_data["description"] = description
+            res = freecad.edit_object(doc_name, obj_name, edit_data)
             success = bool(res.get("success"))
             summary = (
                 f"Object '{res['object_name']}' edited successfully"
@@ -603,6 +608,11 @@ def cad_operation(
                 )
             # Internal keys LAST: user params must never clobber them.
             spec = {**params, "type": operation, "base": obj_name}
+            # The caller's one-line intent rides along to the addon's step
+            # journal: it becomes the Steps panel's row label, so the human
+            # watching the panel reads the design decision, not the call.
+            if description:
+                spec["description"] = description
             res = freecad.create_feature(doc_name, spec)
             success = bool(res.get("success"))
             summary = (

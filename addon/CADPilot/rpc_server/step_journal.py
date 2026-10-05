@@ -127,9 +127,11 @@ def from_json(text: str | None) -> list[StepRecord]:
         if not isinstance(raw, dict):
             continue
         try:
-            out.append(StepRecord.from_dict(raw))
+            rec = StepRecord.from_dict(raw)
         except (TypeError, ValueError):
             continue
+        upgrade_legacy_label(rec)
+        out.append(rec)
     return out
 
 
@@ -138,12 +140,279 @@ def reindex(records: list[StepRecord]) -> None:
         rec.index = i
 
 
-def describe_step(step: dict[str, Any]) -> str:
-    op = str(step.get("operation", ""))
-    name = step.get("obj_name") or ""
+# --- one row-label grammar for every step ------------------------------------
+#
+# The panel's Step column answers one question: what IS this step? The caller's
+# own ``description`` is the honest answer — it is the intent — and wins
+# whenever it was written. With no description the label is derived from the
+# op and the single parameter that identifies the step, so a row still reads
+# as a step ("pad 'FlangeProfile' 6mm") rather than as a call ("pad on
+# 'FlangeProfile'"). One grammar for every op, so a column of rows scans as a
+# single document:
+#
+#     <verb> '<target>' <detail>
+#
+# The same builder feeds both halves of the journal — a committed step's label
+# and a planned step's describe_step — so planned and done rows agree.
+
+# The one scalar that names the step, with its unit. Key lookup is
+# case-insensitive: cad() passes user params through verbatim, so a caller's
+# spec may carry "Length" while the builders read "length".
+_SCALAR_DETAIL: dict[str, tuple[str, str]] = {
+    "pad": ("length", "mm"),
+    "pocket": ("length", "mm"),
+    "revolution": ("angle", "°"),
+    "groove": ("angle", "°"),
+    "fillet": ("radius", "mm"),
+    "chamfer": ("size", "mm"),
+    "thickness": ("value", "mm"),
+    "draft": ("angle", "°"),
+}
+
+# Ops this grammar owns. Anything else (assemble, set_anchors, assembly, …)
+# already writes a richer label of its own, and must not be "corrected" into
+# the generic form.
+_DERIVED_OPS = frozenset(
+    {
+        "create_object",
+        "edit_object",
+        "delete_object",
+        "batch",
+        "boolean",
+        "fillet",
+        "chamfer",
+        "loft",
+        "sweep",
+        "mirror",
+        "pattern",
+        "move",
+        "variables",
+        "sketch",
+        "pad",
+        "pocket",
+        "revolution",
+        "groove",
+        "thickness",
+        "draft",
+        "datum_plane",
+        "hull",
+    }
+)
+
+
+def first_line(text: str | None) -> str:
+    """A label is one line: the first non-empty line of a description block."""
+    for line in str(text or "").splitlines():
+        if line.strip():
+            return line.strip()
+    return ""
+
+
+def _num_text(value: Any) -> str:
+    """A parameter as it should read in a label: 6.0 -> "6", "6 mm" as written."""
+    if isinstance(value, str):
+        return value.strip()
+    try:
+        return f"{float(value):g}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _params_ci(params: Any) -> dict[str, Any]:
+    if not isinstance(params, dict):
+        return {}
+    return {str(k).lower(): v for k, v in params.items()}
+
+
+def feature_detail(operation: str, params: Any) -> str:
+    """The ONE parameter that identifies a step ("6mm", "polar ×8"), else "".
+
+    The Op column already names the operation; this names the thing, which is
+    what turns a recorded call into a readable step when the caller wrote no
+    description of its own.
+    """
+    p = _params_ci(params)
+    op = str(operation or "")
+    scalar = _SCALAR_DETAIL.get(op)
+    if scalar is not None:
+        key, unit = scalar
+        value = p.get(key)
+        if value is None:
+            return ""
+        text = _num_text(value)
+        # A string already carries its own unit ("6 mm") or is an expression
+        # ("=Vars.Thickness"); only a bare number needs the unit appended.
+        return text if isinstance(value, str) else f"{text}{unit}"
+    if op == "pattern":
+        kind = "polar" if str(p.get("pattern_type", "linear")).lower() == "polar" else "linear"
+        count = p.get("count")
+        return f"{kind} ×{_num_text(count)}" if count is not None else kind
+    if op == "boolean":
+        return str(p.get("op") or "")
+    if op == "mirror":
+        return f"across {str(p.get('plane') or 'XY').upper()}"
+    if op == "sweep":
+        return f"along '{p['path']}'" if p.get("path") else ""
+    if op == "move":
+        delta = p.get("translate")
+        if isinstance(delta, dict):
+            delta = [delta.get("x", 0), delta.get("y", 0), delta.get("z", 0)]
+        if isinstance(delta, (list, tuple)) and len(delta) == 3:
+            return "Δ(" + ", ".join(_num_text(v) for v in delta) + ")"
+        rotate = p.get("rotate")
+        if isinstance(rotate, dict) and rotate.get("angle") is not None:
+            return f"rotate {_num_text(rotate['angle'])}°"
+        return "placement" if p.get("placement") else ""
+    if op == "variables":
+        cells = p.get("cells")
+        return f"{len(cells)} cell(s)" if isinstance(cells, dict) and cells else ""
+    if op == "sketch":
+        bits = []
+        for key, word in (("geometry", "geom"), ("constraints", "con")):
+            count = len(p.get(key) or [])
+            if count:
+                bits.append(f"{count} {word}")
+        return " / ".join(bits)
+    if op == "loft":
+        count = len(p.get("profiles") or [])
+        return f"{count} profiles" if count else ""
+    if op == "hull":
+        views = p.get("sketches")
+        count = len(views) if isinstance(views, (list, dict)) else 0
+        return f"{count} views" if count else ""
+    if op == "datum_plane":
+        plane = p.get("plane")
+        if isinstance(plane, dict):
+            plane = plane.get("datum") or plane.get("plane")
+        return str(plane) if plane else ""
+    return ""
+
+
+def batch_label(ops: Any) -> str:
+    """"batch ×5: pad, pocket, fillet" — what a batch row should say.
+
+    "batch (5 ops)" described the container, not the step; the distinct
+    sub-op verbs make the row scannable without opening it.
+    """
+    verbs: list[str] = []
+    for sub in ops or []:
+        if not isinstance(sub, dict):
+            continue
+        verb = str(sub.get("action") or sub.get("operation") or "")
+        if verb and verb not in verbs:
+            verbs.append(verb)
+    head = f"batch ×{len(ops or [])}"
+    if not verbs:
+        return head
+    tail = ", ".join(verbs[:4]) + (", …" if len(verbs) > 4 else "")
+    return f"{head}: {tail}"
+
+
+def step_label(
+    operation: str,
+    target: str | None = "",
+    params: Any = None,
+    description: str | None = "",
+    detail: str | None = None,
+) -> str:
+    """The canonical one-line label for a step.
+
+    The caller's description when it wrote one, else the derived
+    ``<verb> '<target>' <detail>`` form. ``detail`` overrides the derived
+    detail for the few ops whose identifying text is not a spec parameter
+    (create_object's type).
+    """
+    note = first_line(description)
+    if note:
+        return note
+    op = str(operation or "")
+    if detail is None:
+        detail = feature_detail(op, params)
+    name = str(target or "")
+    head = f"{op} '{name}'" if name else op
+    return f"{head} {detail}".strip() if detail else head
+
+
+def derived_label(rec: StepRecord) -> str:
+    """A recorded step's mechanical label, recomputed from its stored params.
+
+    Used by the hover tooltip: when the row label is the caller's description,
+    this is the only place the operation and its parameters still surface.
+    "" for the ops that write their own label (assemble, set_anchors, …).
+    """
+    op = rec.operation
+    if op not in _DERIVED_OPS:
+        return ""
+    params = rec.params or {}
     if op == "batch":
-        return f"batch ({len(step.get('ops') or [])} ops)"
-    return f"{op} '{name}'" if name else op
+        ops = params.get("ops")
+        return batch_label(ops) if ops else ""
+    if op == "create_object":
+        name = params.get("obj_name")
+        if not name:
+            return ""
+        obj_type = params.get("obj_type")
+        return step_label("create", name, detail=f"({obj_type})" if obj_type else "")
+    if op in ("edit_object", "delete_object"):
+        name = params.get("obj_name")
+        return step_label(op.split("_", 1)[0], name) if name else ""
+    name = params.get("obj_name")
+    if not name:
+        return ""
+    return step_label(op, name, params.get("obj_properties"))
+
+
+def upgrade_legacy_label(rec: StepRecord) -> bool:
+    """Re-label a step recorded before the label grammar existed.
+
+    The old auto labels were "<op> on '<target>'", "batch (N ops)" and
+    "create <type> '<name>'". They carry nothing the derived label does not,
+    and a caller's description never looks like them, so upgrading is
+    lossless: a model built before the change reads as a set of steps rather
+    than a set of calls the moment it is opened. Returns whether it changed.
+    """
+    params = rec.params or {}
+    name = params.get("obj_name")
+    legacy = {
+        f"{rec.operation} on '{name}'",
+        f"batch ({len(params.get('ops') or [])} ops)",
+        f"create {params.get('obj_type')} '{name}'",
+    }
+    if rec.label not in legacy:
+        return False
+    upgraded = derived_label(rec)
+    if not upgraded or upgraded == rec.label:
+        return False
+    rec.label = upgraded
+    return True
+
+
+def describe_step(step: dict[str, Any]) -> str:
+    """Derived label for a *planned* step (a cad() argument dict).
+
+    Shares step_label with the committed path, so a planned row and the same
+    step after it ran read identically instead of drifting apart.
+    """
+    op = str(step.get("operation") or step.get("action") or "")
+    if op not in _DERIVED_OPS:
+        # Ops outside the grammar (align_shapes, assemble, …) keep the plain
+        # "<op> '<target>'" form rather than losing their target entirely.
+        name = step.get("obj_name")
+        return f"{op} '{name}'" if name else op
+    note = step.get("description")
+    if op == "batch":
+        return batch_label(step.get("ops"))
+    if op == "create_object":
+        obj_type = step.get("obj_type")
+        return step_label(
+            "create",
+            step.get("obj_name"),
+            description=note,
+            detail=f"({obj_type})" if obj_type else "",
+        )
+    if op in ("edit_object", "delete_object"):
+        return step_label(op.split("_", 1)[0], step.get("obj_name"), description=note)
+    return step_label(op, step.get("obj_name"), step.get("obj_properties"), description=note)
 
 
 def params_for(step: dict[str, Any]) -> dict[str, Any]:
@@ -351,10 +620,21 @@ def row_text(rec: StepRecord) -> str:
 
 
 def tooltip_text(rec: StepRecord) -> str:
-    """Full row text for hover: the whole description block, then the label."""
-    desc = step_description(rec)
-    if desc and desc != rec.label:
-        return f"{desc}\n{rec.label.removeprefix('execute_code: ')}"
+    """Full row text for hover: the row label, then what the step actually did.
+
+    When the label IS the caller's description, the derived text is the only
+    place the operation and its parameters survive — so the tooltip keeps
+    both. For a step with no description the two are equal and the label
+    alone is the tooltip.
+    """
+    if rec.operation == "execute_code":
+        desc = step_description(rec)
+        if desc and desc != rec.label:
+            return f"{desc}\n{rec.label.removeprefix('execute_code: ')}"
+        return rec.label
+    derived = derived_label(rec)
+    if derived and derived != rec.label:
+        return f"{rec.label}\n{derived}"
     return rec.label
 
 
@@ -370,7 +650,7 @@ def build_record(
         index=index,
         state=state,
         operation=op,
-        label=label or step.get("description") or describe_step(step),
+        label=label or describe_step(step),
         params=params_for(step),
         executable=op in executable_ops,
         timestamp=stamp(),
