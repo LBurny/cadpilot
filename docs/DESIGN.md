@@ -33,13 +33,13 @@ FreeCAD document / GUI
 
 The MCP server and the addon are two separate programs communicating over XML-RPC, for three reasons.
 
-**Isolation.** The MCP server never imports FreeCAD, so it can run anywhere, including on another machine (directed there with `--host`). When FreeCAD restarts, the server detects the dead connection, rebuilds its proxy, and retries once.
+**Isolation.** The MCP server never imports FreeCAD, so it can run anywhere, including on another machine (directed there with `--host`). When FreeCAD restarts, the server detects the dead connection, rebuilds its proxy, and retries once, for read-only calls. A mutating call is never retried on a lost response: the request may already have been executed, and a retry would apply it twice. The caller gets an error telling it to inspect the document before repeating anything.
 
 **Mismatched lifecycles.** AI clients start and stop stdio servers at will, while FreeCAD is a long-lived GUI application. The addon holds the CAD state independently of MCP server lifetimes.
 
 **Library compatibility.** The server imports `FastMCP` from `mcp.server.fastmcp` (MCP 1.x) and falls back to `MCPServer` (MCP 2.x) if that import fails.
 
-The XML-RPC transport times out after 150 seconds. A socket timeout is not retried, because the operation may still be executing on the FreeCAD side; retrying could apply it twice.
+The XML-RPC transport times out after 150 seconds. A socket timeout is never retried, because the operation may still be executing on the FreeCAD side. The same holds for every mutating call whose response was lost after delivery: the retry rule is that only calls whose worst case is a repeated question are retried automatically.
 
 ## 3. The single-threaded constraint
 
@@ -82,7 +82,7 @@ Every committed change runs inside a FreeCAD transaction. Two journals sit on to
 
 A session (`session` tool, `start` through `complete`) records each change as a step: the operation, its parameters, the result, the list of objects in the document afterwards, and any notes the model or user attached. The object list is the fingerprint used to detect when the document no longer matches the log.
 
-Rolling back to step N runs `doc.undo()` once per removed step, then truncates the log. The removed steps sit in a redo buffer until a new step arrives, which mirrors FreeCAD's own redo semantics.
+Rolling back to step N runs `doc.undo()` once per removed step that actually owns an undo entry, then truncates the log. A step that provably committed nothing (an empty commit, a read-only inspection) neither blocks the rollback nor consumes a pop; it once blocked every rollback behind a misattributed warning, and a same-value edit counted as a transaction and popped one entry too many. The removed steps sit in a redo buffer until a new step arrives, which mirrors FreeCAD's own redo semantics.
 
 Undo is only a guarantee when a step actually owns an undo entry, and a property write alone creates none. A step recorded without a transaction therefore survived rollback, which is how a rollback could once report success while the objects it was asked to drop were still present. Rollback now inspects what the undo stack actually holds and takes one of three paths:
 
@@ -92,7 +92,7 @@ Undo is only a guarantee when a step actually owns an undo entry, and a property
 
 Every reply states which path was taken and what was removed.
 
-Two details keep those paths honest. First, the undo result is verified, not assumed. The FreeCAD undo stack is shared with the GUI, and a manual edit interleaved on it pops under a rollback's name while the popped count still matches, so a count that looks right can still leave the model in the wrong state. After the undo, the journal compares object sets: whatever the rolled-back steps created must be gone, and whatever the target step should have must be present. Any discrepancy escalates to the rebuild path. Second, what a cleanup removes is decided by per-step before and after diffs, never by subtracting whole snapshots. Every snapshot lists the entire document, so at the target "before the journal" a snapshot subtraction would drag in objects that predate the journal and delete the user's own work. The journal removes only what the journal built.
+Two details keep those paths honest. First, the undo result is verified, not assumed. The FreeCAD undo stack is shared with the GUI, and a manual edit interleaved on it pops under a rollback's name while the popped count still matches, so a count that looks right can still leave the model in the wrong state. After the undo, the journal compares object sets: whatever the rolled-back steps created must be gone, and whatever the target step should have must be present. Any discrepancy escalates to the rebuild path. Second, what a cleanup removes is decided by per-step before and after diffs, never by subtracting whole snapshots. Every snapshot lists the entire document, so at the target "before the journal" a snapshot subtraction would drag in objects that predate the journal and delete the user's own work. The journal removes only what the journal built. Records that demonstrably changed nothing (a snapshot marker, a skipped read-only step) contribute no diff at all: their whole-document spans would otherwise name the user's own pre-journal objects as creations, which is how rejecting a baseline snapshot once deleted imported geometry.
 
 Every committed change is audited as well: a read-only connectivity check runs after each `cad()` call and reports parts that became disconnected from the rest. The audit only warns, never blocks, and can be disabled globally or skipped automatically for very large documents.
 
@@ -184,7 +184,7 @@ Several rules keep it reliable, all verified against a live FreeCAD:
 
 ## 9. Screenshot policy
 
-Screenshots come from a single tool: `get_view`. Everything else is text-only, which keeps token usage flat. Each capture is written to `$CADPILOT_HOME/screenshots/` (newest 100 kept) and the response carries only its path as text, so no image data enters the context; a multimodal client opens the PNG with its own file-reading tool. `--only-text-feedback` turns even `get_view` into a text notice, giving text-only models a hard guarantee. Captures are capped at 384 pixels on the long edge unless a size is given, and a few view types, such as TechDraw and Spreadsheet, return none at all.
+Screenshots come from a single tool: `get_view`. Everything else is text-only, which keeps token usage flat. Each capture is written to `$CADPILOT_HOME/screenshots/` (newest 100 kept) and the response carries only its path as text, so no image data enters the context; a multimodal client opens the PNG with its own file-reading tool. `--only-text-feedback` turns even `get_view` into a text notice, giving text-only models a hard guarantee. Captures are capped at 384 pixels on the long edge unless a size is given, and a few view types, such as TechDraw and Spreadsheet, return none at all. FreeCAD's selection is process-global GUI state; a focus capture frames its target without taking the selection away, and whatever the user had selected is restored after the shot.
 
 ## 10. Long-running computations
 
@@ -198,7 +198,7 @@ The RPC server listens on localhost by default. Remote access is an explicit opt
 
 ## 12. Failure handling
 
-* **Reconnect.** The client rebuilds its proxy and retries once when the connection is dead, which covers a FreeCAD or addon restart.
+* **Reconnect.** The client rebuilds its proxy and retries once when the connection is dead, which covers a FreeCAD or addon restart. Read-only methods retry automatically; a mutating method refuses, because a response lost after delivery means the operation may already have been applied. The legacy fallback for old addons fires only on dispatch-shape errors, which provably happen before the handler body runs.
 * **Forward and backward compatibility.** A new client falls back to older addon behavior, and an old client keeps working against a newer addon.
 * **Names are normalized.** FreeCAD rewrites object names (spaces become underscores, duplicates get numbered), so every handler returns the name FreeCAD actually chose.
 * **Version differences are probed.** Where FreeCAD 1.1 and older releases store the same setting differently, the addon checks at runtime which layout applies.

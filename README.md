@@ -178,6 +178,12 @@ uv run ruff check .    # lint
 uv run cadpilot        # run the MCP server from source
 ```
 
+Two layers of tests back the tool surface. The unit suite runs without FreeCAD: it includes a wire-contract test that compares every copy of the XML-RPC interface (client proxy, addon handler, test double) so a renamed method or a changed argument count fails in CI instead of at runtime. `tests/live_complex_verify.py` is the live half: complex real-scenario builds (a parametric flange, a shelled enclosure, a hinge assembly, journal and session semantics) that assert analytic volumes against a running FreeCAD, and each stress round adds its cases there instead of writing throwaway probes. Run it with FreeCAD open:
+
+```bash
+.venv/Scripts/python.exe tests/live_complex_verify.py   # Windows; needs FreeCAD + the addon running
+```
+
 ## Acknowledgments
 
 This project was originally based on [neka-nat/freecad-mcp](https://github.com/neka-nat/freecad-mcp) by Shirokuma (k tanaka). Many thanks to the original authors; parts of this project are derived from their work (MIT License).

@@ -178,6 +178,12 @@ uv run ruff check .    # 代码检查
 uv run cadpilot        # 从源码运行 MCP 服务器
 ```
 
+
+测试分两层。单元测试无需 FreeCAD：其中的线路契约测试会比对 XML-RPC 接口的每一份手写副本（客户端代理、插件处理器、测试替身），改名或改参数数量会在 CI 里报错，而不是在线上运行时才炸。`tests/live_complex_verify.py` 是活体的一半：用复杂真实场景（参数化法兰、抽壳机箱、铰链装配、日志与会话语义）对着运行中的 FreeCAD 断言解析体积；每轮压测的用例都加进这里，不再写一次性探针。打开 FreeCAD 后运行：
+
+```bash
+.venv/Scripts/python.exe tests/live_complex_verify.py   # Windows；需要 FreeCAD 与插件在运行
+```
 ## 致谢
 
 本项目最初基于 [neka-nat/freecad-mcp](https://github.com/neka-nat/freecad-mcp)（作者 Shirokuma (k tanaka)）开发。非常感谢原作者的工作，本项目部分内容参考并衍生自该项目（MIT License）。

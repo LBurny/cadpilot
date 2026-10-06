@@ -1,5 +1,63 @@
 # Changelog
 
+## v0.7.7 (2026-10-07)
+
+A three-part quality round: a wire-contract test that compares every
+hand-written copy of the XML-RPC interface, two stress audits (MCP
+reliability; addon pure logic plus return shapes), and a live
+complex-scenario regression corpus (`tests/live_complex_verify.py`,
+66 checks over a running FreeCAD). All of it backs the same idea: the
+interfaces this project publishes are written down more than once, and the
+copies are compared by a test instead of by whoever edits one of them.
+
+### Fixed
+
+- **Mutating RPCs are no longer retried on a lost response.**
+  `IncompleteRead` and `RemoteDisconnected` arrive after delivery; a server
+  that processed the request before dying made an automatic retry a silent
+  second execution. Only read-only methods retry now; a mutation raises with
+  an inspect-before-repeating message. The legacy old-addon fallback fires
+  only on dispatch-shape errors, which happen before the handler body runs.
+- **Persistence failures no longer escape the tool** after a mutation
+  committed: they degrade to a warning. Saves use unique temp files (the
+  shared `.tmp` raced between thread-pool workers), session ids are
+  validated path-safe, corrupt-but-parseable stores are refused instead of
+  crashing readers, and an empty `CADPILOT_HOME` no longer redirects all
+  persistence into the working directory.
+- **Snapshot baselines cannot delete pre-journal geometry** (live-caught):
+  `created_since` now skips records that provably changed nothing, whose
+  whole-document spans used to name the user's own objects as creations.
+- **Move on an adopted base chain moves the visible model** (live-caught):
+  members build in the body frame with the base's Placement stripped, so the
+  move silently updated the hidden base alone. Dependent bodies that did not
+  follow the delta are shifted by it.
+- **`get_view` focus captures preserve the selection** (live-caught): the
+  process-global selection was cleared before and after the shot.
+- **`center: true` places a sketch at the face's centroid** and warns when
+  that point lies off the material (a hole or a concave section); the old
+  fallback teleported the origin onto a circular edge's seam.
+- Session rollback counts atomic steps only, truncates the log to the
+  actually-undone transactions, and no longer blocks behind provably empty
+  steps with a misattributed message. Session mutations are serialized.
+- `Placement.Rotation` accepts the lowercase axis/angle spellings and
+  refuses unknown keys instead of silently building an identity rotation.
+- Expression sync keeps whitespace inside quoted literals; a malformed
+  batch sub-op no longer disables a document's manual-edit sync.
+- A corrupt settings file can no longer kill the addon at import or brick
+  the RPC server; settings writes are atomic; the six read-only geometry
+  handlers return proper error envelopes; async task output is capped with
+  a truncation marker; numeric tool params reject inf/nan and marshal-unsafe
+  integers.
+
+### Changed
+
+- The default test double returns the current addon result shapes, so
+  consumption paths (undoable downgrade, foreign-document warnings, island
+  audits, ghost skips) are exercised by default. `cad()` replies no longer
+  leak the addon's `undoable` bookkeeping key.
+- `operation_help` and the addon's start/unmate messages state the real
+  commit, rollback and escape semantics.
+
 ## v0.5.10 (2026-10-04)
 
 The steps panel stops being a wall of identical `execute_code` rows: every step
