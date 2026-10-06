@@ -1,6 +1,6 @@
 [project]
 name = "cadpilot"
-version = "0.7.4"
+version = "0.7.5"
 description = "CADPilot-MCP: Automatic CAD — MCP server that lets AI clients drive FreeCAD to create, edit, and inspect 3D CAD models via XML-RPC"
 readme = "README.md"
 authors = [
