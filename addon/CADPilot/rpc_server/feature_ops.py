@@ -1152,6 +1152,11 @@ def _profile_sketch(doc, spec, op):
 
 _PAD_TYPES = ("length",)  # uptoface & co. intentionally unsupported for now
 
+# A cut that removed nothing changes no volume at all, so any hair of
+# difference is a real removal. Shared by the direction probe and by the
+# "removed no material" warning so the two cannot disagree.
+_CUT_EPS = 1e-6
+
 
 def _set_length(feat, op, value):
     """Assign Length with the op's parameter named on parse failures.
@@ -1232,6 +1237,79 @@ def _ensure_material_base(doc, body, sketch, op):
         return None
 
 
+def _body_material_volume(body) -> float:
+    """The Body's volume BEFORE the new feature is added, or 0.0 when unreadable.
+
+    Read it at the right moment: once the feature is built, ``body.Shape`` is
+    that feature's own result and a "did this remove anything" comparison would
+    be against itself. A body whose material comes from an adopted BaseFeature
+    (a datum-attached profile) has a Tip with no volume, so that comes second.
+    """
+    for candidate in (getattr(body, "Tip", None), getattr(body, "BaseFeature", None)):
+        if candidate is None:
+            continue
+        with contextlib.suppress(Exception):
+            shape = getattr(candidate, "Shape", None)
+            if shape is not None and not shape.isNull() and float(shape.Volume) > 0:
+                return float(shape.Volume)
+    return 0.0
+
+
+_AUTO_DIRECTION_NOTE = ""
+
+
+def _take_auto_direction_note() -> str:
+    global _AUTO_DIRECTION_NOTE
+    note, _AUTO_DIRECTION_NOTE = _AUTO_DIRECTION_NOTE, ""
+    return note
+
+
+def _auto_detect_cut_direction(doc, feat, spec, fc_type, base_vol) -> None:
+    """Turn around a pocket that cuts AIR instead of material.
+
+    FreeCAD's own default pocket direction points away from the solid when the
+    profile lies on the body's start plane, and it says nothing about it: a
+    fresh ``PartDesign::Pocket`` with FreeCAD's untouched defaults (profile on
+    the XY plane under a pad spanning z 0..8, Length 5) removed exactly 0 mm^3,
+    while ``Reversed = True`` removed the analytic pi*r^2*length (measured
+    natively on 1.1.4). A GUI user ticks "Reversed" because the dialog shows the
+    result; a caller over MCP gets a silent no-op cut, which is the one outcome a
+    ``pocket`` can never mean.
+
+    So the direction is decided from the geometry, not from FreeCAD's default:
+    when the forward direction provably removes nothing (the volume did not
+    budge) and reversing it removes material, the reversed direction wins and the
+    reply says so. An explicit ``reversed`` is the caller's decision and is never
+    overridden, ``midplane`` is symmetric so there is nothing to decide, and when
+    NEITHER direction removes anything the feature is left exactly as asked for:
+    that is a profile outside the solid or a bad attachment, and the existing
+    no-material warning explains it better than a silent flip would.
+    """
+    if fc_type != "PartDesign::Pocket" or base_vol <= 0:
+        return
+    if spec.get("reversed") is not None or spec.get("midplane"):
+        return
+    doc.recompute()
+    forward_vol = _read_shape_state(feat, doc)[2]
+    if forward_vol < base_vol - _CUT_EPS:
+        return  # it cut something: nothing to decide
+    feat.Reversed = True
+    doc.recompute()
+    reversed_vol = _read_shape_state(feat, doc)[2]
+    if reversed_vol >= base_vol - _CUT_EPS:
+        feat.Reversed = False  # cuts air either way: not a direction problem
+        doc.recompute()
+        return
+    global _AUTO_DIRECTION_NOTE
+    _AUTO_DIRECTION_NOTE = (
+        f"'{feat.Name}' cut material in the reverse direction, so its Reversed "
+        f"property was set for you (removed {round(base_vol - reversed_vol, 3)} mm^3; "
+        "the caller's direction would have cut air). Pass reversed=true/false "
+        "explicitly to decide it yourself."
+    )
+    FreeCAD.Console.PrintMessage(f"CADPilot: {_AUTO_DIRECTION_NOTE}\n")
+
+
 def _build_padlike(doc, spec, fc_type, default_name):
     body = sketcher_ops._get_or_create_body(doc, spec.get("body"))
     sketch = _profile_sketch(doc, spec, fc_type)
@@ -1244,6 +1322,9 @@ def _build_padlike(doc, spec, fc_type, default_name):
     doc.recompute()
     _require_closed_profile(sketch, fc_type)
     _ensure_material_base(doc, body, sketch, fc_type.split("::")[-1].lower())
+    # Snapshot the material BEFORE the feature joins the body: afterwards its
+    # Shape is the feature's own result (see _body_material_volume).
+    base_vol = _body_material_volume(body)
     feat = body.newObject(fc_type, spec.get("name") or default_name)
     feat.Profile = sketch
     if spec.get("through_all"):
@@ -1265,6 +1346,7 @@ def _build_padlike(doc, spec, fc_type, default_name):
         _set_length(feat, fc_type.split("::")[-1].lower(), spec.get("length", 10.0))
     feat.Reversed = bool(spec.get("reversed", False))
     feat.Midplane = bool(spec.get("midplane", False))
+    _auto_detect_cut_direction(doc, feat, spec, fc_type, base_vol)
     return feat
 
 
@@ -1631,7 +1713,7 @@ def _cut_removed_nothing(feat) -> str:
         new_vol = float(feat.Shape.Volume)
     except Exception:
         return ""
-    if prev_vol <= 0 or new_vol < prev_vol - 1e-6:
+    if prev_vol <= 0 or new_vol < prev_vol - _CUT_EPS:
         return ""
     return (
         f"{feat.Name} removed no material (volume unchanged at {round(new_vol, 1)} mm^3): "
@@ -1750,6 +1832,11 @@ def describe_feature_reply(feat, spec) -> dict:
     asserted, shape)."""
     out = describe_feature(feat, spec) or {}
     note = _take_shape_check_note()
+    direction = _take_auto_direction_note()
+    if direction:
+        # An auto-decided cut direction is a silent-geometry fix the caller must
+        # see: the geometry is right, but the STEP as written would not be.
+        note = f"{note} {direction}".strip() if note else direction
     if note:
         warnings = out.get("warnings")
         if isinstance(warnings, list):
@@ -2167,6 +2254,10 @@ def create_feature_gui(doc, spec):
     builder = _BUILDERS.get(ftype)
     if builder is None:
         raise ValueError(f"unknown feature type {ftype!r}; supported: {', '.join(FEATURE_TYPES)}")
+    # Notes are per-build: a replay (step_engine) also calls this, and a note it
+    # leaves behind must never be reported as the NEXT caller's outcome.
+    global _AUTO_DIRECTION_NOTE
+    _AUTO_DIRECTION_NOTE = ""
     # Read the Shape of what this feature is built on FIRST: a lazy predecessor
     # makes the new feature compute to nothing, silently (see the helper).
     _settle_shape_caches(doc, spec)

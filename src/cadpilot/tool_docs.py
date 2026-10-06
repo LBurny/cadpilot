@@ -349,6 +349,11 @@ A NEGATIVE length is legal and cuts the other way (the result warns).
 through_all is the right choice for a hole that must stay open when the model
 gets thicker: a numeric length only goes "through" while the body is thinner
 than it, and silently leaves a floor once it is not.
+The DIRECTION is decided from the geometry: FreeCAD's own default points away
+from the solid when the profile sits on the body's start plane, which removes
+0 mm^3, so if the default cuts nothing while the opposite direction removes
+material the opposite is applied and the reply's warnings say so. Pass
+reversed explicitly to decide it yourself; midplane is never touched.
 Attachment fusion: on a face-attached sketch, pocket CUTS the supporting
 solid via attachment — no boolean needed.""",
     "revolution": """\

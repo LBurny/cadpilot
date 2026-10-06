@@ -373,3 +373,60 @@ def test_invalid_shape_error_names_the_object_and_reason():
     assert ".Name" in text, "the object name is what makes the error actionable"
     assert "_status_string" in _names(helper), "FreeCAD's reason must be carried through"
     assert "_invalid_shape_error" in _names(_func(_FEATURE, "create_feature_gui"))
+
+
+def test_pocket_direction_is_decided_from_the_geometry():
+    """FreeCAD's OWN default pocket direction points away from the solid when the
+    profile lies on the body's start plane, and it says nothing: a fresh
+    PartDesign::Pocket with FreeCAD's untouched defaults (profile on the XY
+    plane under a pad spanning z 0..8, Length 5) removed exactly 0 mm^3, while
+    Reversed=True removed the analytic pi*r^2*length (measured natively on
+    1.1.4, reproduced through CADPilot: 10053.0965 -> 9424.7780 mm^3). The GUI
+    user ticks "Reversed" because the dialog shows the result; a caller over MCP
+    got a silent no-op cut, the one outcome a `pocket` can never mean.
+
+    So the builder must probe both directions: forward cuts nothing and reversed
+    removes material means reversed wins, and the reply says so. An explicit
+    `reversed` is the caller's decision and midplane is symmetric, so neither is
+    overridden; when NEITHER direction cuts (a profile outside the solid, a bad
+    attachment) the feature is left as asked for and the existing no-material
+    warning explains it."""
+    helper = ast.unparse(_func(_FEATURE, "_auto_detect_cut_direction"))
+    assert "PartDesign::Pocket" in helper, "only a pocket has a direction to decide"
+    assert "midplane" in helper, "midplane is symmetric, so there is nothing to decide"
+    assert "reversed" in helper, "an explicit reversed must never be overridden"
+    assert "feat.Reversed = True" in helper and "feat.Reversed = False" in helper, (
+        "the probe must try BOTH directions, and put the caller's choice back"
+    )
+    # The decision needs a volume, so it must be taken against the material that
+    # existed BEFORE the feature joined the body.
+    assert "base_vol" in helper
+    # ...and the builder has to call it after the direction properties are set,
+    # with a volume read before the feature exists.
+    built = ast.unparse(_func(_FEATURE, "_build_padlike"))
+    assert "_auto_detect_cut_direction" in built
+    assert built.index("feat.Reversed") < built.index("_auto_detect_cut_direction")
+    assert "_body_material_volume" in built
+    assert built.index("_body_material_volume") < built.index("body.newObject"), (
+        "the material volume must be read before the feature exists"
+    )
+
+
+def test_the_auto_decided_direction_reaches_the_caller():
+    """A geometry fix the caller cannot see is a silent inconsistency between the
+    reply and the model: the auto-decided direction must be reported as a
+    warning, and it must not leak into the NEXT op's reply."""
+    reply = ast.unparse(_func(_FEATURE, "describe_feature_reply"))
+    assert "_take_auto_direction_note" in reply, "the note must reach the reply"
+    build = ast.unparse(_func(_FEATURE, "create_feature_gui"))
+    # ast.unparse renders the empty string with single quotes.
+    assert "_AUTO_DIRECTION_NOTE = ''" in build, (
+        "the note is per-build: a replay also builds features and must not leave"
+        " a note for the next caller's reply"
+    )
+    setter = ast.unparse(_func(_FEATURE, "_auto_detect_cut_direction"))
+    assert "_AUTO_DIRECTION_NOTE" in setter
+    # One epsilon, shared with the no-material warning, so the two cannot
+    # disagree about whether a cut removed anything.
+    assert "_CUT_EPS" in setter
+    assert "_CUT_EPS" in ast.unparse(_func(_FEATURE, "_cut_removed_nothing"))
