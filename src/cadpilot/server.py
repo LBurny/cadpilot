@@ -524,14 +524,19 @@ def diagnose(ctx: Context, host: str | None = None, dismiss: bool = False) -> li
     Reference: operation_help("diagnose").
     """
     # The connection is resolved ONLY for the acting call: a plain diagnose must
-    # not touch FreeCAD (it exists to answer while FreeCAD is down), and
-    # get_freecad_connection() answers None after a failed ping, which the
-    # operation reports as "no connection available to act on".
-    return diagnose_operation(
-        host or state.rpc_host,
-        dismiss=dismiss,
-        freecad=get_freecad_connection() if dismiss else None,
-    )
+    # not touch FreeCAD (it exists to answer while FreeCAD is down). It is also
+    # resolved DEFENSIVELY — get_freecad_connection() RAISES when the endpoint is
+    # down (it does not answer None), and letting that escape would lose the very
+    # report the caller needs exactly when FreeCAD is unreachable. The operation
+    # reports a None connection as "Dismiss: skipped (no connection available to
+    # act on)".
+    connection = None
+    if dismiss:
+        try:
+            connection = get_freecad_connection()
+        except Exception as e:
+            logger.info("diagnose: no connection to dismiss with (%s)", e)
+    return diagnose_operation(host or state.rpc_host, dismiss=dismiss, freecad=connection)
 
 
 @mcp.tool(annotations=_mutating("Save Pattern", destructive=False))

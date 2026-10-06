@@ -429,3 +429,28 @@ def test_diagnose_tool_reaches_the_dismissal_through_the_server_layer(monkeypatc
     assert [m for m, _a, _k in fake.calls].count("dismiss_blocking_dialog") == 1
     assert "Dismiss: closed the blocking dialog" in text
     assert "文档恢复" in text
+
+
+def test_diagnose_with_freecad_down_still_reports_and_skips_the_dismissal(monkeypatch):
+    """get_freecad_connection() RAISES when the endpoint is down, it does not
+    answer None — so resolving it unguarded made diagnose(dismiss=true) throw out
+    of the tool handler exactly when FreeCAD was unreachable, losing the report
+    and closing nothing. The dismissal is a best-effort extra; the report is the
+    point. (The first version of this fix asserted the wrong behaviour in a
+    comment and its test monkeypatched the connection to a working fake, so the
+    down path stayed unexercised.)"""
+    from cadpilot import diagnostics as diag_mod
+    from cadpilot import server
+
+    def down():
+        raise Exception("Failed to connect to FreeCAD. Make sure the FreeCAD addon is running.")
+
+    monkeypatch.setattr(diag_mod, "diagnose", lambda *a, **k: {"reachable": False})
+    monkeypatch.setattr(diag_mod, "format_report", lambda report: "REPORT")
+    monkeypatch.setattr(server, "get_freecad_connection", down)
+
+    text = " ".join(
+        c.text for c in server.diagnose(None, host="127.0.0.1", dismiss=True) if hasattr(c, "text")
+    )
+    assert "REPORT" in text, "the report must survive an unreachable FreeCAD"
+    assert "Dismiss: skipped (no connection available to act on)." in text
