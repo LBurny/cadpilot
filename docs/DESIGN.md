@@ -8,7 +8,7 @@ CADPilot lets an AI client drive FreeCAD: it creates documents, builds constrain
 
 Four goals shape the design.
 
-**Complete control.** Anything a user can do at the FreeCAD window — create and edit objects, sketch, apply features, assemble, measure — the AI should be able to do as well.
+**Complete control.** Anything a user can do at the FreeCAD window, from creating and editing objects to sketching, applying features, assembling, and measuring, the AI should be able to do as well.
 
 **A small context budget.** Every tool definition and every reply consumes tokens in the model's context. CADPilot keeps the tool list small, keeps docstrings short, and returns text by default, so that a long modeling session does not exhaust the context window.
 
@@ -47,7 +47,9 @@ FreeCAD's document tree and GUI are not thread safe: document work must happen o
 
 Each call is placed on a task queue, and the RPC thread blocks waiting for the answer. Every call has its own response queue, so a call that times out can never receive the next call's answer. The main thread is woken by a Qt signal, with a timer as a fallback in case the signal is lost.
 
-The addon defers to interactive use: while a mouse button is held or a dialog is open, queued work is postponed, so an automated change never interrupts a drag in progress. The mouse-button check exists because after a background launch or a remote desktop session, Qt can report a button as pressed when none is, and a program cannot clear that state — so queued work waited forever. The symptom was `ping` answering normally while every real call timed out, indistinguishable from a dropped connection. The deferral now applies only while the main window is genuinely active.
+The addon defers to interactive use: while a mouse button is held, a popup is open, or a modal dialog blocks the main window, queued work is postponed, so an automated change never interrupts a drag or hides behind a dialog. On Windows the physical button state is read directly from the OS in both directions, because Qt's event-delivered state goes stale exactly while the event loop is busy: trusting it alone once let queued tasks start mid-drag, and also made a real hold look free. The old symptom was `ping` answering normally while every real call timed out, indistinguishable from a dropped connection. A task that arrives while a guard is holding the queue reports the reason after a two-second grace period instead of burning its whole timeout in silence.
+
+A modal dialog deserves its own note, because it can hold the queue indefinitely: FreeCAD opens its document-recovery dialog after an unclean shutdown, before any tool can reach the document. The queue states why it is held (readable through the `get_gui_state` RPC and printed by `diagnose` as a GUI queue line), and `diagnose(dismiss=true)` closes the active modal with Cancel semantics, so nothing is ever confirmed. The dismissal rides on `diagnose` rather than being its own tool: the blocker is exactly what the report names, and a plain `diagnose` must not touch FreeCAD at all, since it has to work while FreeCAD is down.
 
 Errors raised inside a queued task are caught, written to FreeCAD's report view, and returned to the caller as an error message; the processing loop is never killed. A shutdown sentinel stops the timer from rescheduling itself, so the server stops cleanly.
 
@@ -66,7 +68,7 @@ Every tool definition is injected into the model's context when the client lists
 
 ### 4.2 Docstring budget
 
-Docstrings are paid for in every conversation, so each `@mcp.tool()` docstring is a one- to three-line summary plus brief argument descriptions. The full reference for each operation lives in `tool_docs.py` and is fetched through `operation_help` when the model actually needs the detail. A test enforces a total budget of 11,000 characters, so the constraint cannot regress unnoticed.
+Docstrings are paid for in every conversation, so each `@mcp.tool()` docstring is a one- to three-line summary plus brief argument descriptions. The full reference for each operation lives in `tool_docs.py` and is fetched through `operation_help` when the model actually needs the detail. A test enforces the budget, 9,000 characters at the current 27 tools with 150 more allowed per added tool, so the constraint cannot regress unnoticed.
 
 ### 4.3 The knowledge hierarchy
 
@@ -80,19 +82,19 @@ Every committed change runs inside a FreeCAD transaction. Two journals sit on to
 
 A session (`session` tool, `start` through `complete`) records each change as a step: the operation, its parameters, the result, the list of objects in the document afterwards, and any notes the model or user attached. The object list is the fingerprint used to detect when the document no longer matches the log.
 
-Rolling back to step N runs `doc.undo()` once per removed step, then truncates the log; no part of the model is deleted or rebuilt. The removed steps sit in a redo buffer until a new step arrives, which mirrors FreeCAD's own redo semantics.
+Rolling back to step N runs `doc.undo()` once per removed step, then truncates the log. The removed steps sit in a redo buffer until a new step arrives, which mirrors FreeCAD's own redo semantics.
 
 Undo is only a guarantee when a step actually owns an undo entry, and a property write alone creates none. A step recorded without a transaction therefore survived rollback, which is how a rollback could once report success while the objects it was asked to drop were still present. Rollback now inspects what the undo stack actually holds and takes one of three paths:
 
-* `native`: every step in range owns a transaction and came off the stack — nothing extra happens.
-* `partial`: some steps own no undo entry — the objects those steps introduced, as recorded by the journal, are removed by name, and the reply lists the step numbers, noting that their property changes cannot be restored.
-* `rebuild`: everything up to the target can be re-created from the journal — the journal-built objects are removed and steps 1..N run again, an exact restore.
+* `native`: every step in range owns a transaction and came off the stack, so nothing extra happens.
+* `partial`: some steps own no undo entry; the objects those steps introduced, as recorded by the journal, are removed by name, and the reply lists the step numbers, noting that their property changes cannot be restored.
+* `rebuild`: everything up to the target can be re-created from the journal, so the journal-built objects are removed and steps 1..N run again, an exact restore.
 
 Every reply states which path was taken and what was removed.
 
 Two details keep those paths honest. First, the undo result is verified, not assumed. The FreeCAD undo stack is shared with the GUI, and a manual edit interleaved on it pops under a rollback's name while the popped count still matches, so a count that looks right can still leave the model in the wrong state. After the undo, the journal compares object sets: whatever the rolled-back steps created must be gone, and whatever the target step should have must be present. Any discrepancy escalates to the rebuild path. Second, what a cleanup removes is decided by per-step before and after diffs, never by subtracting whole snapshots. Every snapshot lists the entire document, so at the target "before the journal" a snapshot subtraction would drag in objects that predate the journal and delete the user's own work. The journal removes only what the journal built.
 
-Every committed change is audited as well: a read-only connectivity check runs after each `cad()` call and reports parts that became disconnected from the rest. The audit only warns — it never blocks — and can be disabled globally or skipped automatically for very large documents.
+Every committed change is audited as well: a read-only connectivity check runs after each `cad()` call and reports parts that became disconnected from the rest. The audit only warns, never blocks, and can be disabled globally or skipped automatically for very large documents.
 
 Sessions and patterns are stored as JSON under `~/.cadpilot/` (or `$CADPILOT_HOME`), written through a temporary file and a rename, so a crash cannot truncate them.
 
@@ -100,13 +102,13 @@ Sessions and patterns are stored as JSON under `~/.cadpilot/` (or `$CADPILOT_HOM
 
 The mechanism is covered separately because it decides whether code-driven modeling can be rolled back at all.
 
-In FreeCAD, changing a property does not create an undo entry by itself; undo entries come from transactions. An AI that models through `execute_code` snippets — a common pattern, since it is the most flexible tool available — produced changes that no rollback could reach, and journal entries that blocked every rollback attempt.
+In FreeCAD, changing a property does not create an undo entry by itself; undo entries come from transactions. An AI that models through `execute_code` snippets, the most flexible tool available and a common choice, produced changes that no rollback could reach, and journal entries that blocked every rollback attempt.
 
 The addon now wraps every snippet in a transaction and reports whether that transaction actually produced an undo entry.
 
 * If the document changed, the run is recorded as an ordinary step that owns exactly one undo entry. The code is kept with the step, so rollback, re-run, and a full replay all work; a model built entirely from snippets replays like one built from declared operations.
 * If nothing changed, the empty commit creates no undo entry, so the run is recorded as read-only: it blocks no rollback and is not re-run.
-* If the snippet raises, the transaction is aborted, so a failed run leaves no partially applied changes — a second defect eliminated by the same mechanism.
+* If the snippet raises, the transaction is aborted, so a failed run leaves no partially applied changes; the same mechanism eliminated that second defect as well.
 
 Transactions do not nest: a snippet that manages its own transaction merges into the wrapper, which opens one only when none is already pending.
 
@@ -114,7 +116,7 @@ Transactions do not nest: a snippet that manages its own transaction merges into
 
 A session disappears when the MCP server exits, and it is invisible to a user working in FreeCAD. The **step journal** is a second log stored on the document itself, in the `MCP_StepJournal` property, so it survives with the RPC server stopped. One engine serves two front ends:
 
-* the `step_control` tool, with these verbs: `run_next`, `run_all`, `run_to`, `rollback_to`, `reexecute` (undo the step, then run it again with merged parameters), `accept` and `unaccept`, `reject`, `update` and `insert`, `replay` (rewind to the start and rebuild everything from the journal), `snapshot`, `reset`;
+* the `step_control` tool, with these verbs: `run_next`, `run_all`, `run_to`, `rollback_to`, `reexecute` (undo the step, then run it again with merged parameters), `accept` and `unaccept`, `reject`, `update` and `insert`, `replay` (rewind to the start and rebuild everything from the journal), `snapshot`, `clear_plan`, `reset`;
 * the **Steps panel**, a dock inside FreeCAD with the step list, a progress bar, an editable parameter view, and a log console. It works with the MCP server down, including opening a saved document later and replaying how it was built.
 
 Several rules keep this loop safe:
@@ -142,7 +144,9 @@ Further details:
 
 * `external` geometry may only reference start and end points of other objects' edges and vertices, because referencing a midpoint fails at solve time; that case is rejected up front with a clear message. Targets outside the sketch's body are bridged automatically with a `PartDesign::SubShapeBinder`, since PartDesign rejects external geometry from outside the body.
 * A datum plane attaches to an origin plane or to an existing face, and sketches can attach to a datum plane.
-* **Attach a sketch by direction, not by face name.** `plane={"face": [obj, "+Z"]}` (also `-Z`, `+X`, `-X`, `+Y`, `-Y`, or the words top, bottom, left, right, front, back) selects the planar face whose normal points that way, the outermost one when several qualify. FreeCAD re-derives face names after every feature, so `Face5` on one feature can denote a different face on the next; attaching by name can land the sketch on a side wall, and the pocket then removes nothing while still reporting success. As a backstop, a pocket or groove that removes no material returns a warning.
+* **Attach a sketch by direction, not by face name.** `plane={"face": [obj, "+Z"]}` (also `-Z`, `+X`, `-X`, `+Y`, `-Y`, or the words top, bottom, left, right, front, back) selects the planar face whose normal points that way, the outermost one when several qualify. FreeCAD re-derives face names after every feature, so `Face5` on one feature can denote a different face on the next; attaching by name can land the sketch on a side wall, and the pocket then removes nothing while still reporting success. As a backstop, a pocket that removes no material returns a warning; when the forward direction provably removes nothing and the reversed direction cuts material, the reversed direction is applied automatically and the reply names the volume it removed (an explicit `reversed` is never overridden).
+* **An attachment never names a Body.** A sketch attached to `plane={"face": ["Body", "+Z"]}` would close a dependency cycle, because the Body's shape is its tip feature's result; the reference is silently rewritten to that tip, which carries the same faces under the same names.
+* **A parametric feature mode is never replaced by a number.** Pad and pocket accept `through_all`, which sets FreeCAD's own `ThroughAll` type instead of a stand-in numeric length, so a through hole stays a through hole when the body later gets thicker.
 * **Patterns repeat a feature, not the body.** On a PartDesign feature, `pattern` creates a `PartDesign::PolarPattern` or `LinearPattern` inside the same body with the feature as its original, repeating that hole or rib across the part. For part-level objects (a boolean result, a primitive), a Draft array replicates the object itself. FreeCAD 1.1 cannot be driven reliably into a working PartDesign pattern from Python, so when the transform has no visible effect the operation raises, rather than returning a part with one hole where six were requested.
 * **Attachment fusion.** A pad or pocket whose sketch sits on a solid's face acts on that solid directly: the pocket cuts it, the pad fuses into it. Applying a pad and then a boolean cut would be wrong here.
 * `hull` builds a visual hull from two or three view-profile sketches extruded along their normals and intersected. The result is a plain `Part::Feature` that survives reload, and running it again with the same name replaces the shape in place so it can be iterated.
@@ -152,7 +156,7 @@ Further details:
 
 `measure_geometry`, `get_topology`, `check_interference`, and `get_positioning_info` are read-only queries over the shapes, dispatched to the GUI thread without a transaction.
 
-Coordinates come back in global space: a shape's stored geometry already includes its placement, so no additional transform is applied (an early double-transform bug made this rule explicit). Topology listings are sorted by size and paginated, and each face and edge carries its type, center, normal, radius, or axis where relevant — the information the model needs to choose edges for a fillet or faces for a sketch. Numbers are rounded to four significant digits at the reporting boundary only; the math that positions parts uses full precision.
+Coordinates come back in global space. Most objects carry the placement inside their stored geometry; a PartDesign feature's shape is body-local, so the query adds the owning body's global placement (an early double-transform bug and its opposite made this rule explicit). Topology listings are sorted by size and paginated, and each face and edge carries its type, center, normal, radius, or axis where relevant; this is the information the model needs to choose edges for a fillet or faces for a sketch. Numbers are rounded to six significant digits at the reporting boundary only, because coarser rounding once made a caller's own delta the same order as the rounding itself; the math that positions parts uses full precision.
 
 ## 8. Positioning parts: anchors and assembly
 
@@ -160,7 +164,7 @@ Relative placement of parts is the hardest problem in AI-driven CAD. CADPilot ad
 
 **Anchors** name points and directions on an object. Some are derived automatically (the bounding-box center and corners, the center of mass, the axis of the dominant cylindrical face, the centers of the largest planar faces), and the model or user can define more. Explicit anchors are stored on the object in local coordinates, so they follow it when it moves.
 
-**`assemble`** takes a list of mates, each naming an object, an anchor, a target and a target anchor, plus a mode (`center`, `touch`, or `axis`) and an optional offset. All mates are applied in one transaction, then each anchor is resolved again at its new position to report the residual distance and angle per mate. If any mate exceeds its tolerance, the whole operation aborts.
+**`assemble`** takes a list of mates, each naming an object, an anchor, a target and a target anchor, plus a mode (`center`, `touch`, or `axis`) and an optional offset. All mates are applied in one transaction, in order, so a later mate sees the moves of the earlier ones; each anchor is then resolved again at its new position to report the residual distance and angle per mate. A mate whose residual exceeds its tolerance fails; the mates that already passed stay applied, and nothing moves only when the first mate is the one that fails.
 
 **`align_shapes`** is the single-element version: it aligns one face, edge, or vertex of an object with a target element.
 
@@ -173,8 +177,8 @@ Relative placement of parts is the hardest problem in AI-driven CAD. CADPilot ad
 Several rules keep it reliable, all verified against a live FreeCAD:
 
 * The solver's preparation pass must run before the final solve; repeated solve passes corrupt the solver's stored state.
-* A component's shape is in global coordinates while joint references are in the part's local frame, so residuals are measured geometrically — distance between faces, angle between normals — never through the joint coordinate system's own math.
-* A mate can name a face, an anchor, or a point; when it names a face, the nearest vertex decides where the mate lands, matching what a GUI click selects.
+* A component's shape is in global coordinates while joint references are in the part's local frame, so residuals are measured geometrically (distance between faces, angle between normals), never through the joint coordinate system's own math.
+* A mate can name a face, an anchor, or a point. Where the joint lands follows FreeCAD's own click rules: a plain face reference lands at the face center, a cylindrical face lands on its axis, and an explicit point hint lands on the closest selectable point. The result reports where each joint actually landed and warns when a reference snapped far from where it aimed.
 * `trim={"winner": ...}` performs a declarative priority trim: a non-destructive cut baked into the losing part's local frame, with the link re-pointed at the result. Every step precomputes what undoing it would take, so a rollback is a single merged request executed atomically.
 * The MCP side validates the addon's result before recording anything, so a failed request never leaves a half-mutated session.
 
@@ -198,14 +202,14 @@ The RPC server listens on localhost by default. Remote access is an explicit opt
 * **Forward and backward compatibility.** A new client falls back to older addon behavior, and an old client keeps working against a newer addon.
 * **Names are normalized.** FreeCAD rewrites object names (spaces become underscores, duplicates get numbered), so every handler returns the name FreeCAD actually chose.
 * **Version differences are probed.** Where FreeCAD 1.1 and older releases store the same setting differently, the addon checks at runtime which layout applies.
-* **Hot reload.** During development the addon can be reloaded without restarting FreeCAD, with a documented repair path for the rare race between server shutdown and startup.
-* **Diagnosis without a live FreeCAD.** The `diagnose` tool runs entirely on the MCP side and never imports FreeCAD, so it still answers when FreeCAD is not running or is stuck. It reports the RPC endpoint, the FreeCAD process, the installed addon across every FreeCAD user directory, and the addon's bootstrap log, then ends with a concrete suggestion. Its most useful verdict: a port that is listening but does not answer a ping means the GUI thread is stuck, not that anything is misconfigured.
+* **Hot reload.** During development the addon can be reloaded without restarting FreeCAD; a watchdog revives the RPC endpoint automatically whenever it is down but wanted, and the documented restart recipe reloads every addon module in dependency order.
+* **Diagnosis without a live FreeCAD.** The `diagnose` tool runs entirely on the MCP side and never imports FreeCAD, so it still answers when FreeCAD is not running or is stuck. It reports the RPC endpoint, the FreeCAD process, the installed addon across every FreeCAD user directory, the addon's bootstrap log, and the state of the GUI queue, then ends with a concrete suggestion. Its most useful verdict: a port that is listening but does not answer a ping means the GUI thread is stuck, not that anything is misconfigured. Passing `dismiss=true` also closes a modal dialog that is holding the queue, with Cancel semantics.
 * **The addon log stays readable while the GUI is stuck**, because its handler deliberately bypasses the GUI thread. It is a small ring buffer plus a log file on disk, and each record is tagged with the request that caused it.
 * **The bootstrap trap.** FreeCAD runs an addon's `InitGui.py` with `exec()`, which leaves functions defined in that file unable to see names imported at its top level. Any name the startup code needs is therefore imported inside the startup function itself. A crash there is written to a log file whose location `diagnose` knows how to find.
 
 ## 13. Testing
 
-The pytest suite — about 325 tests — covers the MCP server against a fake XML-RPC connection that records every call: response shaping, screenshot policy, reconnect behavior, the session and pattern state machines, the `cad()` dispatcher, the assembly state machine including its failure paths, guidance heuristics, and the docstring budget.
+The pytest suite, about 600 tests, covers the MCP server against a fake XML-RPC connection that records every call: response shaping, screenshot policy, reconnect behavior, the session and pattern state machines, the `cad()` dispatcher, the assembly state machine including its failure paths, guidance heuristics, the docstring budget, and the tool-surface metadata such as annotations and pagination envelopes.
 
 The addon cannot be imported without FreeCAD, so a second layer of tests parses its source with Python's `ast` module and pins contracts that would otherwise fail silently at runtime: the namespace rule in `InitGui.py`, the signal wiring of the steps panel, the two spellings of batch sub-operation names, and the skip behavior of a replay. The diagnostics suite covers the per-platform path layouts, a live local endpoint, a closed port, and every verdict the tool can reach.
 

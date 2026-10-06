@@ -120,12 +120,14 @@ Tool responses are text-only; the `get_view` tool captures a view screenshot on 
 * `--host <ip>`: connect to a FreeCAD instance on another machine
 * `--no-auto-audit`: skip the connectivity audit after each mutation (for very large models)
 
+Flags are appended to the args list, for example:
+
 ```json
 {
   "mcpServers": {
     "cadpilot": {
       "command": "uvx",
-      "args": ["cadpilot"]
+      "args": ["cadpilot", "--only-text-feedback"]
     }
   }
 }
@@ -144,13 +146,14 @@ Something not talking? Ask the AI to run the **`diagnose`** tool. It checks the 
 
 1. Addon changes load only at startup, so **restart FreeCAD** after installing or updating the addon.
 2. The MCP tool list is built at startup, so **restart the MCP client** after changing the server config or version.
+3. If every document call times out while `ping` still answers, a modal dialog (typically FreeCAD's document-recovery dialog after an unclean shutdown) is holding the queue; `diagnose(dismiss=true)` closes it with Cancel semantics.
 
 ## Tools
 
 * **`cad`** is the unified CAD mutation tool: `create_object` / `edit_object` / `delete_object` / `batch`, parametric feature ops (`boolean` / `fillet` / `chamfer` / `loft` / `sweep` / `mirror` / `pattern` / `move`), appearance (`color`: shape color, transparency, line and display settings, for one object or the whole document), Sketcher/PartDesign ops (`variables` / `sketch` / `pad` / `pocket` / `revolution` / `groove` / `thickness` / `draft` / `datum_plane` / `hull`). Edge/face selectors are fed by `get_topology`; every mutation is transactional and rollback-able.
 * **`execute_code` / `execute_code_async` / `get_task_result`** run arbitrary Python in FreeCAD (GUI-thread safe), or background-safe code for long OCCT computations with polling. A run that changes the document is transactional, so it rolls back and replays like any other step; a failing snippet is rolled back cleanly.
 * **Modeling sessions**: `session` (actions `start` / `status` / `get_steps` / `rollback` / `redo` / `add_note` / `pause` / `resume` / `list` / `complete`): step recording with rollback via FreeCAD's native transaction undo.
-* **Step journal**: `step_control` drives the FreeCAD-side review loop shared with the Steps panel: `run_next` / `run_all` / `rollback_to` / `reexecute` / `accept` / `reject` / `update` / `insert` / `replay` / `snapshot`. The journal lives on the document itself, so the panel works even with the RPC server stopped.
+* **Step planning & journal**: `step_plan` submits a modeling plan to the FreeCAD-side journal without executing it; `step_control` drives the review loop shared with the Steps panel: `run_next` / `run_all` / `run_to` / `rollback_to` / `reexecute` / `accept` / `reject` / `update` / `insert` / `replay` / `snapshot` / `clear_plan` / `reset`. The journal lives on the document itself, so the panel works even with the RPC server stopped.
 * **Knowledge hierarchy**: `save_pattern` / `recall_patterns` (reusable workflow memory), `inspect_freecad` (runtime API introspection), `operation_help` (per-operation reference docs).
 * **Geometry sensing**: `measure_geometry` / `get_topology` / `check_interference` / `get_positioning_info`: quantitative feedback after each modeling step.
 * **Assembly**: `get_anchors` / `set_anchors` / `assemble` / `align_shapes` / `verify_assembly` for data-driven spatial positioning; `assembly_session` for mate-based assembly with persistent joints (FreeCAD 1.1 Assembly workbench) and declarative priority trimming.
