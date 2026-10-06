@@ -309,7 +309,14 @@ def setup_logging(
 
         req_filter = _RequestIdFilter()
 
-        _ring = RingBufferHandler(ring_size or settings_ring or DEFAULT_RING_SIZE)
+        try:
+            effective_ring = int(ring_size or settings_ring or DEFAULT_RING_SIZE)
+        except (TypeError, ValueError):
+            # setup_logging must never raise: a corrupt (hand-edited) settings
+            # value used to kill setup_logging, and get_logger runs at request_log
+            # IMPORT time, so the whole addon never came up.
+            effective_ring = DEFAULT_RING_SIZE
+        _ring = RingBufferHandler(effective_ring)
         _ring.addFilter(req_filter)
         logger.addHandler(_ring)
 

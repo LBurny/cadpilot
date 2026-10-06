@@ -84,6 +84,7 @@ App = FreeCAD
 _async_tasks: dict[str, dict] = {}
 _async_tasks_lock = threading.Lock()
 _ASYNC_TASKS_MAX = 50
+_ASYNC_OUTPUT_MAX = 64 * 1024  # task_print keeps at most this many characters
 
 # Why the last get_active_screenshot returned None. get_view cannot say in its
 # return value (it is base64-or-None on the wire, and an old MCP server would
@@ -879,21 +880,31 @@ class FreeCADRPC:
             return res
         return _err(res)
 
+
+    @staticmethod
+    def _gui_result(res):
+        """dispatch_to_gui returns a bare exception string when the task dies;
+        the MCP contract is a dict with success/error (a quoted string made a
+        read-only failure read as a JSON text payload, not an error)."""
+        if isinstance(res, dict):
+            return res
+        return {"success": False, "error": str(res)}
+
     # --- read-only geometry sensing ------------------------------------------
 
     def measure_geometry(self, doc_name, obj_name):
-        return dispatch_to_gui(lambda: _measure_geometry(doc_name, obj_name))
+        return self._gui_result(dispatch_to_gui(lambda: _measure_geometry(doc_name, obj_name)))
 
     def get_topology(self, doc_name, obj_name, element="faces", limit=50, offset=0):
-        return dispatch_to_gui(lambda: _get_topology(doc_name, obj_name, element, limit, offset))
+        return self._gui_result(dispatch_to_gui(lambda: _get_topology(doc_name, obj_name, element, limit, offset)))
 
     def check_interference(self, doc_name, obj_a, obj_b):
-        return dispatch_to_gui(lambda: _check_interference(doc_name, obj_a, obj_b))
+        return self._gui_result(dispatch_to_gui(lambda: _check_interference(doc_name, obj_a, obj_b)))
 
     def get_positioning_info(self, doc_name, obj_name, element, element_index):
         """Return detailed global-coordinate spatial info for a specific face/edge/vertex."""
-        return dispatch_to_gui(
-            lambda: _get_positioning_info(doc_name, obj_name, element, element_index)
+        return self._gui_result(
+            dispatch_to_gui(lambda: _get_positioning_info(doc_name, obj_name, element, element_index))
         )
 
     def align_shapes(
@@ -1099,6 +1110,12 @@ class FreeCADRPC:
                 entry = _async_tasks.get(task_id)
                 if entry is not None:
                     entry["output"] += sep.join(str(a) for a in args) + end
+                    if len(entry["output"]) > _ASYNC_OUTPUT_MAX:
+                        # A chatty background task used to grow memory without
+                        # bound and dump the whole blob into get_task_result;
+                        # keep the TAIL (the newest output) plus a marker.
+                        marker = f"[output truncated, kept the last {_ASYNC_OUTPUT_MAX // 1024} KB]\n"
+                        entry["output"] = marker + entry["output"][-_ASYNC_OUTPUT_MAX:]
 
         def _set_status(msg):
             dispatch_to_gui(lambda: FreeCADGui.getMainWindow().statusBar().showMessage(msg))

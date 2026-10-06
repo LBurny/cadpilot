@@ -99,12 +99,33 @@ def test_step_control_defaults_params_to_empty_dict(fake_freecad):
 
 def test_step_control_forwards_review_actions(fake_freecad):
     """accept/reject/update/insert/replay ride the same spec channel."""
-    for action in ("accept", "reject", "update", "insert", "replay"):
+    for action in ("accept", "reject", "update", "replay"):
         step_control_operation(fake_freecad, "Doc", action, index=2, params={"reason": "bad"})
         spec = fake_freecad.calls[-1][1][1]
         assert spec["operation"] == action
         assert spec["index"] == 2
         assert spec["params"] == {"reason": "bad"}
+
+
+def test_step_control_insert_requires_an_operation_per_step(fake_freecad):
+    """insert used to forward an operation-less step, which build_record turned
+    into a record that run_next then marked DONE as "skipped: not
+    re-executable" — a planned step that could never run, reported as
+    executed. It is refused at the boundary, like step_plan does."""
+    resp = step_control_operation(fake_freecad, "Doc", "insert", index=2, params={"reason": "bad"})
+    assert "carry no operation" in _text(resp)
+    assert all(c[0] != "journal_op" for c in fake_freecad.calls[-1:])
+
+    step_control_operation(
+        fake_freecad,
+        "Doc",
+        "insert",
+        index=2,
+        params={"steps": [{"operation": "pad", "obj_name": "Profile"}]},
+    )
+    spec = fake_freecad.calls[-1][1][1]
+    assert spec["operation"] == "insert"
+    assert spec["steps"] == [{"operation": "pad", "obj_name": "Profile"}]
 
 
 def test_step_control_unknown_action_lists_review_verbs(fake_freecad):

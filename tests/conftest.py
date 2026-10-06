@@ -119,6 +119,7 @@ class FakeFreeCADConnection:
             "success": True,
             "object_name": obj_data.get("Name", "New_Object"),
             "transaction": True,
+            "undoable": True,
             "objects": self._doc_objects(doc_name),
         }
         if screenshot is not None:
@@ -131,6 +132,7 @@ class FakeFreeCADConnection:
             "success": True,
             "object_name": obj_name,
             "transaction": True,
+            "undoable": True,
             "objects": self._doc_objects(doc_name),
         }
         if screenshot is not None:
@@ -143,6 +145,7 @@ class FakeFreeCADConnection:
             "success": True,
             "object_name": obj_name,
             "transaction": True,
+            "undoable": True,
             "objects": self._doc_objects(doc_name),
         }
         if screenshot is not None:
@@ -155,6 +158,7 @@ class FakeFreeCADConnection:
             "success": True,
             "object_name": spec.get("name") or spec["type"].capitalize(),
             "transaction": True,
+            "undoable": True,
             "objects": self._doc_objects(doc_name),
         }
         if screenshot is not None:
@@ -179,7 +183,20 @@ class FakeFreeCADConnection:
     def execute_code(self, code, screenshot=None, doc_name=None):
         self._record("execute_code", code, screenshot=screenshot, doc_name=doc_name)
         res = self._result(
-            "execute_code", {"success": True, "message": "Python code executed successfully."}
+            "execute_code",
+            {
+                "success": True,
+                "message": "Python code executed successfully.",
+                # The current addon shape (rpc_server.execute_code): the MCP
+                # layer reads these to decide atomic recording and the
+                # foreign-document warning. The old one-key shape made the
+                # whole recording branch dead under the default fake.
+                "changed": False,
+                "document": doc_name,
+                "objects": [],
+                "attributed": True,
+                "foreign_changes": [],
+            },
         )
         if screenshot is not None:
             res["screenshot"] = self.SCREENSHOT
@@ -240,6 +257,7 @@ class FakeFreeCADConnection:
             "success": True,
             "results": [{"success": True, "action": op.get("action")} for op in ops],
             "transaction": True,
+            "undoable": True,
             "objects": self._doc_objects(doc_name),
         }
         if screenshot is not None:
@@ -256,7 +274,14 @@ class FakeFreeCADConnection:
         count = self.undo_count if self.undo_count is not None else n
         return self._result(
             "undo_transactions",
-            {"success": True, "count": count, "objects": self._doc_objects(doc_name)},
+            {
+                "success": True,
+                "count": count,
+                "ghosts_skipped": 0,
+                "stack_before": [],
+                "stack_after": [],
+                "objects": self._doc_objects(doc_name),
+            },
         )
 
     def redo_transactions(self, doc_name, n=1, trust_journal=False):
@@ -266,7 +291,14 @@ class FakeFreeCADConnection:
             self._record("redo_transactions", doc_name, n)
         return self._result(
             "redo_transactions",
-            {"success": True, "count": n, "objects": self._doc_objects(doc_name)},
+            {
+                "success": True,
+                "count": n,
+                "ghosts_skipped": 0,
+                "stack_before": [],
+                "stack_after": [],
+                "objects": self._doc_objects(doc_name),
+            },
         )
 
     def save_document(self, doc_name, path=None):
@@ -352,6 +384,7 @@ class FakeFreeCADConnection:
                 "center_of_mass": [5.0, 5.0, 5.0],
                 "bbox": {"xmin": 0, "ymin": 0, "zmin": 0, "xmax": 10, "ymax": 10, "zmax": 10},
                 "counts": {"solids": 1, "shells": 1, "faces": 6, "edges": 12, "vertices": 8},
+                "placement": {"base": [0, 0, 0], "rotation": {"axis": [0, 0, 1], "angle_deg": 0}},
             },
         )
 
@@ -467,6 +500,7 @@ class FakeFreeCADConnection:
             "obj_name": obj_name,
             "anchor_count": len(anchors),
             "transaction": True,
+            "undoable": True,
             "objects": self._doc_objects(doc_name),
         }
         if screenshot is not None:
@@ -484,6 +518,7 @@ class FakeFreeCADConnection:
                 for m in mates
             ],
             "transaction": True,
+            "undoable": True,
             "objects": self._doc_objects(doc_name),
         }
         if screenshot is not None:
@@ -514,7 +549,14 @@ class FakeFreeCADConnection:
                 ]
                 if checks
                 else [],
-                "summary": {"floating_count": 0, "interference_count": 0, "checks_failed": 0},
+                "islands": [],
+                "summary": {
+                    "floating_count": 0,
+                    "interference_count": 0,
+                    "checks_failed": 0,
+                    "island_count": 0,
+                    "component_count": 1,
+                },
             },
         )
 

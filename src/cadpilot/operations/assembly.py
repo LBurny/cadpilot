@@ -75,6 +75,23 @@ def _rpc_error(res: Any, operation: str) -> ToolResponse | None:
     return None
 
 
+def _assembly_rpc(conn, doc_name: str, spec: dict) -> Any:
+    """One assembly_op call, failures kept inside the result.
+
+    A transport-level exception (including the client's lost-response error
+    that tells the caller to inspect before repeating) used to escape the tool
+    as a protocol-level error, discarding exactly the guidance the caller
+    needs; a non-dict result would AttributeError in _rpc_error.
+    """
+    try:
+        res = conn.assembly_op(doc_name, spec)
+    except Exception as e:
+        return {"success": False, "error": f"{type(e).__name__}: {e}"}
+    if isinstance(res, dict):
+        return res
+    return {"success": False, "error": f"addon returned a non-dict result: {res!r}"}
+
+
 def _session_doc_mismatch(session: astate.AssemblySession, doc_name: str | None) -> str:
     """Refuse an op aimed at a DIFFERENT document than the active session's.
 
@@ -114,7 +131,7 @@ def assembly_session_operation(
             return text_response("start requires doc_name and part (the ground part)")
         replaced = astate.current_session()
         spec = {"operation": "start", "ground": part, "name": name or ""}
-        res = conn.assembly_op(doc_name, spec)
+        res = _assembly_rpc(conn, doc_name, spec)
         if (err := _rpc_error(res, "start")) is not None:
             return err
         session = astate.start_session(doc_name, part, name or "")
@@ -166,7 +183,7 @@ def assembly_session_operation(
             return text_response("add_component requires part")
         if part in session.components:
             return text_response(f"{part} is already a component")
-        res = conn.assembly_op(session.doc_name, {"operation": "add_component", "part": part})
+        res = _assembly_rpc(conn, session.doc_name, {"operation": "add_component", "part": part})
         if (err := _rpc_error(res, "add_component")) is not None:
             return err
         st = astate.record_step(
@@ -196,7 +213,7 @@ def assembly_session_operation(
             if trim.get("winner") not in ("inserted", "base"):
                 return text_response("trim.winner must be 'inserted' or 'base'")
             spec["trim"] = trim
-        res = conn.assembly_op(session.doc_name, spec)
+        res = _assembly_rpc(conn, session.doc_name, spec)
         if (err := _rpc_error(res, "mate")) is not None:
             return err
         undo = _undo(joints_to_delete=[res["joint"]])
@@ -229,12 +246,12 @@ def assembly_session_operation(
         return json_response(res)
 
     if operation == "solve":
-        return json_response(conn.assembly_op(session.doc_name, {"operation": "solve"}))
+        return json_response(_assembly_rpc(conn, session.doc_name, {"operation": "solve"}))
 
     if operation == "unmate":
         if not joint:
             return text_response("unmate requires a joint name")
-        res = conn.assembly_op(session.doc_name, {"operation": "unmate", "joint": joint})
+        res = _assembly_rpc(conn, session.doc_name, {"operation": "unmate", "joint": joint})
         if (err := _rpc_error(res, "unmate")) is not None:
             return err
         session.joints = [j for j in session.joints if j["name"] != joint]
@@ -253,7 +270,7 @@ def assembly_session_operation(
         if to_step is None:
             return text_response("rollback requires to_step")
         spec = astate.plan_rollback(session, to_step)
-        res = conn.assembly_op(session.doc_name, spec)
+        res = _assembly_rpc(conn, session.doc_name, spec)
         if (err := _rpc_error(res, "rollback")) is not None:
             return err
         astate.truncate_after_rollback(session, to_step)
@@ -261,7 +278,9 @@ def assembly_session_operation(
 
     if operation == "verify":
         return json_response(
-            conn.assembly_op(session.doc_name, {"operation": "verify", "gap_samples": gap_samples})
+            _assembly_rpc(
+                conn, session.doc_name, {"operation": "verify", "gap_samples": gap_samples}
+            )
         )
 
     if operation == "status":

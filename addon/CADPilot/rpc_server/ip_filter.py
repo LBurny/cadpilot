@@ -45,6 +45,10 @@ def validate_allowed_ips(allowed_ips_str):
     """
     errors = []
 
+    if not isinstance(allowed_ips_str, str):
+        # A corrupted settings file can hold any JSON type; the server used to
+        # raise AttributeError here on every start, forever (watchdog retries).
+        allowed_ips_str = "" if allowed_ips_str is None else str(allowed_ips_str)
     if not allowed_ips_str or not allowed_ips_str.strip():
         return [], ["Input must not be empty."]
 

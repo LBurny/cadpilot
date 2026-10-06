@@ -438,6 +438,11 @@ def probe_gui_state(host: str, port: int, timeout: float = PROBE_TIMEOUT) -> dic
         return {"available": False, "error": f"{type(e).__name__}: {e}"}
     if not isinstance(state, dict):
         return {"available": False, "error": f"unexpected reply: {state!r}"}
+    if state.get("success") is False:
+        # The addon answers a failed backpressure probe with
+        # {"success": False, "error": ...}; spreading it under
+        # {"available": True} reported the probe as fine and hid the error.
+        return {"available": False, "error": state.get("error", "get_gui_state failed")}
     return {"available": True, **state}
 
 

@@ -33,13 +33,12 @@ state-bound calls their document explicitly:
   whenever the target differs.
 - get_view: pass doc_name. The default frames the foreground tab, which the
   other agent may have switched, so the screenshot shows the wrong model.
-- cad / get_objects / get_object / measure_geometry / get_topology /
-  set_anchors / assemble / align_shapes / verify_assembly / step_control /
-  session_*: already take doc_name — always pass it, never rely on the
-  active document.
+- cad / get_objects / measure_geometry / get_topology / set_anchors /
+  assemble / align_shapes / verify_assembly / step_control / session:
+  already take doc_name — always pass it, never rely on the active document.
 
-Screenshots attached to mutations (cad with_screenshot, get_objects, ...)
-frame the mutation's own document.
+Screenshots: get_view is the ONLY capture tool (pass doc_name); no mutation
+attaches a screenshot anymore.
 
 Hard isolation (two agents that must never see each other, separate undo
 stacks) still means two FreeCAD instances on different ports; a shared
@@ -694,8 +693,11 @@ Actions:
   get_steps   full step records + notes + redo buffer
   rollback    undo everything after to_step (keep 1..to_step; 0 = undo all).
               to_step is REQUIRED so a bare call cannot wipe the session.
-              force=true rolls back across non-atomic steps (risky: undo may
-              revert the wrong change). Removed steps sit in a redo buffer.
+              Non-atomic steps (a same-value edit, a read-only step) provably
+              committed nothing: they neither block the rollback nor consume
+              an undo. force=true instead lets undo pop transactions CADPilot
+              did not create (a manual GUI edit sitting on the stack). Removed
+              steps sit in a redo buffer.
               success=false means the model did NOT reach the target state
               (the undo came up short or the object set does not match);
               warnings say what was left behind.

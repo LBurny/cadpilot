@@ -137,6 +137,10 @@ def save_active_screenshot(
         # The resolved object we frame on (when focus_object is given), kept so
         # the framing can be re-applied synchronously right before saveImage().
         focus_target = None
+        # The user's (or another agent's) selection is process-global GUI
+        # state; the focus path used to clearSelection() it away and leave
+        # nothing behind. Save it and hand it back after the capture.
+        prior_selection = list(FreeCADGui.Selection.getSelection())
 
         if focus_object:
             obj = doc.getObject(focus_object) if doc else None
@@ -162,7 +166,11 @@ def save_active_screenshot(
         if focused_selection and focus_target is not None:
             FreeCADGui.Selection.addSelection(focus_target)
             _send_viewselection(gdoc)
+            # Hand the selection back: restore what was selected before the
+            # capture (the focus target included, if the caller had it).
             FreeCADGui.Selection.clearSelection()
+            for sel in prior_selection:
+                FreeCADGui.Selection.addSelection(sel)
         else:
             view.fitAll()
         resolved_width, resolved_height = _resolve_screenshot_size(view, width, height)

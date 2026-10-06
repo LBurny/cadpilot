@@ -50,6 +50,11 @@ def sessions_dir() -> Path:
 
 _last_now: datetime | None = None
 _now_lock = threading.Lock()
+# Serializes ModelingSession mutations: FastMCP runs handlers on a thread
+# pool, and two concurrent cad() calls into one session used to
+# read-modify-write steps unguarded (duplicate step numbers break
+# rollback's atomic-count arithmetic).
+_session_lock = threading.Lock()
 
 
 def _now() -> str:
@@ -130,39 +135,42 @@ class ModelingSession:
         objects_after: list[str] | None = None,
         atomic: bool = True,
     ) -> Step:
-        # A new committed transaction invalidates FreeCAD's redo stack too.
-        self.redo_buffer.clear()
-        step = Step(
-            step_number=len(self.steps) + 1,
-            operation=operation,
-            description=description,
-            params_summary=params_summary,
-            result_summary=result_summary,
-            objects_after=sorted(objects_after or []),
-            atomic=atomic,
-        )
-        self.steps.append(step)
-        self.updated_at = _now()
-        return step
+        with _session_lock:
+            # A new committed transaction invalidates FreeCAD's redo stack too.
+            self.redo_buffer.clear()
+            step = Step(
+                step_number=len(self.steps) + 1,
+                operation=operation,
+                description=description,
+                params_summary=params_summary,
+                result_summary=result_summary,
+                objects_after=sorted(objects_after or []),
+                atomic=atomic,
+            )
+            self.steps.append(step)
+            self.updated_at = _now()
+            return step
 
     def add_note(self, note: str, note_type: str = "observation") -> dict[str, Any]:
-        entry = {
-            "after_step": len(self.steps),
-            "note": note,
-            "note_type": note_type,
-            "timestamp": _now(),
-        }
-        self.notes.append(entry)
-        self.updated_at = _now()
-        return entry
+        with _session_lock:
+            entry = {
+                "after_step": len(self.steps),
+                "note": note,
+                "note_type": note_type,
+                "timestamp": _now(),
+            }
+            self.notes.append(entry)
+            self.updated_at = _now()
+            return entry
 
     def truncate_to(self, step_number: int) -> list[Step]:
         """Move steps after ``step_number`` into the redo buffer; returns them."""
-        removed = self.steps[step_number:]
-        self.redo_buffer = list(removed)
-        self.steps = self.steps[:step_number]
-        self.updated_at = _now()
-        return removed
+        with _session_lock:
+            removed = self.steps[step_number:]
+            self.redo_buffer = list(removed)
+            self.steps = self.steps[:step_number]
+            self.updated_at = _now()
+            return removed
 
     def restore_steps(self, n: int) -> list[Step]:
         """Pop n steps from the redo buffer back onto the log (after a redo).
@@ -174,15 +182,16 @@ class ModelingSession:
         entry. Such entries are dropped as they surface.
         """
         restored: list[Step] = []
-        while len(restored) < n and self.redo_buffer:
-            step = self.redo_buffer.pop(0)
-            if not step.atomic:
-                continue
-            step.step_number = len(self.steps) + 1
-            self.steps.append(step)
-            restored.append(step)
-        self.updated_at = _now()
-        return restored
+        with _session_lock:
+            while len(restored) < n and self.redo_buffer:
+                step = self.redo_buffer.pop(0)
+                if not step.atomic:
+                    continue
+                step.step_number = len(self.steps) + 1
+                self.steps.append(step)
+                restored.append(step)
+            self.updated_at = _now()
+            return restored
 
     # --- serialization ------------------------------------------------------
 

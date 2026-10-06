@@ -449,7 +449,9 @@ _ISLAND_OBJECTS_PREVIEW = 4
 # the whole document's object-name fingerprint (hundreds of names on a real
 # model), `screenshot` may still arrive from an old addon's mutation reply, and
 # success/object_name are already spelled out in the summary text.
-_RESULT_BOOKKEEPING = frozenset({"success", "object_name", "screenshot", "objects", "transaction"})
+_RESULT_BOOKKEEPING = frozenset(
+    {"success", "object_name", "screenshot", "objects", "transaction", "undoable"}
+)
 
 
 def _format_feature_warnings(warnings: list[Any]) -> str:
@@ -1217,6 +1219,21 @@ def step_control_operation(
                 "insert requires steps as a list of step dicts — pass params as a single "
                 "step dict, or params={'steps': […]} for several"
             )
+        opless = [
+            i
+            for i, s in enumerate(steps)
+            if not isinstance(s.get("operation"), str) or not s["operation"]
+        ]
+        if opless:
+            # step_plan validates the same thing; insert used not to, and the
+            # addon happily built a record with operation="" that run_next
+            # then marked DONE as "skipped: not re-executable" — a planned
+            # step that could never run, reported as executed.
+            return text_response(
+                f"insert: steps {opless} carry no operation. Each step dict needs "
+                "'operation' (one of the journal ops, e.g. 'pad', 'create_object', "
+                "'execute_code' with its 'code')"
+            )
         spec["steps"] = steps
     try:
         res = freecad.journal_op(doc_name, spec)
@@ -1227,8 +1244,9 @@ def step_control_operation(
         # replay that rolled back to 0 first, the document may be nearly empty
         # and nothing in "step 1 (batch): ValueError: …" said so (live-caught).
         detail = res.get("error") or "unknown error"
-        if res.get("warning"):
-            detail = f"{detail}\n{res['warning']}"
+        reasons = res.get("warning") or " ".join(res.get("warnings") or [])
+        if reasons:
+            detail = f"{detail}\n{reasons}"
         objs = res.get("document_objects")
         if objs is not None:
             detail = f"{detail}\nThe document now holds: {', '.join(objs) or '(nothing)'}"

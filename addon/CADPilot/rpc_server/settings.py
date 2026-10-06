@@ -2,6 +2,7 @@
 
 import json
 import os
+import tempfile
 
 import FreeCAD
 
@@ -40,7 +41,16 @@ def load_settings():
 def save_settings(settings):
     path = _get_settings_path()
     try:
-        with open(path, "w") as f:
-            json.dump(settings, f, indent=2)
+        # tmp + replace (unique tmp): a torn in-place write left corrupt JSON
+        # and load_settings then silently reset every setting to defaults.
+        fd, tmp_name = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".settings.", suffix=".tmp")
+        tmp_path = tmp_name
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(settings, f, indent=2)
+            os.replace(tmp_path, path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
     except Exception as e:
         FreeCAD.Console.PrintError(f"Failed to save MCP settings: {e}\n")
