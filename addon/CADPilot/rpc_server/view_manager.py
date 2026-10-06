@@ -166,18 +166,19 @@ def save_active_screenshot(
         if focused_selection and focus_target is not None:
             FreeCADGui.Selection.addSelection(focus_target)
             _send_viewselection(gdoc)
-            # Hand the selection back: restore what was selected before the
-            # capture (the focus target included, if the caller had it).
-            FreeCADGui.Selection.clearSelection()
-            for sel in prior_selection:
-                FreeCADGui.Selection.addSelection(sel)
         else:
             view.fitAll()
         resolved_width, resolved_height = _resolve_screenshot_size(view, width, height)
         view.saveImage(save_path, resolved_width, resolved_height, "Current")
 
         if focused_selection:
+            # Hand the selection back: the focus framing cleared the caller's
+            # (or another agent's) process-global selection, and the old
+            # post-saveImage clearSelection() then left NOTHING selected.
+            # Restore exactly what was selected before the capture.
             FreeCADGui.Selection.clearSelection()
+            for sel in prior_selection:
+                FreeCADGui.Selection.addSelection(sel)
             _flush_gui_events(delay_ms=0)
         return True
     except Exception as e:

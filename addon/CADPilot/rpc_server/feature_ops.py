@@ -704,7 +704,10 @@ def _build_move(doc, spec):
             _vec3(axis, "placement.Rotation.Axis"),
             float(rot_data.get("Angle", 0)),
         )
-        return _assign_placement(doc, obj, new_base, new_rot)
+        _watch = _watched_dependent_bodies(doc, obj, new_base - current.Base)
+        moved = _assign_placement(doc, obj, new_base, new_rot)
+        _shift_unfollowed_bodies(doc, _watch, new_base - current.Base)
+        return moved
 
     # Relative translation / rotation — at least one is required.
     translate = spec.get("translate", {})
@@ -734,7 +737,74 @@ def _build_move(doc, spec):
     elif rotate:
         new_base = current.Base
         new_rot = delta_rot.multiply(current.Rotation)
-    return _assign_placement(doc, obj, new_base, new_rot)
+    _watch = _watched_dependent_bodies(doc, obj, new_base - current.Base)
+    moved = _assign_placement(doc, obj, new_base, new_rot)
+    _shift_unfollowed_bodies(doc, _watch, new_base - current.Base)
+    return moved
+
+
+def _watched_dependent_bodies(doc, obj, delta):
+    """(Body, tip bbox) for every Body whose feature chain consumes obj.
+
+    Only bodies that DEPEND on the moved object can fail to follow it; the
+    snapshot is taken before the move so the follow check compares honestly.
+    """
+    watch = []
+    if delta.Length < 1e-9:
+        return watch
+    try:
+        dependents = list(obj.InListRecursive)
+    except Exception:
+        return watch
+    for o in dependents:
+        if getattr(o, "TypeId", "") != "PartDesign::Body":
+            continue
+        tip = o.Tip if getattr(o, "Tip", None) is not None else o
+        try:
+            bb = tip.Shape.BoundBox
+            watch.append((o, (bb.XMin, bb.YMin, bb.ZMin, bb.XMax, bb.YMax, bb.ZMax)))
+        except Exception:
+            continue
+    return watch
+
+
+def _shift_unfollowed_bodies(doc, watch, delta) -> list[str]:
+    """Shift a dependent Body whose visible model did NOT follow the move.
+
+    A root solid adopted as a dress-up chain's base (draft/thickness/fillet
+    over a Part::Box) builds its members in the BODY frame with the base's
+    Placement stripped: moving the base updated the base object alone while
+    the whole visible chain read the old position, every member Up-to-date and
+    no error anywhere (live: move reported success and the model never
+    moved). Bodies whose tip bbox DID travel already carry the delta —
+    shifting them too would double it — so only the frozen ones are moved.
+    """
+    shifted = []
+    for body, before in watch:
+        tip = body.Tip if getattr(body, "Tip", None) is not None else body
+        try:
+            bb = tip.Shape.BoundBox
+        except Exception:
+            continue
+        followed = (
+            abs(bb.XMin - before[0]) > 1e-6
+            or abs(bb.YMin - before[1]) > 1e-6
+            or abs(bb.ZMin - before[2]) > 1e-6
+        )
+        if followed:
+            continue
+        _assign_placement(doc, body, body.Placement.Base + delta, body.Placement.Rotation)
+        shifted.append(body.Name)
+    if shifted:
+        global _AUTO_DIRECTION_NOTE
+        _AUTO_DIRECTION_NOTE = (
+            "the moved object is the adopted base of "
+            + ", ".join(shifted)
+            + "; those members build in the body frame and did not follow the "
+            "placement, so the Body itself was shifted by the same delta to "
+            "move the visible model"
+        )
+    return shifted
 
 
 def _assign_placement(doc, obj, new_base, new_rot):

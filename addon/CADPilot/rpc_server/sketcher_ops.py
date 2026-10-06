@@ -22,6 +22,7 @@ _LAST_SKETCH_INFO: dict | None = None
 # Which plane/face the last _attach_sketch call resolved to (echoed in the
 # sketch result so a wrong face pick is visible).
 _LAST_ATTACHMENT: dict | None = None
+_CENTER_OFF_MATERIAL: str | None = None
 
 # spec point keyword -> Sketcher PointPos
 _POINT_POS = {"start": 1, "end": 2, "center": 3, "mid": 3}
@@ -484,24 +485,25 @@ def _face_echo(obj, face_name: str) -> dict:
     return entry
 
 
-def _face_center_point(face) -> FreeCAD.Vector:
-    """A point ON the face, at its middle.
+def _face_center_point(face) -> tuple[FreeCAD.Vector, bool]:
+    """The face's middle: the AREA centroid, and whether it lies on material.
 
-    ``Face.CenterOfMass`` is the AREA centroid: for an annular face (the top
-    of a bushing) it sits in the hole, so it must be validated, and the
-    midpoint of the longest edge (always on the face) is the fallback.
+    ``Face.CenterOfMass`` is the area centroid. For a face with an INNER WIRE
+    (a hole) or a concave shape it can sit off the material — the old fallback
+    for that case (midpoint of the longest edge's vertices) is the SEAM for
+    any closed edge, so centering a sketch on a holed face teleported its
+    origin onto the rim (live: a bolt circle meant for r25 landed at x=35 and
+    the pocket cut air, reported as plain success). The centroid IS the
+    honest "middle of the face" — the caller offsets from it predictably —
+    so it is always returned and the off-material case is flagged for the
+    echo instead of being silently replaced by an arbitrary rim point.
     """
     point = FreeCAD.Vector(face.CenterOfMass)
     try:
-        if face.isInside(point, 1e-5, True):
-            return point
+        on_material = bool(face.isInside(point, 1e-5, True))
     except Exception:
-        return point
-    edges = list(getattr(face, "Edges", None) or [])
-    if not edges:
-        return point
-    edge = max(edges, key=lambda e: e.Length)
-    return (edge.Vertexes[0].Point + edge.Vertexes[-1].Point) * 0.5
+        on_material = True
+    return point, on_material
 
 
 def center_attachment(obj, ref, face_name, doc, extra_offset: float = 0.0):
@@ -521,7 +523,7 @@ def center_attachment(obj, ref, face_name, doc, extra_offset: float = 0.0):
         face = ref.Shape.Faces[n - 1]
     except Exception:
         return
-    target = _face_center_point(face)
+    target, on_material = _face_center_point(face)
     placement = obj.Placement
     delta = placement.Rotation.inverted().multVec(target - placement.Base)
     if extra_offset:
@@ -529,6 +531,15 @@ def center_attachment(obj, ref, face_name, doc, extra_offset: float = 0.0):
         delta = delta + FreeCAD.Vector(0, 0, extra_offset)
     obj.AttachmentOffset = FreeCAD.Placement(delta, FreeCAD.Rotation())
     doc.recompute()
+    if not on_material:
+        # A hole or a concave section swallows the centroid: the origin sits
+        # at the visual middle, but the material is an offset ring/limb away.
+        global _CENTER_OFF_MATERIAL
+        _CENTER_OFF_MATERIAL = (
+            "the face's middle lies off the material (a hole or a concave "
+            "section) — the sketch origin is placed there anyway, so offset "
+            "the profile from it rather than drawing at [0, 0]"
+        )
 
 
 def _attach_sketch(sketch, doc, spec):
@@ -584,6 +595,8 @@ def _attach_sketch(sketch, doc, spec):
         support_prop = "AttachmentSupport" if hasattr(sketch, "AttachmentSupport") else "Support"
         setattr(sketch, support_prop, [(ref, face_name)])
         sketch.MapMode = "FlatFace"
+        global _CENTER_OFF_MATERIAL
+        _CENTER_OFF_MATERIAL = None
         _LAST_ATTACHMENT = _face_echo(ref, face_name)
         _LAST_ATTACHMENT["centered"] = bool(plane.get("center"))
         if plane.get("center"):
@@ -601,6 +614,10 @@ def _attach_sketch(sketch, doc, spec):
         # centered rib profile drew its rectangle around the corner and hung
         # half of it outside the part, with the volume still adding up).
         _LAST_ATTACHMENT["sketch_origin"] = _vec3(sketch.Placement.Base)
+        if _CENTER_OFF_MATERIAL:
+            _LAST_ATTACHMENT["warnings"] = (_LAST_ATTACHMENT.get("warnings") or []) + [
+                _CENTER_OFF_MATERIAL
+            ]
         if not plane.get("center"):
             _LAST_ATTACHMENT["note"] = (
                 "the sketch origin sits on the face's parametric origin (a corner on a "
