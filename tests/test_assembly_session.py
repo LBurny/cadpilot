@@ -58,7 +58,7 @@ def asm_conn(fake_freecad, monkeypatch):
         fake_freecad._record("assembly_op", doc_name, spec)
         return _fake_assembly_result((doc_name, spec))
 
-    monkeypatch.setattr(fake_freecad, "assembly_op", assembly_op, raising=False)
+    monkeypatch.setattr(fake_freecad, "assembly_op", assembly_op)
     return fake_freecad
 
 
@@ -171,7 +171,7 @@ def test_mate_restores_every_link_the_solver_actually_moved(asm_conn, asm_home, 
             },
         }
 
-    monkeypatch.setattr(asm_conn, "assembly_op", moved_mate, raising=False)
+    monkeypatch.setattr(asm_conn, "assembly_op", moved_mate)
     assembly_session_operation(
         asm_conn,
         "mate",
@@ -202,7 +202,7 @@ def test_mate_that_moved_nothing_records_no_restore(asm_conn, asm_home, monkeypa
             "warnings": ["the mate was satisfied without moving any component"],
         }
 
-    monkeypatch.setattr(asm_conn, "assembly_op", no_move, raising=False)
+    monkeypatch.setattr(asm_conn, "assembly_op", no_move)
     r = assembly_session_operation(
         asm_conn,
         "mate",
@@ -288,7 +288,6 @@ def _fail_rpc(conn, monkeypatch, error="solver exploded"):
         conn,
         "assembly_op",
         lambda d, s: {"success": False, "error": error},
-        raising=False,
     )
 
 
@@ -333,7 +332,6 @@ def test_mate_trim_result_without_user_trim_does_not_crash(asm_conn, asm_home, m
         asm_conn,
         "assembly_op",
         lambda d, s: {"joint": "J_X", "trim": {"cut": "TrimCut_Gear"}},
-        raising=False,
     )
     r = assembly_session_operation(
         asm_conn,

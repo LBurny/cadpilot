@@ -5,9 +5,13 @@ listing tools expose pagination, numeric params carry schema constraints, and
 the semi-static references are reachable as resources.
 """
 
+import ast
 import asyncio
+import dataclasses
+from pathlib import Path
 
 from cadpilot import server
+from cadpilot.server_state import ServerState
 
 # Tools that only read FreeCAD / local state and must advertise readOnlyHint.
 _READ_ONLY = {
@@ -116,3 +120,49 @@ def test_assemble_docs_match_the_commit_policy():
     assert "ALREADY passed stay applied" in reference, reference
     assert "nothing moves only when the" in reference
     assert "aborts the whole transaction" not in reference.replace("\n", " ")
+
+
+def test_server_only_touches_real_server_state_fields():
+    """``diagnose(dismiss=true)`` resolved its connection with
+    ``state.connection`` — the field is ``freecad_connection`` — so the
+    modal-recovery action threw AttributeError. It stayed invisible because the
+    test injected a working fake into the operation and never went through the
+    tool layer that reads ``state``. The dataclass is the single source of
+    truth, so every attribute ``server.py`` reads or writes on ``state`` is
+    checked against it.
+
+    The check is only sound while ``state`` means that one module global. The
+    pin enforces the module-level assignment: exactly one, the dataclass
+    itself. Any OTHER binding of the name in a function scope also fails
+    loudly — an assignment trips the pin; a ``for``/``with``/parameter shadow
+    makes the field check above fail on unrelated attributes instead. Read
+    either failure as "rename the local", not as a ServerState bug."""
+    fields = {f.name for f in dataclasses.fields(ServerState)}
+    source = Path(server.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    used = {
+        n.attr
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "state"
+    }
+    assert used <= fields, (
+        f"server.py touches ServerState attributes that do not exist: {sorted(used - fields)} "
+        f"(fields: {sorted(fields)})"
+    )
+    assert used, "the walk found no state attribute at all — the detector is broken"
+    assigns = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+        and any(isinstance(t, ast.Name) and t.id == "state" for t in _targets(n))
+    ]
+    assert len(assigns) == 1 and ast.unparse(assigns[0]).startswith("state = ServerState("), (
+        f"expected exactly one module-level 'state = ServerState()', got "
+        f"{[ast.unparse(a) for a in assigns]} — a rebound 'state' voids the field check"
+    )
+
+
+def _targets(n):
+    if isinstance(n, (ast.AnnAssign, ast.AugAssign)):
+        return [n.target]
+    return n.targets

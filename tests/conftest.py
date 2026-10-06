@@ -61,7 +61,7 @@ class FakeFreeCADConnection:
         if method in self.errors:
             raise self.errors.pop(method)
 
-    def _result(self, method: str, default: dict) -> dict:
+    def _result(self, method: str, default: dict | str) -> dict | str:
         return self.result_overrides.get(method, default)
 
     def _doc_objects(self, doc_name: str) -> list[str]:
@@ -72,6 +72,26 @@ class FakeFreeCADConnection:
     def ping(self) -> bool:
         self._record("ping")
         return True
+
+    def get_gui_state(self) -> dict:
+        """Mirrors gui_dispatch.backpressure(): a draining queue, no reason.
+
+        Not dispatched on purpose (it has to answer while everything else is
+        stuck), so it is a plain RPC here like any other.
+        """
+        self._record("get_gui_state")
+        return self._result(
+            "get_gui_state",
+            {
+                "success": True,
+                "defer_reason": None,
+                "defer_label": "",
+                "deferred_s": 0.0,
+                "processing": False,
+                "processing_s": 0.0,
+                "queue_depth": 0,
+            },
+        )
 
     def dismiss_blocking_dialog(self) -> dict:
         """Mirrors the addon's forced-queue dismissal (Cancel semantics only)."""
@@ -141,6 +161,21 @@ class FakeFreeCADConnection:
             res["screenshot"] = self.SCREENSHOT
         return self._result("create_feature", res)
 
+    def assembly_op(self, doc_name, spec):
+        """Assembly-session RPC.
+
+        The addon answers with an op-specific shape (``start`` names the
+        container, ``mate`` a joint and a residual, ...), so there is no honest
+        canned result to invent — and a plausible-looking fake is exactly what
+        hides a wiring bug. Tests patch this with the result they are about (see
+        ``test_assembly_session.py::asm_conn``).
+        """
+        self._record("assembly_op", doc_name, spec)
+        raise NotImplementedError(
+            "FakeFreeCADConnection.assembly_op has no canned result; patch it with "
+            "the op-specific payload the test expects"
+        )
+
     def execute_code(self, code, screenshot=None, doc_name=None):
         self._record("execute_code", code, screenshot=screenshot, doc_name=doc_name)
         res = self._result(
@@ -181,6 +216,11 @@ class FakeFreeCADConnection:
             "get_active_screenshot", view_name, width, height, focus_object, doc_name=doc_name
         )
         return self.SCREENSHOT
+
+    def get_last_screenshot_error(self):
+        """Empty string is the addon's "the last capture had no failure"."""
+        self._record("get_last_screenshot_error")
+        return self._result("get_last_screenshot_error", "")
 
     def get_objects(self, doc_name):
         self._record("get_objects", doc_name)

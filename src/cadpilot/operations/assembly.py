@@ -10,6 +10,7 @@ import logging
 from typing import Any
 
 from .. import assembly_state as astate
+from ..freecad_client import FreeCADConnection
 from ..responses import ToolResponse, json_response, text_response
 
 logger = logging.getLogger("CADPilot")
@@ -95,7 +96,7 @@ def _session_doc_mismatch(session: astate.AssemblySession, doc_name: str | None)
 
 
 def assembly_session_operation(
-    conn,
+    conn: FreeCADConnection,
     operation: str,
     doc_name: str | None = None,
     name: str | None = None,

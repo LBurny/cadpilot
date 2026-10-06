@@ -338,7 +338,8 @@ pad — extrude a closed sketch profile (obj_name = profile sketch).
 Optional in obj_properties: length (default 10), reversed, midplane, body, name.
 through_all (true) asks for PartDesign's parametric through-all instead of a
 length, and `length` is then ignored (it is meant for cuts, so it rarely makes
-sense on a pad).
+sense on a pad). pad_type: only "length" is accepted — the other PartDesign
+pad modes are unsupported, and the error names through_all for through cuts.
 Numeric params accept "=expressions". The profile must have a closed wire.
 A NEGATIVE length is legal and extrudes the other way (the result warns).
 A profile that does not touch the base still succeeds (the Body allows
@@ -349,6 +350,8 @@ solid automatically — do not pad-then-boolean.""",
 pocket — cut a closed sketch profile out of a solid (obj_name = profile sketch).
 Optional: length (default 10) OR through_all (true = PartDesign's parametric
 through-all, and `length` is then ignored), reversed, midplane, body, name.
+pad_type: only "length" is accepted — other PartDesign pocket modes are
+unsupported, and the error names through_all for through cuts.
 A NEGATIVE length is legal and cuts the other way (the result warns).
 through_all is the right choice for a hole that must stay open when the model
 gets thicker: a numeric length only goes "through" while the body is thinner
@@ -372,8 +375,11 @@ only ever produce a flat zero-volume shell (FreeCAD still reports success).
 A profile that CROSSES its revolve axis is refused too — FreeCAD's own reason
 ("Revolve axis intersects the sketch") is carried into the error.""",
     "groove": """\
-groove — subtractive revolution (obj_name = profile sketch).
-Same axis/angle params as revolution.""",
+groove — subtractive revolution (obj_name = profile sketch), the revolved
+pocket: it cuts the swung profile OUT of the body.
+Optional: axis (default "Y", same forms as revolution), angle (degrees,
+default 360), reversed, body, name. The axis-refusal rules match revolution:
+the profile's own normal ("Z") and a profile crossing the axis are refused.""",
     "thickness": """\
 thickness — shell a solid (obj_name = base solid feature).
 Required in obj_properties: faces (selector), value. Optional: reversed, body, name.
