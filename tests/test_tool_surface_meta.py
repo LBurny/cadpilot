@@ -16,7 +16,6 @@ _READ_ONLY = {
     "get_objects",
     "list_documents",
     "get_addon_log",
-    "diagnose",
     "recall_patterns",
     "operation_help",
     "inspect_freecad",
@@ -29,8 +28,10 @@ _READ_ONLY = {
 }
 # Tools that mutate the document, the step journal or the pattern store.
 _MUTATING = {
+    # diagnose is here because dismiss=true acts (closes a modal dialog); it is
+    # the same tool as the report because the blocker is what the report names.
+    "diagnose",
     "create_document",
-    "dismiss_blocking_dialog",
     "cad",
     "execute_code",
     "execute_code_async",

@@ -1218,41 +1218,52 @@ def diagnose_operation(
     host: str,
     port: int = 9875,
     timeout: float = 5.0,
+    dismiss: bool = False,
+    freecad: FreeCADConnection | None = None,
 ) -> ToolResponse:
-    """Fault diagnosis that runs entirely on the MCP side (FreeCAD may be down)."""
+    """Fault diagnosis that runs entirely on the MCP side (FreeCAD may be down).
+
+    ``dismiss`` adds the one ACTION this tool can take: closing the modal dialog
+    that holds the addon's GUI queue back. It is the same tool rather than a
+    separate one because the blocker is exactly what this tool reports, and a
+    client that cannot operate the GUI (Claude Code, opencode, any MCP client)
+    reaches for it the moment the report explains why nothing answers. Only ever
+    Cancel semantics, so no dialog is ever confirmed.
+    """
     from ..diagnostics import diagnose, format_report
 
-    return text_response(format_report(diagnose(host, port, timeout)))
+    report = format_report(diagnose(host, port, timeout))
+    if not dismiss:
+        return text_response(report)
+    return text_response(f"{report}\n\n{_dismiss_blocking_dialog(freecad)}")
 
 
-def dismiss_blocking_dialog_operation(freecad: FreeCADConnection) -> ToolResponse:
-    """Close the modal dialog that blocks every document call (Cancel semantics).
+def _dismiss_blocking_dialog(freecad: FreeCADConnection | None) -> str:
+    """Close the modal dialog holding the GUI queue back; returns a report line.
 
-    The recovery path for a client that cannot operate the GUI: FreeCAD's
-    document-recovery dialog (shown after an unclean shutdown) holds the whole
-    GUI queue back, so every other call times out. This one is NOT queued behind
-    that guard, and it only ever cancels, never confirms.
+    Never raises: this rides along with a diagnosis, and a broken dismissal must
+    not cost the caller the report it asked for.
     """
-    res = freecad.dismiss_blocking_dialog()
+    if freecad is None:
+        return "Dismiss: skipped (no connection available to act on)."
+    try:
+        res = freecad.dismiss_blocking_dialog()
+    except Exception as e:
+        return f"Dismiss: could not reach FreeCAD to close a dialog ({type(e).__name__}: {e})."
     if not res.get("success"):
-        return json_response(
-            {
-                "success": False,
-                "error": res.get("error") or res.get("note") or "could not dismiss a dialog",
-                "hint": (
-                    "Either nothing was blocking or the dialog overrides Cancel. Read the "
-                    "current blocker with the diagnose tool, or look at FreeCAD's screen."
-                ),
-            }
+        return (
+            "Dismiss: nothing was closed — "
+            f"{res.get('error') or res.get('note') or 'no modal dialog is open'}. "
+            "If a dialog IS on screen, it overrides Cancel: close it by hand."
         )
     dismissed = res.get("dismissed")
     if isinstance(dismissed, dict):
         where = dismissed.get("title") or dismissed.get("type") or "dialog"
-        return text_response(
-            f"Dismissed the blocking dialog '{where}' with Cancel semantics: nothing was "
-            "confirmed and the GUI queue can drain again. Retry the call that timed out."
+        return (
+            f"Dismiss: closed the blocking dialog '{where}' with Cancel semantics; nothing "
+            "was confirmed and the GUI queue can drain again. Retry the call that timed out."
         )
-    return text_response("No modal dialog was open, so nothing held the GUI queue back.")
+    return "Dismiss: no modal dialog was open, so nothing held the GUI queue back."
 
 
 def session_pause_operation() -> ToolResponse:

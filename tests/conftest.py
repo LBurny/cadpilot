@@ -73,6 +73,18 @@ class FakeFreeCADConnection:
         self._record("ping")
         return True
 
+    def dismiss_blocking_dialog(self) -> dict:
+        """Mirrors the addon's forced-queue dismissal (Cancel semantics only)."""
+        self._record("dismiss_blocking_dialog")
+        return self._result(
+            "dismiss_blocking_dialog",
+            {
+                "success": True,
+                "dismissed": None,
+                "note": "no modal dialog is open; nothing to dismiss",
+            },
+        )
+
     def create_document(self, name, screenshot=None):
         self._record("create_document", name, screenshot=screenshot)
         self.documents.append(name)

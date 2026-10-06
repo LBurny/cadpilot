@@ -649,6 +649,12 @@ and Linux:
      tool list are only picked up on a restart: restart FreeCAD, then the
      MCP client (it builds tools/list once, at startup).
 
+dismiss=true adds the one ACTION this tool can take: it closes the modal dialog
+holding the GUI queue back (Cancel semantics, so nothing on screen is ever
+confirmed). That call is not held back by the dialog, which is why it works
+where every other tool times out; it is part of diagnose rather than a tool of
+its own because the blocker IS what this report describes.
+
 A listening port that does not answer ping is the one case that is not a
 setup problem: FreeCAD is up but its GUI thread is busy or wedged (modal
 dialog, long recompute, deadlock). The addon log stays readable exactly

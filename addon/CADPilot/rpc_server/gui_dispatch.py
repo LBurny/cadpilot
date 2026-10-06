@@ -606,7 +606,7 @@ def dispatch_to_gui(task: Callable[[], Any], timeout: float = 60, force: bool = 
                 f"{label}. The queued work is held back deliberately while the user interacts, "
                 "so nothing is stuck: close the dialog or menu (or release the mouse button) "
                 "and retry; the queue drains by itself. A modal dialog can also be closed for "
-                "you with the dismiss_blocking_dialog tool, which is not held back."
+                "you by the diagnose tool with dismiss=true, which is not held back."
             ),
         }
     if _processing:

@@ -221,7 +221,7 @@ def test_probe_gui_state_reads_the_back_pressure_reason():
     assert state["available"] is True
     assert state["defer_reason"] == "modal"
     assert "MODAL DIALOG" in note
-    assert "dismiss_blocking_dialog" in note, "the programmatic way out must come first"
+    assert "dismiss=true" in note, "the programmatic way out must come first"
     assert "Cancel" in note and "Start recovery" in note, "the note must name the resolution"
     # The prose is ENGLISH like every other CADPilot message; only the literal
     # on-screen button labels appear in their localized form, in parentheses.
@@ -343,3 +343,55 @@ def test_diagnose_help_topic_documents_the_flow():
     text = " ".join(c.text for c in operation_help_operation("diagnose") if hasattr(c, "text"))
     assert "initgui_debug.log" in text
     assert "v1-1" in text and "restart" in text.lower()
+
+
+def test_diagnose_dismisses_the_blocker_only_when_asked():
+    """Closing the modal dialog is part of diagnose rather than a tool of its
+    own: the blocker is exactly what the report names, and a client that cannot
+    operate the GUI reaches for it the moment the report explains why nothing
+    answers. Two properties matter: the plain report must NOT touch FreeCAD
+    (diagnose works while FreeCAD is down), and a broken dismissal must never
+    cost the caller the report it asked for."""
+    from conftest import FakeFreeCADConnection
+
+    from cadpilot.operations import core
+
+    fake = FakeFreeCADConnection()
+
+    plain = " ".join(
+        c.text for c in core.diagnose_operation("127.0.0.1", dismiss=False) if hasattr(c, "text")
+    )
+    assert "Dismiss:" not in plain, "a plain diagnose must not act"
+    assert not any(m == "dismiss_blocking_dialog" for m, _a, _k in fake.calls)
+
+    # A dialog is reported back by name, and the call is the forced-queue RPC.
+    fake.result_overrides["dismiss_blocking_dialog"] = {
+        "success": True,
+        "dismissed": {"title": "文档恢复", "type": "TaskDialog"},
+        "note": "closed the dialog with Cancel semantics; nothing was confirmed",
+    }
+    res = core.diagnose_operation("127.0.0.1", dismiss=True, freecad=fake)
+    text = " ".join(c.text for c in res if hasattr(c, "text"))
+    assert [m for m, _a, _k in fake.calls].count("dismiss_blocking_dialog") == 1
+    assert "Dismiss: closed the blocking dialog" in text
+    assert "文档恢复" in text, "the dialog's own label is echoed"
+    assert "Cancel semantics" in text and "nothing was confirmed" in text
+
+    # No dialog open: said plainly, not as a failure.
+    fake.result_overrides.pop("dismiss_blocking_dialog")
+    text = " ".join(
+        c.text
+        for c in core.diagnose_operation("127.0.0.1", dismiss=True, freecad=fake)
+        if hasattr(c, "text")
+    )
+    assert "no modal dialog was open" in text
+
+    # A dead connection still yields the report.
+    fake.errors["dismiss_blocking_dialog"] = RuntimeError("connection refused")
+    text = " ".join(
+        c.text
+        for c in core.diagnose_operation("127.0.0.1", dismiss=True, freecad=fake)
+        if hasattr(c, "text")
+    )
+    assert "could not reach FreeCAD to close a dialog" in text
+    assert "CADPilot diagnosis" in text, "the report must survive a failed dismissal"

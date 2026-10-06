@@ -28,7 +28,6 @@ from .operations import (
     check_interference_operation,
     create_document_operation,
     diagnose_operation,
-    dismiss_blocking_dialog_operation,
     execute_code_async_operation,
     execute_code_operation,
     get_addon_log_operation,
@@ -512,27 +511,23 @@ def get_addon_log(
     )
 
 
-@mcp.tool(annotations=_read_only("Diagnose Connection"))
-def diagnose(ctx: Context, host: str | None = None) -> list[TextContent]:
-    """Find out why CADPilot cannot reach FreeCAD; this keeps working while FreeCAD is down or frozen.
+@mcp.tool(annotations=_mutating("Diagnose Connection", destructive=False))
+def diagnose(ctx: Context, host: str | None = None, dismiss: bool = False) -> list[TextContent]:
+    """Find out why CADPilot cannot reach FreeCAD; works while FreeCAD is down.
 
-    It probes the RPC port, the FreeCAD process, the addon install and its logs, including the bootstrap crash log.
+    Probes the RPC port, the process, the addon install and its logs.
 
     Args:
         host: FreeCAD host to probe; defaults to this server's --host.
+        dismiss: Also close the modal dialog blocking every call (Cancel, nothing confirmed).
 
     Reference: operation_help("diagnose").
     """
-    return diagnose_operation(host or state.rpc_host)
-
-
-@mcp.tool(annotations=_mutating("Dismiss Blocking Dialog", destructive=False))
-def dismiss_blocking_dialog(ctx: Context) -> list[TextContent]:
-    """Close the modal dialog that is blocking every CADPilot call (Cancel semantics).
-
-    Use it when calls time out while ping still answers; diagnose names the blocker.
-    """
-    return dismiss_blocking_dialog_operation(state.connection)
+    return diagnose_operation(
+        host or state.rpc_host,
+        dismiss=dismiss,
+        freecad=state.connection if dismiss else None,
+    )
 
 
 @mcp.tool(annotations=_mutating("Save Pattern", destructive=False))
