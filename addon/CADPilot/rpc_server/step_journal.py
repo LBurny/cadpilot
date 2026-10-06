@@ -843,11 +843,49 @@ def set_plan(
     return added
 
 
+def next_runnable(records: list[StepRecord]) -> StepRecord | None:
+    """The next record a run action must apply: planned OR failed.
+
+    A FAILED record is one whose transaction aborted, so its effect is not in
+    the model: it is still to be applied, exactly like a planned one. Skipping
+    it stepped the rest of the plan over a dependency that was never created
+    (live: a failed pocket, then the polar pattern whose base it was, then a
+    move that ran "successfully" on a part missing both). Re-running is the
+    honest reading of "Next": retry the step that is not applied yet. A caller
+    who wants to abandon a failed step rejects it or edits it, which is the
+    deliberate act rather than a side effect of pressing Next.
+    """
+    for rec in records:
+        if rec.state in (STATE_PLANNED, STATE_FAILED):
+            return rec
+    return None
+
+
 def next_planned(records: list[StepRecord]) -> StepRecord | None:
+    """The next PLANNED record only (kept for callers that want the plan tail)."""
     for rec in records:
         if rec.state == STATE_PLANNED:
             return rec
     return None
+
+
+def replan_failed(records: list[StepRecord], to_index: int) -> list[int]:
+    """Return FAILED records after ``to_index`` to ``planned``; returns their indices.
+
+    A rollback puts the model back at ``to_index``, and a failed record was
+    never applied in the first place, so keeping it marked failed left it out of
+    reach of the cursor: the panel's Next skipped it and ran the steps BEHIND it
+    against a dependency that does not exist (live: a failed pocket and pattern
+    were skipped, and a move step then ran "successfully" on a part missing
+    both). The rebuild path already reset failed records for exactly this
+    reason; the native undo path did not, so the two rollback paths disagreed
+    about what the journal means after a rollback.
+    """
+    replanned = [r for r in records if r.state == STATE_FAILED and r.index > to_index]
+    for rec in replanned:
+        rec.state = STATE_PLANNED
+        rec.error = ""
+    return [r.index for r in replanned]
 
 
 def pending_count(records: list[StepRecord]) -> int:

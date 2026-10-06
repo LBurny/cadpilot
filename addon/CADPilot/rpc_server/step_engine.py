@@ -1081,7 +1081,7 @@ def _run_steps(doc, records, limit: int | None, upto: int | None) -> dict[str, A
     executed: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     while True:
-        rec = sj.next_planned(records)
+        rec = sj.next_runnable(records)
         if rec is None:
             break
         # The cursor decides the upto bound, never a done-count: done records
@@ -1374,8 +1374,15 @@ def _rollback(doc, records, to_index: int, force: bool) -> dict[str, Any]:
     # records marked done whose transactions were already undone) whenever a
     # FAILED or PLANNED record sits in between.
     extra = sj.done_after_index(records, to_index)
+    replanned: list[int] = []
     if extra > 0:
         sj.rewind(records, extra)
+    # A failed record was never applied, so it must go back to planned too —
+    # otherwise the cursor steps over it and runs the rest of the plan against a
+    # dependency that was never created (see sj.replan_failed). The rebuild path
+    # above has always done this; the native path did not.
+    replanned = sj.replan_failed(records, to_index)
+    if extra > 0 or replanned:
         with contextlib.suppress(Exception):
             write_journal(doc, records)
     return {
@@ -1384,6 +1391,7 @@ def _rollback(doc, records, to_index: int, force: bool) -> dict[str, Any]:
         "restored": restored,
         "removed": removed,
         "stranded": stranded,
+        "replanned": replanned,
         "done": sj.done_count(records),
         "count": len(records),
         "warnings": warnings,

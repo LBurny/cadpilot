@@ -204,9 +204,16 @@ def test_read_only_execute_code_appends_and_plan_removal_is_by_state():
     assert "planned_tail_start" not in _attrs(commit)
     run = _func(ENGINE, "_run_steps")
     src = ast.unparse(run)
-    assert "next_planned" in _calls(run), "the plan cursor must walk by state"
+    assert "next_runnable" in _calls(run), (
+        "the plan cursor must walk by state, and a FAILED record is still to be"
+        " applied: its transaction aborted, so stepping over it runs the rest of"
+        " the plan against a dependency that was never created"
+    )
+    assert "next_planned" not in _calls(run), (
+        "next_planned skips failed records, which is the bug this replaced"
+    )
     assert "rec.index > upto" in src, (
-        "run_to's upto bound must be the cursor (next_planned().index > upto)"
+        "run_to's upto bound must be the cursor (next_runnable().index > upto)"
     )
     assert "done_count(records) >= upto" not in src, (
         "the upto bound must never compare a done-count: trailing done records "
@@ -444,3 +451,19 @@ def test_object_removal_mutes_the_manual_edit_observer():
     assert "_EngineQuiet" in _names(body) or "_EngineQuiet" in _attrs(body), (
         "removal must run inside _EngineQuiet"
     )
+
+
+def test_native_rollback_replans_failed_records():
+    """Both rollback paths must agree about what the journal means afterwards.
+    The rebuild path has always reset done AND failed records to planned; the
+    native undo path only rewound the done ones, so a failed step stayed failed,
+    the cursor stepped over it, and the panel's Next ran the steps behind it
+    against a dependency that was never created (live: a rollback to step 3,
+    then Next skipped the failed pocket and pattern and ran the move and batch
+    steps on a part missing both)."""
+    rollback = ast.unparse(_func(ENGINE, "_rollback"))
+    assert "replan_failed" in rollback, "a rollback must re-plan failed records"
+    assert "replanned" in rollback, "and report which ones it re-planned"
+    # The rebuild branch keeps its own reset (it also clears object state), and
+    # the failed state must be part of that set too.
+    assert "STATE_FAILED" in rollback

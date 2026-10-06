@@ -921,6 +921,58 @@ def test_set_plan_drops_planned_wherever_they_sit():
     ]
 
 
+def test_next_runnable_does_not_step_over_a_failed_record():
+    """A FAILED record's transaction aborted, so its effect is not in the model:
+    it is still to be applied. The cursor used to return planned records only,
+    so a failed step was stepped over and the rest of the plan ran against a
+    dependency that was never created (live: a failed pocket, then the polar
+    pattern whose base it was, then a move that ran "successfully" on a part
+    missing both)."""
+    recs = [
+        _done_rec("pad", 1, {}, after=["Pad"]),
+        sj.StepRecord(index=2, state=sj.STATE_FAILED, operation="pocket"),
+        sj.StepRecord(index=3, state=sj.STATE_PLANNED, operation="pattern"),
+    ]
+    assert sj.next_runnable(recs).index == 2, "the unapplied step comes first"
+    assert sj.next_planned(recs).index == 3, "...which is what the old cursor did"
+    # Once it is applied again the cursor moves on.
+    recs[1].state = sj.STATE_DONE
+    assert sj.next_runnable(recs).index == 3
+    assert sj.next_runnable([_done_rec("pad", 1, {})]) is None
+
+
+def test_replan_failed_returns_them_to_planned_after_a_rollback():
+    """The rebuild path has always reset failed records to planned ("their
+    transaction aborted, so re-running them is safe, and skipping them would run
+    a later step against a missing dependency"); the native undo path did not,
+    so the two rollback paths disagreed about what the journal means. Live: a
+    rollback to step 3 left the failed pocket/pattern as failed, and the panel's
+    Next then skipped both and ran the move and batch steps on a part missing
+    them."""
+    recs = [
+        _done_rec("pad", 1, {}),
+        sj.StepRecord(index=2, state=sj.STATE_FAILED, operation="pocket", error="boom"),
+        sj.StepRecord(index=3, state=sj.STATE_FAILED, operation="pattern", error="boom"),
+        sj.StepRecord(index=4, state=sj.STATE_PLANNED, operation="fillet"),
+    ]
+    assert sj.replan_failed(recs, 1) == [2, 3]
+    assert [r.state for r in recs] == [
+        sj.STATE_DONE,
+        sj.STATE_PLANNED,
+        sj.STATE_PLANNED,
+        sj.STATE_PLANNED,
+    ]
+    assert recs[1].error == "", "a re-planned step must not carry its old failure"
+    # Only failures AFTER the target: an earlier one is history the rollback
+    # does not reach, and a done/planned record is not this helper's business.
+    recs2 = [
+        sj.StepRecord(index=1, state=sj.STATE_FAILED, operation="pocket"),
+        sj.StepRecord(index=2, state=sj.STATE_PLANNED, operation="pad"),
+    ]
+    assert sj.replan_failed(recs2, 1) == []
+    assert recs2[0].state == sj.STATE_FAILED
+
+
 def test_next_planned_walks_by_state_behind_done_records():
     recs = [
         _done_rec("pad", 1, {}, after=["Pad"]),
