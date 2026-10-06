@@ -486,8 +486,11 @@ Each mate: {"obj", "anchor", "target", "target_anchor",
   axis   — directions parallel (axle-in-hole); same landing rule.
 Mates run in order; later mates see earlier moves. Every mate's residual
 (mm, plus degrees for touch/axis) is measured AFTER the move and returned.
-A mate whose residual exceeds tolerance fails: stop_on_error=True aborts the
-whole transaction (nothing moves); False commits the passing mates.
+A mate whose residual exceeds tolerance fails. stop_on_error=True stops at the
+first failure: mates that ALREADY passed stay applied (the transaction commits
+when at least one passed, mirroring batch), and nothing moves only when the
+FIRST mate is the one that fails. stop_on_error=False keeps going and commits
+the passing mates either way.
 For PERSISTENT joints use assembly_session instead.""",
     "step_plan": """\
 step_plan — submit a plan to FreeCAD's step journal WITHOUT executing it.

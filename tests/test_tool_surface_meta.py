@@ -99,3 +99,20 @@ def test_reference_docs_and_patterns_are_resources():
     assert "cadpilot://patterns" in resources
     assert "cadpilot://docs/{operation}" in templates
     assert "cadpilot://patterns/{pattern_id}" in templates
+
+
+def test_assemble_docs_match_the_commit_policy():
+    """The addon commits the transaction whenever at least one mate passed
+    (commit_if=lambda res: res.get("passed", 0) > 0, mirroring batch), so with
+    stop_on_error=True the mates already applied before the failure STAY. Both
+    doc surfaces claimed the opposite ("everything rolls back", "nothing
+    moves"), so a caller reasoning from the docs mis-predicted the document."""
+    from cadpilot import server, tool_docs
+
+    docstring = server.assemble.__doc__ or ""
+    assert "nothing moves only if the FIRST mate fails" in docstring, docstring
+    assert "everything rolls back" not in docstring
+    reference = tool_docs.CAD_OP_DOCS["assemble"]
+    assert "ALREADY passed stay applied" in reference, reference
+    assert "nothing moves only when the" in reference
+    assert "aborts the whole transaction" not in reference.replace("\n", " ")

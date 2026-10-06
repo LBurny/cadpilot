@@ -395,3 +395,37 @@ def test_diagnose_dismisses_the_blocker_only_when_asked():
     )
     assert "could not reach FreeCAD to close a dialog" in text
     assert "CADPilot diagnosis" in text, "the report must survive a failed dismissal"
+
+
+def test_diagnose_tool_reaches_the_dismissal_through_the_server_layer(monkeypatch):
+    """The tool handler is where state.connection vs state.freecad_connection
+    lives, and calling the operation directly (which the first version of this
+    test did) hid an AttributeError: diagnose(dismiss=true) crashed before it
+    could close anything, killing exactly the recovery path it exists for."""
+    from conftest import FakeFreeCADConnection
+
+    from cadpilot import diagnostics as diag_mod
+    from cadpilot import server
+
+    fake = FakeFreeCADConnection()
+    fake.result_overrides["dismiss_blocking_dialog"] = {
+        "success": True,
+        "dismissed": {"title": "文档恢复", "type": "TaskDialog"},
+        "note": "closed",
+    }
+    monkeypatch.setattr(diag_mod, "diagnose", lambda *a, **k: {"reachable": True})
+    monkeypatch.setattr(diag_mod, "format_report", lambda report: "REPORT")
+    monkeypatch.setattr(server, "get_freecad_connection", lambda: fake)
+
+    plain = " ".join(c.text for c in server.diagnose(None, host="127.0.0.1") if hasattr(c, "text"))
+    assert "REPORT" in plain and "Dismiss:" not in plain
+    assert not any(m == "dismiss_blocking_dialog" for m, _a, _k in fake.calls), (
+        "a plain diagnose must not touch FreeCAD"
+    )
+
+    text = " ".join(
+        c.text for c in server.diagnose(None, host="127.0.0.1", dismiss=True) if hasattr(c, "text")
+    )
+    assert [m for m, _a, _k in fake.calls].count("dismiss_blocking_dialog") == 1
+    assert "Dismiss: closed the blocking dialog" in text
+    assert "文档恢复" in text

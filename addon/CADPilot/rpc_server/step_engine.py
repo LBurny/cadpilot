@@ -1104,6 +1104,17 @@ def _run_steps(doc, records, limit: int | None, upto: int | None) -> dict[str, A
                 if rec.operation == "execute_code"
                 else "skipped: not re-executable"
             )
+            # A skipped step is a no-op by definition, so it must stop claiming
+            # a mutation: build_record defaults atomic/mutated True, and a
+            # record that keeps them while owning no transaction satisfies
+            # sj.steps_without_undo — which diverts an otherwise clean native
+            # rollback to the (destructive) rebuild path over a step that
+            # changed nothing. This mirrors append_execute_code's read-only
+            # record, and the rule AGENTS.md states: a record that provably
+            # changed nothing must NOT stand in rollback's way.
+            rec.atomic = False
+            rec.mutated = False
+            rec.transaction = ""
             skipped.append({"index": rec.index, "operation": rec.operation})
             logger.info("step %d (%s): skipped, not re-executable", rec.index, rec.operation)
             continue
@@ -1488,11 +1499,17 @@ def _reexecute(
     if not rec.executable:
         return {"success": False, "error": f"step {index} ('{rec.operation}') is not re-executable"}
     plan = sj.plan_rollback(records, index - 1)
-    if plan["blocking"]:
+    if plan["blocking"] and not force:
+        # force is honored here like _rollback and _reject honor it, and the
+        # message names it: the panel only offers a force retry when the error
+        # text says "force=true", so this dead end left the user with no way
+        # forward at all. The verification below still refuses if the undo
+        # cannot be trusted, and points at rollback_to.
         return {
             "success": False,
             "error": (
-                f"cannot re-run step {index}: non-atomic step(s) {plan['blocking']} sit in the way"
+                f"cannot re-run step {index}: non-atomic step(s) {plan['blocking']} sit in the "
+                "way; pass force=true to re-run anyway, or run rollback_to first"
             ),
         }
     if plan["accepted"] and not force:

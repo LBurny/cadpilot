@@ -50,3 +50,45 @@ def test_patterns_persist_across_loads(isolated_home):
     add_pattern("durable", "survives reload")
     # a second search goes through a fresh _load() from disk
     assert search_patterns("durable")[0]["name"] == "durable"
+
+
+def test_a_corrupt_store_is_refused_not_overwritten(isolated_home):
+    """_load() used to return [] for an unreadable file as well as for a missing
+    one, so one corrupt patterns.json made the next add_pattern write a store
+    holding only the new entry: every previously saved pattern gone, no error
+    reported. An unreadable store now reads as None and add_pattern refuses."""
+    import pytest
+
+    import cadpilot.pattern_store as store
+
+    add_pattern("keeper", "a pattern that must survive")
+    path = store._store_path()
+    before = path.read_text(encoding="utf-8")
+    path.write_text('{"truncated": ', encoding="utf-8")
+
+    with pytest.raises(RuntimeError) as err:
+        add_pattern("newcomer", "must not clobber the store")
+    assert "cannot be read" in str(err.value)
+
+    # The tool layer keeps the failure inside the result.
+    from cadpilot.operations import save_pattern_operation
+
+    text = " ".join(c.text for c in save_pattern_operation("x", "y") if hasattr(c, "text"))
+    assert "Could not store the pattern" in text
+
+    # Read-only paths still answer (an unreadable store reads as empty).
+    assert list_patterns() == []
+    assert search_patterns("keeper") == []
+    # ...and the corrupt file was left for the user to repair, not replaced.
+    assert path.read_text(encoding="utf-8") == '{"truncated": '
+    assert before  # the keeper really was written first
+
+
+def test_a_non_list_store_is_corrupt_too(isolated_home):
+    import pytest
+
+    import cadpilot.pattern_store as store
+
+    store._store_path().write_text('{"patterns": []}', encoding="utf-8")
+    with pytest.raises(RuntimeError):
+        add_pattern("x", "y")

@@ -523,10 +523,14 @@ def diagnose(ctx: Context, host: str | None = None, dismiss: bool = False) -> li
 
     Reference: operation_help("diagnose").
     """
+    # The connection is resolved ONLY for the acting call: a plain diagnose must
+    # not touch FreeCAD (it exists to answer while FreeCAD is down), and
+    # get_freecad_connection() answers None after a failed ping, which the
+    # operation reports as "no connection available to act on".
     return diagnose_operation(
         host or state.rpc_host,
         dismiss=dismiss,
-        freecad=state.connection if dismiss else None,
+        freecad=get_freecad_connection() if dismiss else None,
     )
 
 
@@ -726,12 +730,12 @@ def assemble(
     tolerance: Annotated[float, Field(ge=0)] = 0.1,
     stop_on_error: bool = True,
 ) -> list[TextContent]:
-    """Snap parts together by matching named anchors in one transaction; a mate over tolerance fails and everything rolls back. For joints that persist across moves, use assembly_session.
+    """Snap parts together by matching named anchors in one transaction. For persistent joints use assembly_session.
 
     Args:
         mates: Non-empty list of mate dicts.
         tolerance: Maximum allowed post-move residual in mm (default 0.1).
-        stop_on_error: Abort and roll back at the first failed mate.
+        stop_on_error: Stop at the first failed mate (mates already applied stay; nothing moves only if the FIRST mate fails).
 
     Reference: operation_help("assemble").
     """

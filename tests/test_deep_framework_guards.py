@@ -467,3 +467,70 @@ def test_native_rollback_replans_failed_records():
     # The rebuild branch keeps its own reset (it also clears object state), and
     # the failed state must be part of that set too.
     assert "STATE_FAILED" in rollback
+
+
+def test_redo_transactions_accepts_the_argument_the_client_sends():
+    """session(action='redo') could never work: core.py calls
+    freecad.redo_transactions(doc_name, n, trust_journal=True) and the client
+    forwards three POSITIONAL arguments over XML-RPC, but the addon's method
+    only took (doc_name, n) — every redo raised TypeError, surfaced as an
+    XML-RPC Fault and reported as "Redo failed". The fake connection in
+    tests/conftest.py accepts trust_journal, which is exactly why the suite
+    never caught the mismatch between the wire and the addon."""
+    rpc = _tree("rpc_server.py")
+    redo = _func(rpc, "redo_transactions")
+    params = [a.arg for a in redo.args.args]
+    assert "trust_journal" in params, params
+    body = ast.unparse(redo)
+    assert "trust_journal=trust_journal" in body, "the flag must reach _undo_redo"
+    # ...and the client really does send it.
+    client = Path(__file__).resolve().parents[1] / "src" / "cadpilot" / "freecad_client.py"
+    text = client.read_text(encoding="utf-8")
+    assert '"redo_transactions", doc_name, n, True' in text, (
+        "the wire must carry the flag positionally"
+    )
+
+
+def test_a_skipped_record_stops_claiming_a_mutation():
+    """The skip path marks a non-executable record DONE so run_all/replay can
+    walk past it, but build_record defaults atomic/mutated True: a skipped
+    record kept those flags while owning no transaction, so it satisfied
+    sj.steps_without_undo and diverted an otherwise clean native rollback to the
+    destructive rebuild path — over a step that provably changed nothing."""
+    run = _func(_tree("step_engine.py"), "_run_steps")
+    skip_branch = ast.unparse(run)
+    assert "rec.atomic = False" in skip_branch and "rec.mutated = False" in skip_branch
+    assert "rec.transaction = ''" in skip_branch
+    # The rule the record has to satisfy (see AGENTS.md): a step that changed
+    # nothing must not stand in rollback's way.
+    journal = _tree("step_journal.py")
+    without = ast.unparse(_func(journal, "steps_without_undo"))
+    assert "rec.mutated" in without and "not rec.transaction" in without
+
+
+def test_reexecute_honors_force_and_names_the_way_out():
+    """The blocking-non-atomic branch of _reexecute ignored force entirely (the
+    rollback and reject paths honor it), and its message said neither
+    "force=true" nor "rollback_to" — the panel only offers a force retry when
+    the error text contains "force=true", so "Save & re-run" ended in a dead end
+    with no recovery offered."""
+    body = ast.unparse(_func(_tree("step_engine.py"), "_reexecute"))
+    assert "plan['blocking']" in body and "not force" in body, "force must be honored here"
+    assert "force=true" in body, "the refusal must name the way out"
+
+
+def test_the_panel_gates_run_actions_on_the_runnable_cursor():
+    """The engine cursor is next_runnable (planned OR FAILED), but the panel
+    still enabled Next / Run all only when a PLANNED record existed: as soon as
+    the last planned step failed, both buttons went dead, so the documented
+    "edit it, then press Next" retry was unreachable from the panel."""
+    panel = _tree("step_panel.py")
+    actions = ast.unparse(_func(panel, "_update_actions"))
+    assert "next_runnable" in actions, "the enable gate must follow the cursor"
+    assert "STATE_PLANNED for r in self._records" not in actions
+    rollback = ast.unparse(_func(panel, "_rollback"))
+    replay = ast.unparse(_func(panel, "_replay"))
+    for name, body in (("_rollback", rollback), ("_replay", replay)):
+        assert "plan['blocking']" in body and "plan['accepted']" in body, (
+            f"{name} must not bail out before offering the force retry"
+        )

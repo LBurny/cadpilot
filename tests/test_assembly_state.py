@@ -42,7 +42,11 @@ def test_start_and_record_roundtrip(asm_home):
     assert s2.steps[0].operation == "mate"
 
 
-def test_plan_rollback_merges_undo_reverse_order(asm_home):
+def test_plan_rollback_merges_undo_in_step_order(asm_home):
+    """The undone steps are merged in step order. Order matters for the
+    links_restore snapshots (the EARLIEST undone step is the one holding the
+    placement at to_step — see the dedicated test), and for the joint/cut lists
+    it keeps the spec reading in the same order the steps ran."""
     s = astate.start_session("Car", "Chassis", "t")
     astate.record_step(s, "start", "ground Chassis", {"ground": "Chassis"}, _empty_undo())
     astate.record_step(s, "add_component", "add A", {"part": "A"}, _empty_undo())
@@ -68,7 +72,7 @@ def test_plan_rollback_merges_undo_reverse_order(asm_home):
 
     spec = astate.plan_rollback(s, to_step=2)
     assert spec["operation"] == "rollback_step"
-    assert spec["joints_to_delete"] == ["J_2", "J_1"]  # 逆序
+    assert spec["joints_to_delete"] == ["J_1", "J_2"]  # step order
     assert spec["cuts_to_delete"] == ["TrimCut_1"]
     assert spec["links_restore"] == {"L_A": PLACEMENT_ZERO}
     assert spec["links_repoint"] == {"L_Chas": "Chassis"}
@@ -144,3 +148,72 @@ def test_save_is_atomic_when_dump_fails(asm_home, monkeypatch):
         astate.save(s)
     assert path.read_bytes() == original
     assert not path.with_suffix(".tmp").exists()
+
+
+def test_rollback_restores_the_earliest_snapshot_of_a_link_moved_twice(asm_home):
+    """A link moved by two undone steps must come back to the placement it had at
+    to_step, which is the EARLIEST undone step's pre-solve snapshot.
+
+    plan_rollback walked the undone steps in REVERSE and used setdefault, so the
+    snapshot it kept was the LATEST step's (the state just before the last undone
+    move, i.e. one move too far). Live shape: step2 mates L P0->P1 (pre=P0),
+    step3 mates L P1->P2 (pre=P1); rollback to step 1 left L at P1 and reported
+    success.
+    """
+    s = astate.start_session("Car", "Chassis", "t")
+    astate.record_step(s, "start", "ground Chassis", {"ground": "Chassis"}, _empty_undo())
+    astate.record_step(
+        s,
+        "mate",
+        "first move",
+        {"joint": "J_1"},
+        {
+            **_empty_undo(),
+            "joints_to_delete": ["J_1"],
+            "links_restore": {"L": {"Base": {"x": 0, "y": 0, "z": 0}}},
+        },
+    )
+    astate.record_step(
+        s,
+        "mate",
+        "second move",
+        {"joint": "J_2"},
+        {
+            **_empty_undo(),
+            "joints_to_delete": ["J_2"],
+            "links_restore": {"L": {"Base": {"x": 9, "y": 0, "z": 0}}},
+        },
+    )
+    plan = astate.plan_rollback(s, 1)
+    assert plan["links_restore"]["L"] == {"Base": {"x": 0, "y": 0, "z": 0}}, (
+        "the placement at step 1 is the FIRST undone step's pre-solve snapshot"
+    )
+    # Both joints still come off, in step order.
+    assert plan["joints_to_delete"] == ["J_1", "J_2"]
+
+
+def test_rollback_of_a_clean_tail_still_restores_each_link(asm_home):
+    """Two links moved by different steps keep their own snapshots (the forward
+    walk must not let one link's entry shadow another's)."""
+    s = astate.start_session("Car", "Chassis", "t")
+    astate.record_step(s, "start", "ground Chassis", {"ground": "Chassis"}, _empty_undo())
+    first = astate.record_step(
+        s,
+        "mate",
+        "A move",
+        {"joint": "J_1"},
+        {**_empty_undo(), "links_restore": {"A": {"Base": {"x": 1, "y": 0, "z": 0}}}},
+    )
+    second = astate.record_step(
+        s,
+        "mate",
+        "B move",
+        {"joint": "J_2"},
+        {**_empty_undo(), "links_restore": {"B": {"Base": {"x": 2, "y": 0, "z": 0}}}},
+    )
+    assert (first.step_number, second.step_number) == (2, 3)
+    plan = astate.plan_rollback(s, 1)
+    assert plan["links_restore"] == {
+        "A": {"Base": {"x": 1, "y": 0, "z": 0}},
+        "B": {"Base": {"x": 2, "y": 0, "z": 0}},
+    }

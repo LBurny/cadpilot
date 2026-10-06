@@ -737,10 +737,15 @@ QLabel#PanelStatus {{ color: {c["dim"]}; padding: 5px 8px 4px 8px; }}
     def _update_actions(self) -> None:
         rec = self._selected_record()
         has_doc = FreeCAD.ActiveDocument is not None
-        has_planned = any(r.state == sj.STATE_PLANNED for r in self._records)
+        # The cursor is next_runnable (planned OR failed): a failed step's
+        # transaction aborted, so its effect is not in the model and Next must
+        # be able to retry it. Gating on planned-only disabled both buttons the
+        # moment the last planned step failed, which made the documented
+        # "edit it, then press Next" flow unreachable from the panel.
+        can_run = has_doc and sj.next_runnable(self._records) is not None
         any_done = any(r.state == sj.STATE_DONE for r in self._records)
-        self.act_next.setEnabled(has_doc and has_planned)
-        self.act_all.setEnabled(has_doc and has_planned)
+        self.act_next.setEnabled(can_run)
+        self.act_all.setEnabled(can_run)
         self.act_replay.setEnabled(has_doc and any_done)
         self.act_snapshot.setEnabled(has_doc)
         done = rec is not None and rec.state == sj.STATE_DONE
@@ -813,7 +818,13 @@ QLabel#PanelStatus {{ color: {c["dim"]}; padding: 5px 8px 4px 8px; }}
         if not index or doc is None:
             return
         plan = sj.plan_rollback(step_engine.read_journal(doc), index - 1)
-        if plan["undo_count"] == 0:
+        if plan["undo_count"] == 0 and not (plan["blocking"] or plan["accepted"]):
+            # undo_count counts only transaction-bearing records, so a range
+            # holding a MUTATED non-atomic record (a legacy record, or steps
+            # behind a snapshot) reads as "nothing to undo" here while the
+            # engine would still rebuild/partial to the target. Bailing out that
+            # early hid the only recovery the user has, so those cases fall
+            # through to _apply_maybe_force, which offers the force retry.
             self._warn(f"Nothing has been executed before step {index}.")
             return
         text = (
@@ -863,7 +874,7 @@ QLabel#PanelStatus {{ color: {c["dim"]}; padding: 5px 8px 4px 8px; }}
         if doc is None:
             return
         plan = sj.plan_rollback(step_engine.read_journal(doc), 0)
-        if plan["undo_count"] == 0:
+        if plan["undo_count"] == 0 and not (plan["blocking"] or plan["accepted"]):
             self._warn("Nothing has been executed yet.")
             return
         if not self._confirm(

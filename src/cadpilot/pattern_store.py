@@ -32,15 +32,24 @@ def _store_path() -> Path:
     return data_dir() / "patterns.json"
 
 
-def _load() -> list[dict[str, Any]]:
+def _load() -> list[dict[str, Any]] | None:
+    """The stored patterns: [] for an empty store, None when it cannot be read.
+
+    None is the "do not write" signal. An empty store and an unreadable one used
+    to be indistinguishable (both returned []), so one corrupt or truncated
+    patterns.json made the NEXT add_pattern overwrite the whole store with the
+    single entry being added: silent loss of every stored pattern, with no error
+    reported to the caller.
+    """
     path = _store_path()
     if not path.exists():
         return []
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
-        return []
-    return data if isinstance(data, list) else []
+        return None
+    # Valid JSON that is not a list is corrupt in exactly the same way.
+    return data if isinstance(data, list) else None
 
 
 def _save(patterns: list[dict[str, Any]]) -> None:
@@ -59,9 +68,19 @@ def add_pattern(
     tags: list[str] | None = None,
     source: str = "manual",
 ) -> dict[str, Any]:
-    """Add a pattern; returns the stored entry."""
+    """Add a pattern; returns the stored entry.
+
+    Raises RuntimeError when the store exists but cannot be read, instead of
+    silently replacing it (see _load).
+    """
     with _lock:
         patterns = _load()
+        if patterns is None:
+            raise RuntimeError(
+                f"the pattern store at {_store_path()} exists but cannot be read, so saving "
+                "would overwrite every pattern it holds. Move that file aside (or repair it) "
+                "and save again."
+            )
         entry = {
             "pattern_id": uuid.uuid4().hex[:10],
             "name": name,
@@ -93,7 +112,7 @@ def search_patterns(query: str, limit: int = 3) -> list[dict[str, Any]]:
         return []
     scored: list[tuple[int, dict[str, Any]]] = []
     with _lock:
-        for entry in _load():
+        for entry in _load() or []:
             haystack = " ".join(
                 [
                     entry.get("name", ""),
@@ -116,12 +135,12 @@ def search_patterns(query: str, limit: int = 3) -> list[dict[str, Any]]:
 
 def list_patterns(limit: int = 50) -> list[dict[str, Any]]:
     with _lock:
-        return _load()[-limit:]
+        return (_load() or [])[-limit:]
 
 
 def get_pattern(pattern_id: str) -> dict[str, Any] | None:
     with _lock:
-        for entry in _load():
+        for entry in _load() or []:
             if entry.get("pattern_id") == pattern_id:
                 return entry
     return None

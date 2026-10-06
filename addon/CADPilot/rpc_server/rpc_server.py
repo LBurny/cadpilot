@@ -770,9 +770,18 @@ class FreeCADRPC:
         """
         return self._undo_redo(doc_name, n, undo=True, trust_journal=trust_journal)
 
-    def redo_transactions(self, doc_name: str, n: int = 1) -> dict[str, Any]:
-        """Redo n previously undone transactions (only valid until a new op)."""
-        return self._undo_redo(doc_name, n, undo=False)
+    def redo_transactions(
+        self, doc_name: str, n: int = 1, trust_journal: bool = False
+    ) -> dict[str, Any]:
+        """Redo n previously undone transactions (only valid until a new op).
+
+        ``trust_journal`` mirrors undo_transactions: the caller (a session redo)
+        passes it positionally, and without the parameter here XML-RPC raised
+        TypeError on every redo, so session(action='redo') could never work —
+        the addon was invoked with three positional args by a client that has
+        always sent them.
+        """
+        return self._undo_redo(doc_name, n, undo=False, trust_journal=trust_journal)
 
     # --- step journal (steps panel / staged execution) -----------------------
 

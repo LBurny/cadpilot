@@ -157,10 +157,13 @@ def record_step(
 
 
 def plan_rollback(session: AssemblySession, to_step: int) -> dict[str, Any]:
-    """聚合 to_step 之后所有步骤的 undo（逆序）为单个 rollback_step spec。
+    """聚合 to_step 之后所有步骤的 undo（正序）为单个 rollback_step spec。
 
-    links_restore 记录的是每步**之前**的 Link 位姿快照；逆序遍历时
-    setdefault 保留最靠后步骤的快照，即最接近 to_step 时刻的状态。
+    links_restore 记录的是每步**之前**的 Link 位姿快照。要回到 to_step 时刻，
+    需要的是**最早**那个被撤销步骤的快照（即 to_step+1 步骤之前的位姿），所以按
+    step_number 正序遍历并 setdefault 保留它。逆序遍历 + setdefault 会留住最晚
+    步骤的快照（离 to_step 最远，等于多退一步）：一个 Link 被连续两步移动时，
+    rollback 会停在错误的位姿上却报成功。
     """
     joints: list[str] = []
     cuts: list[str] = []
@@ -168,7 +171,7 @@ def plan_rollback(session: AssemblySession, to_step: int) -> dict[str, Any]:
     repoint: dict[str, Any] = {}
     remove_links: list[str] = []
     remove_assembly: str | None = None
-    for step in reversed([s for s in session.steps if s.step_number > to_step]):
+    for step in [s for s in session.steps if s.step_number > to_step]:
         undo = step.undo
         joints += list(undo.get("joints_to_delete", []))
         cuts += list(undo.get("cuts_to_delete", []))

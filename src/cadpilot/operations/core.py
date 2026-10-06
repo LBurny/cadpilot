@@ -399,7 +399,12 @@ def get_objects_operation(
 def list_documents_operation(
     freecad: FreeCADConnection, limit: int = 50, offset: int = 0
 ) -> ToolResponse:
-    documents = freecad.list_documents()
+    try:
+        documents = freecad.list_documents()
+    except Exception as e:
+        # Every peer read returns its failure inside the result; this one let
+        # the exception escape as a protocol-level error instead.
+        return text_response(f"Could not list the open documents: {e!s}")
     documents = documents if isinstance(documents, list) else []
     return json_response(
         {"success": True, **_page_envelope(documents, limit, offset, key="documents")}
@@ -1350,13 +1355,21 @@ def session_complete_operation(
         except Exception as e:
             save_warning = str(e)
 
-    pattern = add_pattern(
-        name=sess.name,
-        description=description or f"Modeling workflow for document '{sess.doc_name}'",
-        steps=[f"{s.step_number}. {s.operation} — {s.description}" for s in sess.steps],
-        tags=tags,
-        source="session",
-    )
+    try:
+        pattern = add_pattern(
+            name=sess.name,
+            description=description or f"Modeling workflow for document '{sess.doc_name}'",
+            steps=[f"{s.step_number}. {s.operation} — {s.description}" for s in sess.steps],
+            tags=tags,
+            source="session",
+        )
+    except Exception as e:
+        # The session still completes (its log is sound); only the pattern
+        # memory entry is refused, and the caller is told why.
+        pattern = None
+        pattern_warning = str(e)
+    else:
+        pattern_warning = ""
     sess.status = "completed"
     save_session(sess)
     set_current_session(None)
@@ -1365,11 +1378,17 @@ def session_complete_operation(
             "success": True,
             "session_id": sess.session_id,
             "steps_recorded": sess.step_count,
-            "pattern_id": pattern["pattern_id"],
+            "pattern_id": pattern["pattern_id"] if pattern else None,
             "saved_file": saved_file,
             "save_warning": save_warning,
-            "message": f"Session completed; workflow stored as pattern '{pattern['pattern_id']}'. "
-            "Recall it later with recall_patterns().",
+            "pattern_warning": pattern_warning or None,
+            "message": (
+                f"Session completed; workflow stored as pattern '{pattern['pattern_id']}'. "
+                "Recall it later with recall_patterns()."
+                if pattern
+                else f"Session completed, but the workflow was not stored as a pattern: "
+                f"{pattern_warning}"
+            ),
         }
     )
 
@@ -1493,7 +1512,15 @@ def save_pattern_operation(
     code: str = "",
     tags: list[str] | None = None,
 ) -> ToolResponse:
-    entry = add_pattern(name=name, description=description, code=code, tags=tags, source="manual")
+    try:
+        entry = add_pattern(
+            name=name, description=description, code=code, tags=tags, source="manual"
+        )
+    except Exception as e:
+        # A failure stays inside the result (the project's convention), and this
+        # one has a cause the caller must act on: an unreadable store is refused
+        # rather than overwritten.
+        return text_response(f"Could not store the pattern: {e!s}")
     return json_response(
         {
             "success": True,
