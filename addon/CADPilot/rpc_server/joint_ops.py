@@ -385,7 +385,7 @@ def _op_start(doc, spec: dict) -> dict:
     JointObject, UtilsAssembly = _joint_mods()
     if doc.getObject(ASSEMBLY_NAME) is not None:
         raise ValueError(
-            f'{ASSEMBLY_NAME} already exists and no active MCP session owns it '
+            f"{ASSEMBLY_NAME} already exists and no active MCP session owns it "
             "(complete never deletes the assembly; it stays as the model's joints). "
             "To start over, delete it via execute_code first: "
             "doc = App.ActiveDocument; "

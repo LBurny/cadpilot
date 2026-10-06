@@ -43,7 +43,9 @@ def save_settings(settings):
     try:
         # tmp + replace (unique tmp): a torn in-place write left corrupt JSON
         # and load_settings then silently reset every setting to defaults.
-        fd, tmp_name = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".settings.", suffix=".tmp")
+        fd, tmp_name = tempfile.mkstemp(
+            dir=os.path.dirname(path), prefix=".settings.", suffix=".tmp"
+        )
         tmp_path = tmp_name
         try:
             with os.fdopen(fd, "w") as f:
