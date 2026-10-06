@@ -191,6 +191,61 @@ def test_probe_rpc_and_tcp_probe_report_a_closed_port():
     assert diag.tcp_open("127.0.0.1", port, timeout=1) is False
 
 
+def test_probe_gui_state_reads_the_back_pressure_reason():
+    """The recovery dialog FreeCAD opens after an unclean shutdown blocks every
+    document call while ping still answers (it is not GUI-dispatched), so the
+    only way to tell that from a wedged thread is to ask the addon."""
+    server = xmlrpc.server.SimpleXMLRPCServer(("127.0.0.1", 0), allow_none=True, logRequests=False)
+    server.register_function(
+        lambda: {
+            "success": True,
+            "defer_reason": "modal",
+            "defer_label": "a modal dialog is open",
+            "deferred_s": 12.5,
+            "processing": False,
+            "processing_s": 0.0,
+            "queue_depth": 2,
+        },
+        "get_gui_state",
+    )
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        state = diag.probe_gui_state("127.0.0.1", port, timeout=5)
+        note = diag.gui_state_note(state)
+        verdict = diag._verdict({"reachable": True}, [], [], [], None, state)
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+    assert state["available"] is True
+    assert state["defer_reason"] == "modal"
+    assert "MODAL DIALOG" in note
+    assert "dismiss_blocking_dialog" in note, "the programmatic way out must come first"
+    assert "Cancel" in note and "Start recovery" in note, "the note must name the resolution"
+    # The prose is ENGLISH like every other CADPilot message; only the literal
+    # on-screen button labels appear in their localized form, in parentheses.
+    cjk = [ch for ch in note if "\u4e00" <= ch <= "\u9fff"]
+    inside = []
+    depth = 0
+    for ch in note:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        elif depth and "\u4e00" <= ch <= "\u9fff":
+            inside.append(ch)
+    assert cjk and len(inside) == len(cjk), f"localized labels must stay parenthesized: {note}"
+    assert "MODAL DIALOG" in verdict
+    # An addon that predates the method is reported, not treated as a fault.
+    assert diag.gui_state_note({"available": False, "error": "no get_gui_state"}) == "", (
+        "an old addon must not be blamed"
+    )
+    assert diag._verdict({"reachable": True}, [], [], []) == (
+        "FreeCAD is reachable — the RPC server answered."
+    )
+
+
 # --- verdict + report --------------------------------------------------------
 
 

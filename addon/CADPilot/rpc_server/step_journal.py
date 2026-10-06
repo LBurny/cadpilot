@@ -537,6 +537,62 @@ def steps_without_undo(records: list[StepRecord], index: int) -> list[int]:
     ]
 
 
+def undo_trust_span(
+    stack_names: list[str], records: list[StepRecord], upto_index: int, undo_count: int
+) -> int:
+    """How many of the rollback's newest transactions ``stack_names`` still holds.
+
+    ``stack_names`` is FreeCAD's undo stack, newest first, with other documents'
+    ghost entries removed. FreeCAD caps that stack (the ``MaxUndoSize``
+    preference, 20 by default), so a journal longer than the cap can NEVER
+    supply the whole span: the oldest entries were evicted by FreeCAD, not by an
+    edit. Comparing the whole span then reads a capped stack as "does not hold
+    the journal's transactions" (the reopened-document verdict) and forces the
+    destructive rebuild path even though every entry the stack still has matches
+    the journal, in order (live-caught: rollback to 0 on a 24-transaction
+    journal reported exactly that, while the top 20 names were identical).
+
+    Only DONE records count, exactly as in ``plan_rollback``: a FAILED record
+    owns no undo entry (its transaction aborted), so letting its name into the
+    expectation would break the prefix at a step the stack never held — and a
+    failed record can still carry the transaction string of an EARLIER
+    successful run of the same step, which is the stale name that made a
+    perfectly healthy rollback look untrustworthy and rebuilt the model.
+
+    Returns the length of the matching prefix, so a caller can undo what the
+    stack really holds and say honestly what it could not reach. A foreign
+    (off-journal) transaction in the way stops the prefix there, which is the
+    case where popping further would undo the WRONG transaction.
+    """
+    expected = [
+        rec.transaction
+        for rec in reversed(records)
+        if rec.index > upto_index and rec.state == STATE_DONE and rec.transaction
+    ]
+    span = 0
+    # strict=False: the stack is legitimately SHORTER than the span when FreeCAD
+    # has already evicted entries, and that shortfall is the answer.
+    for name, want in zip(stack_names, expected, strict=False):
+        if name != want:
+            break
+        span += 1
+    return span
+
+
+def done_after_index(records: list[StepRecord], index: int) -> int:
+    """How many DONE records sit after ``index``: the ones ``rewind`` must move.
+
+    A rollback's rewind count is NOT ``done_count(records) - index``: that
+    assumes records 1..index are all done, so any FAILED or PLANNED hole inside
+    them makes the count too small and leaves later records marked ``done``
+    while their transactions were already undone — the journal then claims work
+    the model no longer has (live-caught: ``[failed, done]`` rolled back to 1
+    rewound nothing). Counting the records the rollback actually affected is
+    the same number ``plan_rollback`` reports as ``affected``.
+    """
+    return sum(1 for rec in records if rec.index > index and rec.state == STATE_DONE)
+
+
 def unrecoverable_steps(records: list[StepRecord], index: int) -> list[int]:
     """Done steps up to ``index`` that nothing can put back.
 
@@ -1054,6 +1110,46 @@ def _batch_sync_ops(rec: StepRecord) -> list[tuple[int, str, dict[str, Any]]]:
     return out
 
 
+def _acted_name(params: dict[str, Any]) -> str:
+    """The object a step actually acted on.
+
+    ``moved_object`` is the op's own record of what it moved, and it differs
+    from the request whenever FreeCAD redirects the op: a PartDesign feature
+    does not own its frame, so the move builder moves the owning BODY and names
+    it in the reply. Claiming the requested name instead left the Body
+    untracked — a manual drag of it synced nowhere — while handing the claim to
+    a feature whose Placement every recompute rewrites.
+    """
+    p = params or {}
+    return str(p.get("moved_object") or p.get("obj_name") or "")
+
+
+def _created_name(rec: StepRecord, sub: dict[str, Any]) -> str:
+    """The name a create sub-op really created (FreeCAD de-duplicates).
+
+    Recorded truth first — the batch annotates each sub-op with the object it
+    created — then the single-creation case, where the record's own object diff
+    names it unambiguously. A multi-create batch recorded before that
+    annotation existed still falls back to the requested name.
+    """
+    name = str(sub.get("obj_name") or "")
+    if sub_operation(sub) != "create_object":
+        return name
+    created = sorted(set(rec.objects_after) - set(rec.objects_before))
+    return str(sub.get("created_object") or "") or (created[0] if len(created) == 1 else name)
+
+
+def _claims_cells(op: str, props: dict[str, Any]) -> bool:
+    """Does this step own the spreadsheet it names?
+
+    ``variables`` builds one; a ``create_object``/``edit_object`` can create or
+    fill one, and the spec's ``cells`` dict is exactly what ``_sync_cells``
+    reads and writes back. Without the claim, a hand-edited cell in a sheet
+    that a create_object built synced nowhere.
+    """
+    return op == "variables" or isinstance((props or {}).get("cells"), dict)
+
+
 def tracked_objects(records: list[StepRecord]) -> dict[str, dict[str, Any]]:
     """object name -> sync handlers, from done steps.
 
@@ -1064,8 +1160,10 @@ def tracked_objects(records: list[StepRecord]) -> dict[str, dict[str, Any]]:
                    unless a move step targets the object, because a move is
                    relative and an absolute create-time Placement plus the
                    move would double-apply on reexecute.
-      ``sheet``  — index of the variables step owning the spreadsheet.
-      ``sketch`` — index of the sketch step owning the sketch.
+      ``sheet``  — (step index, batch sub-op) of the step owning the spreadsheet:
+                   ``variables``, or any step whose spec carries a ``cells``
+                   dict.
+      ``sketch`` — (step index, sub) of the sketch step owning the sketch.
       ``move``   — (index, sub) of the LAST done move targeting the object
                    (top-level step or a move sub-op inside a batch). A manual
                    drag folds into it as an absolute placement override
@@ -1078,19 +1176,23 @@ def tracked_objects(records: list[StepRecord]) -> dict[str, dict[str, Any]]:
     names the object and carries the scalars a manual edit maps back onto);
     feature sub-ops do not — their created object cannot be attributed from
     the record-level object diff.
+
+    Every claim follows the object the step really acted on: a re-directed
+    move claims its Body (``moved_object``), a de-duplicated create claims the
+    name FreeCAD assigned, not the one that was requested.
     """
     last_move: dict[str, tuple[int, int | None]] = {}
     for r in records:
         if r.state != STATE_DONE:
             continue
         if r.operation == "move":
-            name = str((r.params or {}).get("obj_name") or "")
+            name = _acted_name(r.params or {})
             if name:
                 last_move[name] = (r.index, None)
         elif r.operation == "batch":
             for sub_i, sub_op, sub in _batch_sync_ops(r):
                 if sub_op == "move":
-                    name = str(sub.get("obj_name") or "")
+                    name = _acted_name(sub)
                     if name:
                         last_move[name] = (r.index, sub_i)
 
@@ -1105,7 +1207,7 @@ def tracked_objects(records: list[StepRecord]) -> dict[str, dict[str, Any]]:
                     continue  # the fold handler owns move sub-ops
                 props = sub.get("obj_properties") or {}
                 claims = {k: k for k, v in props.items() if isinstance(v, (int, float, str, bool))}
-                name = str(sub.get("obj_name") or "")
+                name = _created_name(rec, sub)
                 if not name:
                     continue
                 entry = tracked.setdefault(
@@ -1115,6 +1217,8 @@ def tracked_objects(records: list[StepRecord]) -> dict[str, dict[str, Any]]:
                     entry["props"][prop] = (rec.index, key, sub_i)
                 if sub_op == "create_object" and name not in last_move:
                     entry["props"]["Placement"] = (rec.index, "Placement", sub_i)
+                if _claims_cells(sub_op, props):
+                    entry["sheet"] = (rec.index, sub_i)
             continue
         props = params.get("obj_properties") or {}
         op = rec.operation
@@ -1141,12 +1245,14 @@ def tracked_objects(records: list[StepRecord]) -> dict[str, dict[str, Any]]:
                 entry["props"]["Placement"] = (rec.index, "Placement", None)
             # The sheet/sketch handlers belong to the object the step NAMES —
             # the diff can also hold incidental creations (a sketch's Body),
-            # which must not answer constraint/cell lookups.
-            if name == str(params.get("obj_name") or ""):
-                if op == "variables":
-                    entry["sheet"] = rec.index
-                elif op == "sketch":
-                    entry["sketch"] = rec.index
+            # which must not answer constraint/cell lookups. For create_object
+            # the diff name IS the named object (FreeCAD may have de-duplicated
+            # the request), so that is what counts.
+            is_named = op == "create_object" or name == str(params.get("obj_name") or "")
+            if is_named and _claims_cells(op, props):
+                entry["sheet"] = (rec.index, None)
+            elif is_named and op == "sketch":
+                entry["sketch"] = (rec.index, None)
 
     for name, (idx, sub) in last_move.items():
         entry = tracked.setdefault(name, {"props": {}, "sheet": None, "sketch": None, "move": None})

@@ -309,6 +309,59 @@ def test_undo_count_skips_records_without_a_transaction():
     assert sj.plan_reject(recs, 2)["undo_count"] == 1
 
 
+def _txn_records(count: int) -> list:
+    """``count`` done, transaction-bearing records, oldest first."""
+    recs = [
+        sj.build_record(_step("create_object", f"Box{i}"), i, sj.STATE_DONE, OPS)
+        for i in range(1, count + 1)
+    ]
+    for rec in recs:
+        rec.transaction = f"CADPilot: create_object Box{rec.index}"
+    return recs
+
+
+def test_undo_trust_span_survives_freecads_undo_cap():
+    """A journal longer than MaxUndoSize can never satisfy a whole-span check:
+    FreeCAD evicted the oldest entries while every survivor still matches, in
+    order. Reading that as "the undo stack does not hold the journal's
+    transactions" (the reopened-document verdict) popped nothing and forced a
+    full rebuild on every rollback deeper than the cap — live-caught on a
+    24-transaction journal rolled back to 0, whose top 20 names were identical
+    to the journal's."""
+    recs = _txn_records(24)
+    stack = [r.transaction for r in reversed(recs)][:20]  # newest 20, oldest evicted
+    assert sj.plan_rollback(recs, 0)["undo_count"] == 24
+    assert sj.undo_trust_span(stack, recs, 0, 24) == 20, "the span is what the stack holds"
+
+
+def test_undo_trust_span_stops_before_a_foreign_transaction():
+    """A manual GUI edit interleaves on the same stack; popping past a foreign
+    name would undo the WRONG transaction, so the matching prefix ends there."""
+    recs = _txn_records(4)
+    newest = [r.transaction for r in reversed(recs)]
+    assert sj.undo_trust_span([newest[0], newest[1], "Chamfer: Radius"], recs, 0, 4) == 2
+    assert sj.undo_trust_span(newest, recs, 0, 4) == 4
+
+
+def test_undo_trust_span_is_zero_without_a_matching_top():
+    recs = _txn_records(3)
+    assert sj.undo_trust_span([], recs, 0, 3) == 0
+    assert sj.undo_trust_span(["Some other transaction"], recs, 0, 3) == 0
+
+
+def test_undo_trust_span_covers_only_the_span_being_rolled_back():
+    """Rolling back to step 2 of 5 needs the 3 newest transactions, so a stack
+    holding exactly those is complete: the older entries are not part of the
+    span. A rollback with nothing to undo is trivially covered."""
+    recs = _txn_records(5)
+    newest = [r.transaction for r in reversed(recs)]
+    assert sj.plan_rollback(recs, 2)["undo_count"] == 3
+    assert sj.undo_trust_span(newest[:3], recs, 2, 3) == 3
+    assert sj.undo_trust_span(newest[:2], recs, 2, 3) == 2
+    assert sj.plan_rollback(recs, 5)["undo_count"] == 0
+    assert sj.undo_trust_span([], recs, 5, 0) == 0
+
+
 def test_plan_rollback_flags_non_atomic_steps():
     recs = [sj.build_record(_step(), 1, sj.STATE_DONE, OPS)]
     recs.append(sj.build_record(_step("execute_code"), 2, sj.STATE_DONE, OPS))
@@ -560,7 +613,7 @@ def test_tracked_objects_variables_claims_the_sheet_even_when_idempotent():
         _rec("variables", 1, "Vars", {"cells": {"A1": ["w", 10]}}, before=["Vars"], after=["Vars"])
     ]
     entry = sj.tracked_objects(recs)["Vars"]
-    assert entry["sheet"] == 1
+    assert entry["sheet"] == (1, None)
     # the Body a sketch op created incidentally must NOT claim the sketch handlers
     recs = [
         _rec(
@@ -573,7 +626,7 @@ def test_tracked_objects_variables_claims_the_sheet_even_when_idempotent():
         )
     ]
     tracked = sj.tracked_objects(recs)
-    assert tracked["Sketch"]["sketch"] == 1
+    assert tracked["Sketch"]["sketch"] == (1, None)
     assert tracked["Body"]["sketch"] is None
 
 
@@ -725,6 +778,91 @@ def test_tracked_objects_claims_batch_sub_ops():
     )
     t2 = sj.tracked_objects([rec, rec2])
     assert t2["BatchA"]["props"]["Length"] == (8, "Length", 0)
+
+
+def test_tracked_objects_move_claims_the_body_that_really_moved():
+    """FreeCAD resets a PartDesign feature's Placement on every recompute, so the
+    move builder moves the owning BODY and the record carries it as
+    moved_object. Claiming the requested feature instead left the Body untracked
+    (dragging it synced nowhere) and handed the pose to an object that cannot
+    hold one."""
+    recs = [
+        _done_rec("pad", 1, {"obj_name": "Sketch"}, before=["Sketch"], after=["Body", "Pad"]),
+        _done_rec(
+            "move",
+            2,
+            {"obj_name": "Pad", "moved_object": "Body", "obj_properties": {"translate": [5, 0, 0]}},
+        ),
+    ]
+    t = sj.tracked_objects(recs)
+    assert t["Body"]["move"] == (2, None)
+    assert "move" not in t.get("Pad", {}) or t["Pad"]["move"] is None
+    # the Body's own create-time Placement claim is still released to the move
+    assert "Placement" not in t["Body"]["props"]
+
+
+def test_tracked_objects_create_object_on_a_sheet_owns_its_cells():
+    """A sheet that create_object built (or edit_object filled) carries a cells
+    spec, and that spec is exactly what a hand-edited cell syncs back into.
+    Without the claim only a later variables step could adopt the sheet, so the
+    edit vanished from the journal."""
+    recs = [
+        _done_rec(
+            "create_object",
+            1,
+            {"obj_name": "Sheet", "obj_properties": {"cells": {"A1": ["w", 10]}}},
+            after=["Sheet001"],
+        )
+    ]
+    t = sj.tracked_objects(recs)
+    # FreeCAD de-duplicated the requested name: the real object is what syncs
+    assert t["Sheet001"]["sheet"] == (1, None)
+    assert "Sheet" not in t
+    # a plain box is not a sheet owner
+    box = _done_rec(
+        "create_object", 2, {"obj_name": "Box", "obj_properties": {"Length": 10}}, after=["Box"]
+    )
+    assert sj.tracked_objects([box])["Box"]["sheet"] is None
+
+
+def test_tracked_objects_batch_claims_the_object_it_really_created():
+    """FreeCAD returns the name it assigned (BatchA -> BatchA001) while the
+    request keeps the one that was asked for; the sub-op records the truth, and
+    a single-creation batch is unambiguous from the record's own diff. The old
+    behaviour overwrote the REAL object's claims with the phantom name's."""
+    rec = _done_rec(
+        "batch",
+        5,
+        {
+            "ops": [
+                {
+                    "action": "create_object",
+                    "obj_name": "BatchA",
+                    "created_object": "BatchA001",
+                    "obj_properties": {"Height": 6},
+                },
+                {"action": "move", "obj_name": "Pad", "moved_object": "Body"},
+            ]
+        },
+        before=["BatchA"],
+        after=["BatchA", "BatchA001", "Pad"],
+    )
+    t = sj.tracked_objects([rec])
+    assert t["BatchA001"]["props"]["Height"] == (5, "Height", 0)
+    assert "BatchA" not in t  # the pre-existing object keeps its own step's claims
+    assert t["Body"]["move"] == (5, 1)  # the batch's redirected move, not "Pad"
+    # no annotation recorded (an older journal): the single-creation diff names it
+    legacy = _done_rec(
+        "batch",
+        6,
+        {
+            "ops": [
+                {"action": "create_object", "obj_name": "BatchB", "obj_properties": {"Height": 4}}
+            ]
+        },
+        after=["BatchB001"],
+    )
+    assert sj.tracked_objects([legacy])["BatchB001"]["props"]["Height"] == (6, "Height", 0)
 
 
 def test_drop_planned_removes_by_state_not_position():
@@ -1067,3 +1205,36 @@ def test_revolution_detail_defaults_to_a_full_turn():
     assert sj.feature_detail("revolution", {}) == "360°"
     assert sj.feature_detail("groove", {}) == "360°"
     assert sj.feature_detail("revolution", {"angle": 180}) == "180°"
+
+
+def test_undo_trust_span_ignores_failed_records_stale_transaction():
+    """A record that was re-run and FAILED owns no undo entry (its transaction
+    aborted), but it can still carry the transaction string of an EARLIER
+    successful run. Letting that name into the expectation broke the prefix at a
+    position the stack never held, so a healthy rollback degraded to the
+    destructive rebuild path (and, at to_index 0, emptied the model)."""
+    recs = _txn_records(3)
+    stack = [recs[2].transaction, recs[0].transaction]
+    recs[1].state = sj.STATE_PLANNED
+    recs[1].transaction = ""
+    assert sj.undo_trust_span(stack, recs, 0, 2) == 2
+    recs[1].state = sj.STATE_FAILED
+    recs[1].transaction = "CADPilot: pad OldName"  # stale, not on the stack
+    assert sj.undo_trust_span(stack, recs, 0, 2) == 2, (
+        "only DONE records may contribute a name to the expectation"
+    )
+
+
+def test_done_after_index_survives_holes_before_the_target():
+    """Rewinding ``done_count - index`` under-counts when a FAILED or PLANNED
+    record sits inside 1..index: those records stayed marked ``done`` while their
+    transactions were already undone, so the journal claimed work the model no
+    longer had (live-caught: ``[failed, done]`` rolled back to 1 rewound
+    nothing)."""
+    recs = [sj.build_record(_step(), i, sj.STATE_DONE, OPS) for i in (1, 2)]
+    recs[0].state = sj.STATE_FAILED
+    recs[0].transaction = ""
+    recs[1].transaction = "CADPilot: create_object Box2"
+    assert sj.plan_rollback(recs, 1)["affected"] == [2]
+    assert sj.done_after_index(recs, 1) == 1
+    assert sj.done_count(recs) - 1 == 0, "the old arithmetic under-rewound by one"

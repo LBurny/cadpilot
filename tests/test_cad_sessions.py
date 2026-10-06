@@ -555,3 +555,71 @@ def test_step_control_failure_carries_the_document_state(fake_freecad, isolated_
     assert "bad alias" in text
     assert "rolled the document back to step 0" in text
     assert "now holds: (nothing)" in text
+
+
+def test_noop_transaction_is_not_recorded_as_atomic(fake_freecad, isolated_home):
+    """``transaction: True`` only means a transaction was OPEN; ``undoable`` says
+    an undo entry really landed. A same-value edit opens one and commits nothing,
+    and counting it as atomic made session rollback pop one transaction too many
+    — invisibly, because only properties had moved and the object-set check
+    compares names."""
+    sess = _start_session(fake_freecad)
+    fake_freecad.objects_by_doc["Doc"] = ["Box"]
+    fake_freecad.result_overrides["edit_object"] = {
+        "success": True,
+        "object_name": "Box",
+        "transaction": True,
+        "undoable": False,  # the addon downgraded it: nothing landed
+        "objects": ["Box"],
+    }
+    cad_operation(fake_freecad, "edit_object", "Doc", obj_name="Box", obj_properties={"Height": 10})
+    assert sess.step_count == 1
+    assert sess.steps[0].atomic is False, "a commit with no undo entry must not count as a step"
+
+
+def test_execute_code_session_step_records_the_object_fingerprint(fake_freecad, isolated_home):
+    """Without the addon's object list an execute_code step's fingerprint was
+    empty, so a rollback ending on such a step compared the model against an
+    empty document and reported a false ROLLBACK INCOMPLETE."""
+    sess = _start_session(fake_freecad)
+    fake_freecad.result_overrides["execute_code"] = {
+        "success": True,
+        "changed": True,
+        "document": "Doc",
+        "attributed": True,
+        "objects": ["Box", "Pin"],
+        "message": "ok",
+    }
+    execute_code_operation(fake_freecad, "doc = App.ActiveDocument", doc_name="Doc")
+    assert sess.step_count == 1
+    assert sess.steps[0].objects_after == ["Box", "Pin"]
+
+
+def test_session_rollback_asks_the_addon_to_refuse_foreign_entries(fake_freecad, isolated_home):
+    """The session cannot name the transactions it expects (its step numbers are
+    not journal indices), so the addon must refuse to pop entries that are not
+    CADPilot's own: a manual GUI edit sitting on top was otherwise consumed in a
+    step's place, silently, because only properties had moved."""
+    # The session's starting fingerprint must include the box, or the forced
+    # rollback below reports a mismatch for a rollback that worked.
+    fake_freecad.objects_by_doc["Doc"] = ["Box"]
+    sess = _start_session(fake_freecad)
+    cad_operation(fake_freecad, "edit_object", "Doc", obj_name="Box", obj_properties={"Height": 10})
+    fake_freecad.result_overrides["undo_transactions"] = {
+        "success": False,
+        "error": "1 of the 1 transaction(s) the undo would pop were not created by CADPilot: "
+        "['Box.Height']. A manual FreeCAD edit or another tool's write owns them",
+        "foreign_entries": ["Box.Height"],
+    }
+    text = _text(session_rollback_operation(fake_freecad, 0))
+    assert "not created by CADPilot" in text
+    calls = [c for c in fake_freecad.calls if c[0] == "undo_transactions"]
+    assert calls[-1][1] == ("Doc", 1) and calls[-1][2].get("trust_journal") is True
+    assert sess.step_count == 1, "a refused rollback must not truncate the session log"
+
+    # force=True proceeds: the caller takes the risk, said so, and the check is
+    # not sent (the addon then behaves exactly as before the guard).
+    fake_freecad.result_overrides.pop("undo_transactions")
+    assert _json(session_rollback_operation(fake_freecad, 0, force=True))["success"] is True
+    assert [c for c in fake_freecad.calls if c[0] == "undo_transactions"][-1][1] == ("Doc", 1)
+    assert sess.step_count == 0

@@ -95,13 +95,13 @@ def test_move_accepts_list_vectors():
     """The whole API takes plain coordinate lists; move's dict-only form used
     to crash with "'list' object has no attribute 'get'" on the natural input."""
     body = _func(_FEATURE, "_build_move")
-    assert any(isinstance(n, ast.Name) and n.id == "_move_vec3" for n in ast.walk(body)), (
+    assert any(isinstance(n, ast.Name) and n.id == "_vec3" for n in ast.walk(body)), (
         "translate/rotate/placement vectors must go through a list-tolerant parser"
     )
 
 
-def test_move_vec3_helper_parses_lists_and_dicts():
-    helper = _func(_FEATURE, "_move_vec3")
+def test_vec3_helper_parses_lists_and_dicts():
+    helper = _func(_FEATURE, "_vec3")
     seg = ast.unparse(helper)
     assert "list" in seg and "tuple" in seg, "lists must be accepted"
     assert "dict" in seg, "dicts must stay accepted"
@@ -141,6 +141,101 @@ def test_recompute_failure_reports_status_string():
 
 def _names(node) -> set[str]:
     return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+
+
+def test_predecessor_shapes_are_settled_before_building():
+    """FreeCAD builds a PartDesign shape LAZILY and a feature whose predecessor
+    is unbuilt computes to a Touched/Null shape with no error. Live on 1.1.4:
+    after reopening a saved model an identical pocket re-run (the same params
+    that had built fine) produced no shape at all, and reading the SKETCH's
+    Shape first made the same build return the analytic result exactly
+    (58800 -> 57207.2 mm^3, one through hole). A recompute is not enough: the
+    READ is what performs the build."""
+    gui = _func(_FEATURE, "create_feature_gui")
+    assert "_settle_shape_caches" in _names(gui), (
+        "the referenced objects must be settled before the builder runs"
+    )
+    settle = _func(_FEATURE, "_settle_shape_caches")
+    assert "Shape" in _strings(settle) or any(
+        isinstance(n, ast.Attribute) and n.attr == "Shape" for n in ast.walk(settle)
+    ), "settling means READING the Shape"
+    assert "Tip" in _strings(settle), "a Body member's baseline is the Body's Tip"
+
+
+def test_shape_volume_probe_sits_inside_the_guard():
+    """The shape read was guarded but the volume probe was not, and a lazily
+    built PartDesign shape raises FreeCAD's "shape is invalid" on the FIRST
+    access while reading fine on the second — so a fillet OCC could not build
+    reported those two words as the ENTIRE error: no object name, no cause, no
+    workaround (live on 1.1.4; it cost a full investigation). The read now lives
+    in one place, guarded and retried once."""
+    reader = _func(_FEATURE, "_read_shape_state")
+    assert "Volume" in _strings(reader), "the volume probe belongs inside the guard"
+    assert "recompute" in {n.attr for n in ast.walk(reader) if isinstance(n, ast.Attribute)}, (
+        "and the read must be retried once"
+    )
+    tries = [n for n in ast.walk(reader) if isinstance(n, ast.Try)]
+    assert any("Volume" in _strings(stmt) for node in tries for stmt in node.body), (
+        "the volume probe must be inside the retried try"
+    )
+    gui = _func(_FEATURE, "create_feature_gui")
+    assert "_read_shape_state" in _names(gui), "and the builder must use it"
+
+
+def test_failed_multi_edge_dress_up_names_the_edge():
+    """A multi-edge fillet OCC refuses reported a bare "shape is invalid" while
+    every edge was fine on its own (live on 1.1.4: the six bore rims of a
+    patterned plate at 0.5 mm — single rims and the top rims as a pair worked,
+    only the bottom rims fail as a set). "Invalid" is not actionable; "split the
+    edges across several fillet calls" is, so the op retries edge by edge and
+    says what it found."""
+    build = _func(_FEATURE, "_build_fillet_chamfer")
+    assert "_remember_dress_context" in _names(build), "the builder must leave the context"
+    detail = _func(_FEATURE, "_dress_failure_detail")
+    assert "probe" in _strings(detail) and "probe" in _names(detail), (
+        "the diagnosis must re-point the feature at one edge at a time"
+    )
+    assert "_dress_shape_usable" in _names(build), "each retry is judged by its own shape"
+    gui = _func(_FEATURE, "create_feature_gui")
+    assert "_dress_retry_repair" in _names(gui), (
+        "a Null shape from a stale recompute must be retried before failing the caller's step"
+    )
+    retry = _func(_FEATURE, "_dress_retry_repair")
+    assert "probe" in _strings(retry) and "names" in _names(retry), (
+        "the retry re-applies the SAME edge set"
+    )
+    gui = _func(_FEATURE, "create_feature_gui")
+    refs = [n for n in ast.walk(gui) if isinstance(n, ast.Name) and n.id == "_dress_failure_detail"]
+    assert len(refs) >= 2, "both failure branches (Invalid state and unreadable shape) must name it"
+
+
+def test_polar_pattern_honours_center():
+    """``center`` was read only by the Draft (Part-level) path; a PartDesign
+    polar pattern always turned about the body's origin axis. Live on 1.1.4: a
+    bolt circle drawn around a face centre (the hole at (60,35), plate 70x70x8)
+    came out as ONE clean hole plus one half-hole clipped by the plate edge,
+    with the tool reporting success — the 6-hole result is 36787.26 mm^3, the
+    clipped one 38691.44 mm^3. The centre is expressed with a datum line, the
+    same reference the GUI uses; a free Placement is what positions it
+    (MapMode "Translate" over the origin line does NOT move it)."""
+    builder = _func(_FEATURE, "_build_pd_pattern")
+    assert "_centered_axis_line" in _names(builder), (
+        "the PartDesign polar branch must use the centred axis line when center is given"
+    )
+    assert "center" in {
+        c.value
+        for c in ast.walk(builder)
+        if isinstance(c, ast.Constant) and isinstance(c.value, str)
+    }, "and it must read the spec's center"
+    helper = _func(_FEATURE, "_centered_axis_line")
+    assert any(isinstance(n, ast.Attribute) and n.attr == "Placement" for n in ast.walk(helper)), (
+        "the datum line is positioned by its Placement"
+    )
+    assert "Deactivated" in {
+        c.value
+        for c in ast.walk(helper)
+        if isinstance(c, ast.Constant) and isinstance(c.value, str)
+    }, "attaching it (any other MapMode) leaves it on the origin"
 
 
 def test_new_feature_is_pushed_as_its_body_tip():

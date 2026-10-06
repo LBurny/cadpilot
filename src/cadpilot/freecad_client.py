@@ -179,6 +179,23 @@ class FreeCADConnection:
     def ping(self) -> bool:
         return self._invoke("ping")
 
+    def get_gui_state(self) -> dict[str, Any]:
+        """Why the addon's GUI queue is (or is not) draining.
+
+        The answer names a held-back queue (a modal dialog, the user mid-drag, a
+        long recompute) instead of leaving "nothing runs" looking like a dead
+        FreeCAD. Old addons have no such method; the caller tolerates the fault.
+        """
+        return self._invoke("get_gui_state")
+
+    def dismiss_blocking_dialog(self) -> dict[str, Any]:
+        """Close the modal dialog that is holding CADPilot work back (Cancel).
+
+        Not queued behind the interaction guards, unlike every other call, so it
+        works while a modal dialog is the thing blocking the queue.
+        """
+        return self._invoke("dismiss_blocking_dialog")
+
     def create_document(
         self, name: str, screenshot: dict[str, Any] | None = None
     ) -> dict[str, Any]:
@@ -258,10 +275,24 @@ class FreeCADConnection:
             "execute_operations", doc_name, ops, stop_on_error, screenshot=screenshot
         )
 
-    def undo_transactions(self, doc_name: str, n: int = 1) -> dict[str, Any]:
+    def undo_transactions(
+        self, doc_name: str, n: int = 1, trust_journal: bool = False
+    ) -> dict[str, Any]:
+        """Undo n transactions; ``trust_journal`` refuses foreign entries.
+
+        The third argument is only sent when requested: XML-RPC is positional, so
+        an older addon (two parameters) keeps working unchanged.
+        """
+        if trust_journal:
+            return self._invoke("undo_transactions", doc_name, n, True)
         return self._invoke("undo_transactions", doc_name, n)
 
-    def redo_transactions(self, doc_name: str, n: int = 1) -> dict[str, Any]:
+    def redo_transactions(
+        self, doc_name: str, n: int = 1, trust_journal: bool = False
+    ) -> dict[str, Any]:
+        """Redo n transactions; ``trust_journal`` refuses foreign entries."""
+        if trust_journal:
+            return self._invoke("redo_transactions", doc_name, n, True)
         return self._invoke("redo_transactions", doc_name, n)
 
     def get_step_journal(self, doc_name: str) -> dict[str, Any]:

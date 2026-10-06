@@ -7,6 +7,7 @@ the transaction, so a failed feature leaves no residue.
 """
 
 import contextlib
+from typing import Any
 
 import FreeCAD
 import Part
@@ -288,8 +289,15 @@ def _build_fillet_chamfer(doc, spec, kind):
         # FreeCAD 1.1's PartDesign dress-up holds ONE scalar size for all edges
         # (the per-edge tuple form is Part-level only).
         feat = body.newObject(tip_policy.dress_type(kind, True), label)
+
+        def _probe(subset, feat=feat, target=target, doc=doc):
+            feat.Base = (target, list(subset))
+            doc.recompute()
+            return _dress_shape_usable(feat)
+
         feat.Base = (target, names)
         setattr(feat, tip_policy.dress_size_property(kind), size)
+        _remember_dress_context(kind, size, names, _probe)
         if named_body:
             # The caller named the BODY, so the reply must say which of its
             # features actually got dressed: "which feature is the Tip" is the
@@ -302,9 +310,23 @@ def _build_fillet_chamfer(doc, spec, kind):
         # in Edges as (1-based edge index, size_start, size_end) tuples.
         feat.Base = base
         feat.Edges = [(int(n[4:]), size, size) for n in names]
+
+        def _probe(subset, feat=feat, base=base, doc=doc, size=size):
+            feat.Base = base
+            feat.Edges = [(int(n[4:]), size, size) for n in subset]
+            doc.recompute()
+            return _dress_shape_usable(feat)
+
     else:
         feat.Base = (base, names)
         setattr(feat, tip_policy.dress_size_property(kind), size)
+
+        def _probe(subset, feat=feat, base=base, doc=doc):
+            feat.Base = (base, list(subset))
+            doc.recompute()
+            return _dress_shape_usable(feat)
+
+    _remember_dress_context(kind, size, names, _probe)
     # The base is redundant once its own rim is dressed (same solid, sharper
     # edges) and FreeCAD draws BOTH, so the caller was left with two
     # overlapping solids and no hint which one to keep (live: a fillet on a
@@ -397,6 +419,25 @@ def _body_axis_datum(body, axis: str):
     )
 
 
+def _centered_axis_line(body, axis: str, center):
+    """A datum line through ``center`` along the body's X/Y/Z axis.
+
+    A PartDesign::PolarPattern rotates about the AXIS LINE it references, and
+    the body's origin datum line runs through the body origin — so a bolt
+    circle about a face centre (the common intent) would silently clip every
+    occurrence that falls outside the material. FreeCAD's own datum line is the
+    reference the GUI uses for this; a free Placement is what positions it
+    (MapMode "Translate" over the origin line does NOT move it — live-verified).
+    """
+    vec = _vec3(center, "center")
+    line = body.newObject("PartDesign::Line", "CadPilotPolarAxis")
+    line.MapMode = "Deactivated"
+    axis_rot = {"Z": FreeCAD.Rotation(), "Y": FreeCAD.Rotation(FreeCAD.Vector(1, 0, 0), -90.0)}
+    rot = axis_rot.get(axis) or FreeCAD.Rotation(FreeCAD.Vector(0, 1, 0), 90.0)
+    line.Placement = FreeCAD.Placement(vec, rot)
+    return line
+
+
 def _build_pd_pattern(doc, body, base, spec, ptype: str, count: int):
     """Pattern a PartDesign FEATURE inside its Body.
 
@@ -413,7 +454,16 @@ def _build_pd_pattern(doc, body, base, spec, ptype: str, count: int):
     if ptype == "polar":
         feat = body.newObject("PartDesign::PolarPattern", spec.get("name") or "PolarPattern")
         _set_or_bind(feat, "Angle", spec.get("angle", 360.0))
-        if datum is not None:
+        # ``center`` was silently ignored here (only the Draft path read it), so
+        # a caller's bolt circle about a face centre rotated about the body
+        # origin instead and lost the occurrences that fell outside the plate —
+        # reported as plain success.
+        center_line = (
+            _centered_axis_line(body, axis, spec["center"]) if spec.get("center") else None
+        )
+        if center_line is not None:
+            feat.Axis = (center_line, [""])
+        elif datum is not None:
             feat.Axis = (datum, [""])
     elif ptype == "linear":
         _require(spec, "spacing")
@@ -563,9 +613,9 @@ def _build_pattern(doc, spec):
                 base, direction * float(spec["spacing"]), FreeCAD.Vector(0, 0, 0), count, 1
             )
         else:
-            center = spec.get("center", [0, 0, 0])
+            center = _vec3(spec.get("center", [0, 0, 0]), "center")
             angle = float(spec.get("angle", 360.0))
-            feat = make_array(base, FreeCAD.Vector(*center), angle, count)
+            feat = make_array(base, center, angle, count)
             axis = str(spec.get("axis", "Z")).upper()
             if axis != "Z" and hasattr(feat, "Axis"):
                 feat.Axis = _axis_vec(axis)
@@ -608,7 +658,7 @@ def _build_variables(doc, spec):
     return ss
 
 
-def _move_vec3(v, name):
+def _vec3(v, name):
     """Vector as [x, y, z] or {"x":.., "y":.., "z":..} -> FreeCAD.Vector.
 
     The rest of the API takes plain coordinate lists; dict-only here used to
@@ -648,10 +698,10 @@ def _build_move(doc, spec):
         p = spec["placement"]
         base = p.get("Base", p.get("Position", {"x": 0, "y": 0, "z": 0}))
         rot_data = p.get("Rotation", {"Axis": {"x": 0, "y": 0, "z": 1}, "Angle": 0})
-        new_base = _move_vec3(base, "placement.Base")
+        new_base = _vec3(base, "placement.Base")
         axis = rot_data.get("Axis", {"x": 0, "y": 0, "z": 1})
         new_rot = FreeCAD.Rotation(
-            _move_vec3(axis, "placement.Rotation.Axis"),
+            _vec3(axis, "placement.Rotation.Axis"),
             float(rot_data.get("Angle", 0)),
         )
         return _assign_placement(doc, obj, new_base, new_rot)
@@ -661,14 +711,14 @@ def _build_move(doc, spec):
     rotate = spec.get("rotate", {})
     if not translate and not rotate:
         raise ValueError("move requires at least one of: translate, rotate, placement.")
-    delta = _move_vec3(translate, "translate") if translate else FreeCAD.Vector(0, 0, 0)
+    delta = _vec3(translate, "translate") if translate else FreeCAD.Vector(0, 0, 0)
 
     # Relative rotation
     delta_rot = FreeCAD.Rotation()
     if rotate:
         if not isinstance(rotate, dict):
             raise ValueError(f"rotate must be a dict {{'axis':…, 'angle':…}}, got {rotate!r}")
-        r_axis = _move_vec3(rotate.get("axis", {"x": 0, "y": 0, "z": 1}), "rotate.axis")
+        r_axis = _vec3(rotate.get("axis", {"x": 0, "y": 0, "z": 1}), "rotate.axis")
         r_angle = float(rotate.get("angle", 0))  # degrees
         delta_rot = FreeCAD.Rotation(r_axis, r_angle)
 
@@ -1898,6 +1948,166 @@ def _status_string(feat) -> str:
     return ""
 
 
+#: Context of the LAST dress-up (fillet/chamfer) built, for the failure
+#: diagnosis below: the kind, the size, the resolved edge names and a probe that
+#: re-points the feature at a SUBSET of them and reports whether the result has
+#: a usable shape (:func:`_dress_failure_detail`).
+_DRESS_CONTEXT: dict[str, Any] = {}
+
+
+def _remember_dress_context(kind, size, names, probe) -> None:
+    _DRESS_CONTEXT.clear()
+    _DRESS_CONTEXT.update({"kind": kind, "size": size, "names": list(names), "probe": probe})
+
+
+def _settle_shape_caches(doc, spec) -> None:
+    """Materialise the Shape of every object a feature is about to be built on.
+
+    FreeCAD builds a PartDesign shape LAZILY, and a feature whose predecessor's
+    Shape has not been read computes to a Touched/Null shape with no error.
+    Live-verified on 1.1.4: after reopening a saved model, re-running an
+    identical pocket (the same params that had built fine) produced NO shape at
+    all, and reading the SKETCH's Shape first made the same build return exactly
+    the analytic result (58800 -> 57207.2 mm^3, one through hole). A recompute is
+    not enough; the READ is what performs the build, so the op performs it here.
+    """
+    if not isinstance(spec, dict):
+        return
+    targets = []
+    for value in (spec.get("base"), spec.get("profile"), spec.get("path"), spec.get("tool")):
+        if isinstance(value, str) and value:
+            with contextlib.suppress(Exception):
+                targets.append(_get_obj(doc, value, "link"))
+    profiles = spec.get("profiles")
+    if isinstance(profiles, list):
+        for value in profiles:
+            if isinstance(value, str) and value:
+                with contextlib.suppress(Exception):
+                    targets.append(_get_obj(doc, value, "profile"))
+    body = _parent_body(targets[0]) if targets else None
+    tip = getattr(body, "Tip", None) if body is not None else None
+    if tip is not None:
+        targets.append(tip)  # the feature's real baseline inside a Body
+    for obj in targets:
+        with contextlib.suppress(Exception):
+            _ = obj.Shape
+    with contextlib.suppress(Exception):
+        doc.recompute()
+
+
+def _read_shape_state(feat, doc):
+    """(shape, valid, volume, solids, error) for a freshly built feature.
+
+    Retried ONCE on failure, because a PartDesign shape builds LAZILY: the first
+    access after a recompute can raise FreeCAD's bare "shape is invalid" for a
+    shape that reads perfectly well on the second attempt. Measured on 1.1.4 —
+    an ordinary 6-rim fillet reported exactly those two words as its whole
+    failure, the same call succeeded on the next try with identical inputs, and
+    every single rim was valid; the retry is the difference. The volume/solids
+    probes belong INSIDE this guard for the same reason (they raise first).
+    """
+    shape, valid, volume, solids, error = None, False, 0.0, 0, ""
+    for attempt in (1, 2):
+        try:
+            shape = getattr(feat, "Shape", None)
+            valid = True if shape is None or shape.isNull() else shape.isValid()
+            volume = float(getattr(shape, "Volume", 0.0) or 0.0) if shape is not None else 0.0
+            solids = len(getattr(shape, "Solids", []) or []) if shape is not None else 0
+            return shape, valid, volume, solids, ""
+        except Exception as e:
+            error = f"the validity check could not run ({type(e).__name__}: {e})"
+            shape, valid, volume, solids = None, False, 0.0, 0
+            if attempt == 1:
+                with contextlib.suppress(Exception):
+                    doc.recompute()
+    return shape, valid, volume, solids, error
+
+
+def _dress_shape_usable(feat) -> bool:
+    """Does a dress-up probe have a readable, non-null Shape?
+
+    Null/raising IS the failure being diagnosed; OCC's ``isValid`` is
+    deliberately not consulted (it is a false negative on ordinary PartDesign
+    fillets — see _SHAPE_CHECK_NOTE). The read is retried once, like every other
+    shape read (see _read_shape_state).
+    """
+    _shape, _valid, _volume, _solids, error = _read_shape_state(feat, feat.Document)
+    return not error and _shape is not None and not _shape.isNull()
+
+
+def _dress_retry_repair() -> bool:
+    """Re-apply the SAME edge set once and report whether it now works.
+
+    A dress-up that comes out with a Null Shape is not always a geometry
+    verdict: live on 1.1.4, the six bore rims of a patterned plate failed on one
+    attempt and produced exactly the 6x roundover (36778.9 mm^3 = 36787.3 -
+    6 x 1.393) on the next, with identical inputs — a stale recompute in the
+    document's graph is enough. Failing a caller's step over that is wrong, so
+    the op retries in place (the Base assignment is idempotent) and only reports
+    a failure when the retry fails too.
+    """
+    probe = _DRESS_CONTEXT.get("probe")
+    names = list(_DRESS_CONTEXT.get("names") or [])
+    if not callable(probe) or not names:
+        return False
+    try:
+        return bool(probe(names))
+    except Exception:
+        return False
+
+
+def _dress_failure_detail(op: str = "") -> str:
+    """Test a failed fillet/chamfer's edges ONE at a time and say what happens.
+
+    A multi-edge dress-up that OCC refuses reports nothing usable — live on
+    1.1.4, a 0.5 mm fillet on the six bore rims of a patterned plate failed with
+    a bare "shape is invalid", while every single rim was fine on its own (and
+    so was the top rims two at a time: only the bottom rims fail as a SET).
+    "Invalid" cannot be acted on; "split these edges across several fillet
+    calls" can. The retries run inside the op's transaction, which aborts when
+    the op raises, so the half-built feature is never left behind.
+    """
+    ctx = dict(_DRESS_CONTEXT)
+    _DRESS_CONTEXT.clear()
+    if op not in ("fillet", "chamfer"):
+        # A stale context from an EARLIER dress-up must never decorate an
+        # unrelated failure: live-caught, a pocket that could not compute
+        # reported "every one of the 4 edges fails at 4.0 mm on its own".
+        return ""
+    probe = ctx.get("probe")
+    names = list(ctx.get("names") or [])
+    kind, size = ctx.get("kind"), ctx.get("size")
+    if not callable(probe) or len(names) < 2 or len(names) > 12:
+        return ""  # one recompute per edge: not worth it on a large edge set
+    bad: list[str] = []
+    for name in names:
+        try:
+            ok = probe([name])
+        except Exception:
+            ok = False
+        if not ok:
+            bad.append(name)
+    with contextlib.suppress(Exception):
+        probe(names)  # hand the full set back, so the caller sees its own failure
+    if not bad:
+        return (
+            f" Each of the {len(names)} edges {kind}s fine on its own (retried one at a "
+            f"time), so OCC refuses the SET: split the edges across several {kind} calls, or "
+            f"lower the {kind} size."
+        )
+    if len(bad) == len(names):
+        return (
+            f" Every one of the {len(names)} edges fails at {size} mm on its own too (retried "
+            f"one at a time), so this is not a combination problem: try a smaller {kind} size, "
+            "or check the geometry around those edges with Part > Check geometry."
+        )
+    return (
+        f" {len(bad)} of the {len(names)} edge(s) fail on their own too ({', '.join(bad)}); the "
+        f"other {len(names) - len(bad)} succeed alone, so the set fails in combination. "
+        f"{kind.capitalize()} the failing edges in a separate call."
+    )
+
+
 def _invalid_shape_error(feat_type, feat, detail: str | None = None) -> str:
     """ "<op> produced an invalid Shape" was raised for a self-intersecting
     profile, a dangling reference and a corrupted dependency graph alike — three
@@ -1934,6 +2144,19 @@ def _take_shape_check_note() -> str:
     return note
 
 
+def _dress_repaired_note(ftype: str, feat) -> str:
+    """A dress-up whose first recompute failed and whose retry succeeded.
+
+    Kept rather than raised: the inputs did not change, so the failure was a
+    stale recompute, and failing the caller's step over it loses real work.
+    """
+    return (
+        f"{ftype} '{feat.Name}' came out invalid on the first recompute; re-applying the "
+        "same edges produced a valid shape, so the step was kept (a stale recompute can do "
+        "this — no parameter changed)."
+    )
+
+
 def create_feature_gui(doc, spec):
     """Create one parametric feature from ``spec``; returns the object.
 
@@ -1944,6 +2167,9 @@ def create_feature_gui(doc, spec):
     builder = _BUILDERS.get(ftype)
     if builder is None:
         raise ValueError(f"unknown feature type {ftype!r}; supported: {', '.join(FEATURE_TYPES)}")
+    # Read the Shape of what this feature is built on FIRST: a lazy predecessor
+    # makes the new feature compute to nothing, silently (see the helper).
+    _settle_shape_caches(doc, spec)
     feat = builder(doc, spec)
     # "move" directly modifies Placement and "color" only the ViewObject —
     # neither builds a feature, so the recompute/validity/volume checks below do
@@ -1961,6 +2187,13 @@ def create_feature_gui(doc, spec):
     if body is not None and getattr(body, "Tip", None) is feat:
         _refresh_appearance(body)
     state = [str(s) for s in getattr(feat, "State", [])]
+    # A dress-up can come out Invalid/Null from a STALE recompute alone (see
+    # _dress_retry_repair): re-apply the same edges once before believing it.
+    dress = ftype in ("fillet", "chamfer")
+    repaired = False
+    if "Invalid" in state and dress and _dress_retry_repair():
+        repaired = True
+        state = [str(s) for s in getattr(feat, "State", [])]
     if "Invalid" in state:
         # FreeCAD's actual failure reason (bad support, missing subelement,
         # "Revolve axis intersects the sketch", …) — "check parameters/geometry"
@@ -1970,23 +2203,34 @@ def create_feature_gui(doc, spec):
         status = _status_string(feat)
         detail = f" — {status}" if status and status != "Invalid" else ""
         hint = _FAILURE_HINTS.get(ftype, "check parameters/geometry.")
-        raise RuntimeError(f"{ftype} failed to recompute{detail} ({hint})")
+        raise RuntimeError(
+            f"{ftype} failed to recompute{detail} ({hint}){_dress_failure_detail(ftype)}"
+        )
     global _SHAPE_CHECK_NOTE
-    _SHAPE_CHECK_NOTE = ""
+    _SHAPE_CHECK_NOTE = _dress_repaired_note(ftype, feat) if repaired else ""
     shape = None
     check_error = ""
-    try:
-        shape = getattr(feat, "Shape", None)
-        valid = True if shape is None or shape.isNull() else shape.isValid()
-    except Exception as e:
-        # A feature whose Shape cannot even be read (a broken tip, a dangling
-        # link) fails the same way as an invalid one, and must name itself too.
-        valid = False
-        check_error = f"the validity check could not run ({type(e).__name__}: {e})"
+    # The read is retried internally (see _read_shape_state): a lazily built
+    # PartDesign shape raises FreeCAD's bare "shape is invalid" on its FIRST
+    # access and reads fine on the second.
+    shape, valid, volume, solids, check_error = _read_shape_state(feat, doc)
+    if not valid and not repaired:
+        # A feature that reads as unbuildable may simply have been built on a
+        # lazy predecessor: settle those caches and read again before giving up.
+        _settle_shape_caches(doc, spec)
+        shape, valid, volume, solids, check_error = _read_shape_state(feat, doc)
+    if not valid and dress and not repaired and _dress_retry_repair():
+        valid = True
+        check_error = ""
+        shape, valid, volume, solids, _err = _read_shape_state(feat, doc)
+        _SHAPE_CHECK_NOTE = _dress_repaired_note(ftype, feat)
     if not valid:
         status = _status_string(feat)
         if check_error or (status and status != "Valid"):
-            raise RuntimeError(_invalid_shape_error(ftype, feat, check_error or status))
+            raise RuntimeError(
+                _invalid_shape_error(ftype, feat, check_error or status)
+                + _dress_failure_detail(ftype)
+            )
         # FreeCAD says Valid, the shape is non-null, the recompute committed and
         # the volume is sane: OCC's BRepCheck disagrees, which it does for good
         # PartDesign fillets (see _SHAPE_CHECK_NOTE). Advisory, not fatal — a
@@ -2012,8 +2256,7 @@ def create_feature_gui(doc, spec):
     # judged: a PartDesign::Plane's infinite face reports a garbage "volume"
     # whose SIGN follows its offset, so an unscoped check refused every
     # datum_plane with a negative offset (live: offset -5 → "volume -1.3e+98").
-    volume = float(getattr(shape, "Volume", 0.0) or 0.0) if shape is not None else 0.0
-    if volume < -1e-6 and len(getattr(shape, "Solids", []) or []) > 0:
+    if volume < -1e-6 and solids > 0:
         hint = (
             "the profile probably crosses its revolve axis"
             if ftype in ("revolution", "groove")

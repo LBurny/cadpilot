@@ -30,6 +30,7 @@ _READ_ONLY = {
 # Tools that mutate the document, the step journal or the pattern store.
 _MUTATING = {
     "create_document",
+    "dismiss_blocking_dialog",
     "cad",
     "execute_code",
     "execute_code_async",

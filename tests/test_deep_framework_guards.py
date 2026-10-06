@@ -232,9 +232,34 @@ def test_ghost_stack_entries_never_consume_a_rollback_slot():
     stack_op = _func(ENGINE, "_stack_op")
     assert "_is_ghost_entry" in _names(stack_op), "the undo loop must recognise ghosts"
     assert "ghosts_skipped" in _strings(stack_op), "the skipped count must reach the caller"
-    journal_check = _func(ENGINE, "_stack_holds_journal")
+    journal_check = _func(ENGINE, "_undo_trust")
     assert "_real_undo_names" in _names(journal_check), (
         "the journal comparison must look at the same non-ghost sequence the undo loop pops"
+    )
+
+
+def test_a_capped_undo_stack_is_not_a_reopened_document():
+    """The undo stack is CAPPED (``MaxUndoSize``, 20 by default), so a journal
+    longer than the cap can never satisfy a whole-span comparison: the oldest
+    entries were evicted by FreeCAD, while every surviving entry still matches
+    the journal in order. Reading that as "does not hold the journal's
+    transactions" popped nothing and forced a full rebuild of the whole journal
+    on every rollback deeper than the cap (live-caught: a 24-transaction journal
+    rolled back to 0 reported a reopened document, with the top 20 undo names
+    identical to the journal's). The trust check is now a SPAN, computed in the
+    pure journal model, and the message names the cap instead of guessing.
+    """
+    trust = _func(ENGINE, "_undo_trust")
+    assert "undo_trust_span" in _attrs(trust) or "undo_trust_span" in _names(trust), (
+        "the span must come from the pure journal model, where it is unit-tested"
+    )
+    assert "MaxUndoSize" in _strings(_func(ENGINE, "_undo_cap")), (
+        "the short-stack message must name FreeCAD's undo cap, not blame a reopen"
+    )
+    # The span, not a yes/no: rollback must pop exactly what the stack holds.
+    rollback = _func(ENGINE, "_rollback")
+    assert "span" in _names(rollback) and "_undo_trust" in _names(rollback), (
+        "_rollback must undo the span the stack really holds"
     )
 
 
@@ -282,3 +307,140 @@ def test_snapshot_does_not_claim_a_mutation():
     assert flags.get("atomic") is False
     assert flags.get("mutated") is False, "a marker with no transaction must not claim a mutation"
     assert flags.get("accepted") is True
+
+
+def test_undo_entry_names_are_unique_per_step():
+    """Two property-only steps used to commit under the SAME undo name, so the
+    journal's name comparison could not tell which transaction was on top. A
+    manual Ctrl+Z of the newest step then left an older same-named entry on the
+    stack, the drift check (a membership test) still answered "present", and a
+    rollback popped the WRONG transaction while every object-set verification
+    stayed silent — only properties had moved. Every opener must route through
+    transaction_name so each entry names its step."""
+    tname = _func(ENGINE, "transaction_name")
+    assert "_TX_SEQ" in _names(tname), "the name must carry a per-document sequence"
+    assert "TX_PREFIX" in _names(tname)
+    assert "transaction_name" in _names(_writer_body(ENGINE, "_run_record_locked")), (
+        "a re-run must name its entry through the same helper as a first commit"
+    )
+    literals = [
+        arg
+        for call in ast.walk(RPC)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "openTransaction"
+        for arg in call.args
+        if isinstance(arg, ast.Constant)
+    ]
+    assert not literals, f"openTransaction still called with a literal name: {literals}"
+    # The session layer keeps its own log and cannot name the transactions it
+    # expects, so the addon refuses entries that are not CADPilot's own instead
+    # of eating a manual edit in a step's place.
+    assert "foreign_undo_entries" in _attrs(_func(RPC, "_undo_redo")), (
+        "undo/redo for a caller with its own log must refuse foreign entries"
+    )
+
+
+def test_modal_blocker_is_reported_and_dismissible_without_a_gui():
+    """A client that cannot drive the GUI (Claude Code, opencode, ...) has no
+    recovery from FreeCAD's document-recovery dialog unless CADPilot itself can
+    name the blocker and clear it: every dispatched call is held back by design,
+    so the dismissal has to bypass that guard, and the state probe must read a
+    GUI-tick-refreshed global (the RPC thread must not touch Qt widget state).
+
+    Live-verified: with a modal open the addon answered get_gui_state with
+    defer_reason 'modal' before any call timed out, and dismiss_blocking_dialog
+    closed it with Cancel semantics.
+    """
+    dispatch = _tree("gui_dispatch.py")
+    probe = _func(dispatch, "backpressure")
+    assert "_guard_state" in _names(probe), "an idle queue must still name the blocker"
+    drain = _func(dispatch, "process_gui_tasks")
+    assert "_probe_guard_state" in _names(drain), "the guard state is refreshed on the GUI tick"
+    assert "_force_queue" in _names(drain), "a dismissal must run despite the guards"
+    dismiss = _func(dispatch, "dismiss_blocking_dialog")
+    assert "force" in {
+        kw.arg
+        for n in ast.walk(dismiss)
+        if isinstance(n, ast.Call)
+        for kw in getattr(n, "keywords", [])
+    }, "the dismissal must go through the forced queue"
+    assert "reject" in _attrs(dismiss), "Cancel semantics: reject(), never accept()"
+    rpc = _func(RPC, "dismiss_blocking_dialog")
+    assert "dispatch_to_gui" not in _names(rpc), "it must not be a normal dispatched call"
+
+
+def test_observer_mute_counter_cannot_leak_negative():
+    """`engine_quiet` is a counter, and a window left open across a hot reload
+    runs its `__exit__` against the freshly re-executed (zeroed) counter. The
+    unbalanced decrement left it at -1 PERMANENTLY, so every later
+    `engine_quiet()` brought it to 0 instead of 1: the observer was no longer
+    muted and synced machine writes into the owning step's params (live: after
+    one `restart_rpc_server()` from execute_code, that snippet's own writes
+    rewrote the batch step's obj_properties — the exact bleed the window exists
+    to prevent). The exit clamps, and the observer tests `> 0`."""
+    klass = next(
+        n for n in ast.walk(ENGINE) if isinstance(n, ast.ClassDef) and n.name == "_EngineQuiet"
+    )
+    exit_fn = next(n for n in klass.body if isinstance(n, ast.FunctionDef) and n.name == "__exit__")
+    src = ast.unparse(exit_fn)
+    assert "max(0" in src, f"the quiet counter must clamp at zero, got: {src}"
+    guard = [
+        node
+        for node in ast.walk(_func(ENGINE, "slotChangedObject"))
+        if isinstance(node, ast.Compare)
+    ]
+    assert any(
+        isinstance(c.left, ast.Name)
+        and c.left.id == "_ENGINE_ACTIVE"
+        and isinstance(c.ops[0], ast.Gt)
+        for c in guard
+    ), "the observer must treat only a POSITIVE counter as muted"
+
+
+def test_expression_binding_changes_are_tracked():
+    """Binding/unbinding an expression in the GUI rewrites ExpressionEngine and
+    need not fire the bound property, so a step's params kept the last NUMBER
+    (or kept "=Vars.x" after an unbind) while the model was already driven by
+    the expression. The observer must re-read everything it tracks for the
+    object when ExpressionEngine changes."""
+    sync = _func(ENGINE, "_sync")
+    assert "ExpressionEngine" in _strings(sync), "the observer must react to the engine itself"
+    assert {"_sync_constraints", "_sync_cells", "_sync_move_fold"} <= _attrs(sync), (
+        "every handler must re-read its values when ExpressionEngine changes"
+    )
+
+
+def test_sync_claims_follow_the_object_that_really_changed():
+    """Two producer-side mismatches between a record and reality, both of which
+    sent a manual edit nowhere (or to the wrong step):
+
+    * a move of a PartDesign feature is applied to the owning BODY — FreeCAD
+      rewrites a feature's Placement on every recompute — so claiming the
+      requested feature left the Body untracked while the pose claim sat on an
+      object that cannot hold one;
+    * FreeCAD de-duplicates a requested create name (Box -> Box001), so a batch
+      sub-op claiming the REQUESTED name overwrote the real object's claims and
+      left the created one untracked.
+
+    Both halves are required: the record must carry what the op did, and the
+    claim must read it (the pure half is unit-tested in test_step_journal).
+    """
+    task = _func(RPC, "_task_body")
+    assert "moved_object" in _strings(task), "the record must carry what the op moved"
+    assert "params" in _names(task), "and it must reach record_commit's params"
+    batch = _func(RPC, "_run_batch")
+    assert {"moved_object", "created_object"} <= _strings(batch), (
+        "a batch sub-op must record the object it created / moved, not the requested name"
+    )
+
+
+def test_object_removal_mutes_the_manual_edit_observer():
+    """The removal window is engine-driven: the recompute after a removal fires
+    changed-object events (a dependent feature's AttachmentOffset, a Body's tip)
+    and mirroring those back into the journal rewrites a step's params from a
+    state the removal itself is tearing down."""
+    body = _func(ENGINE, "_remove_objects_locked")
+    assert "_EngineQuiet" in _names(body) or "_EngineQuiet" in _attrs(body), (
+        "removal must run inside _EngineQuiet"
+    )

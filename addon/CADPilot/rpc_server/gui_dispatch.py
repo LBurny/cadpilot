@@ -31,6 +31,7 @@ Robustness and performance guarantees:
    returned as error strings; they never kill the dispatch loop.
 """
 
+import contextlib
 import queue
 import sys
 import threading
@@ -46,6 +47,12 @@ from rpc_server import dbglog
 logger = dbglog.get_logger("gui")
 
 _rpc_request_queue: "queue.Queue[Any]" = queue.Queue()
+#: Tasks that must run even while a modal dialog (or a drag) holds the normal
+#: queue back. Only dismissing that dialog belongs here: it is the one operation
+#: that has to work precisely when everything else is held back, and it is how a
+#: client with no GUI (Claude Code, opencode, ...) recovers a session wedged on
+#: FreeCAD's document-recovery dialog.
+_force_queue: "queue.Queue[Any]" = queue.Queue()
 _SHUTDOWN = object()
 _processing = False  # re-entrancy guard: True while process_gui_tasks is draining
 _processing_since: float = 0.0  # wall-clock time when _processing became True
@@ -133,6 +140,101 @@ def _clear_defer() -> None:
     global _defer_reason, _defer_warned
     _defer_reason = None
     _defer_warned = False
+
+
+#: What the guards would say RIGHT NOW, refreshed on every GUI tick. The RPC
+#: thread reads this (never Qt widget state itself, which is not safe off the
+#: GUI thread), so a diagnosis run can name an open modal dialog before any call
+#: has been held back — with an idle queue nothing is deferred yet, and the
+#: recorded reason alone would answer "no back-pressure" while a dialog sits in
+#: front of the window (live-caught exactly that way).
+_guard_state: str = ""
+
+
+def _probe_guard_state() -> None:
+    global _guard_state
+    try:
+        app = QtWidgets.QApplication.instance()
+        if app is None:
+            _guard_state = ""
+        elif app.activeModalWidget() is not None:
+            _guard_state = "modal"
+        elif app.activePopupWidget() is not None:
+            _guard_state = "popup"
+        elif _user_holding_button():
+            _guard_state = "button"
+        else:
+            _guard_state = ""
+    except Exception:
+        _guard_state = ""
+
+
+def dismiss_blocking_dialog(timeout: float = 5.0) -> dict:
+    """Close the modal dialog that is holding the GUI queue back (Cancel).
+
+    The one operation that must work WHILE the queue is held back: a client with
+    no way to operate the GUI (Claude Code, opencode, any MCP client) otherwise
+    has no recovery from FreeCAD's document-recovery dialog, which is shown
+    after an unclean shutdown and blocks every dispatched call until someone
+    clicks it. Cancel semantics only: the dialog is closed the way its own
+    Cancel button would, so nothing is ever confirmed.
+    """
+
+    def task() -> dict:
+        app = QtWidgets.QApplication.instance()
+        widget = app.activeModalWidget() if app is not None else None
+        if widget is None:
+            return {
+                "success": True,
+                "dismissed": None,
+                "note": "no modal dialog is open; nothing to dismiss",
+            }
+        title, kind, closed = "", type(widget).__name__, False
+        with contextlib.suppress(Exception):
+            title = str(widget.windowTitle() or "")
+        with contextlib.suppress(Exception):
+            widget.reject()  # == the dialog's Cancel button
+            closed = True
+        if not closed:
+            with contextlib.suppress(Exception):
+                widget.close()
+                closed = True
+        return {
+            "success": closed,
+            "dismissed": {"title": title, "type": kind} if closed else None,
+            "note": (
+                "closed the dialog with Cancel semantics; nothing was confirmed"
+                if closed
+                else "the dialog refused to close (it overrides Cancel/close)"
+            ),
+        }
+
+    res = dispatch_to_gui(task, timeout=timeout, force=True)
+    if isinstance(res, dict):
+        return res
+    return {"success": False, "error": f"could not dismiss the dialog: {res!r}"}
+
+
+def backpressure() -> dict:
+    """Why the GUI queue is not draining, in the shape the RPC endpoint reports.
+
+    Deliberately NOT dispatched: it must answer while the queue is held back or
+    the GUI thread is busy, which is exactly when a caller needs the reason. A
+    held-back queue (mouse button / modal dialog / long recompute) and a dead
+    waker look identical from outside the process and want opposite advice.
+    """
+    reason = _defer_reason or _guard_state or None
+    return {
+        "success": True,
+        "defer_reason": reason,
+        "defer_label": _DEFER_LABELS.get(reason, reason) if reason else "",
+        # Only a RECORDED deferral has a start time. One merely observed on the
+        # tick has none, and `now - 0.0` printed a four-day duration.
+        "deferred_s": round(time.monotonic() - _defer_since, 1) if _defer_reason else 0.0,
+        "processing": bool(_processing),
+        "processing_s": round(time.monotonic() - _processing_since, 1) if _processing else 0.0,
+        "queue_depth": _rpc_request_queue.qsize(),
+    }
 
 
 def _physical_buttons_down() -> "int | None":
@@ -295,6 +397,24 @@ def process_gui_tasks(reschedule: bool = True) -> None:
 
     shutdown = False
     try:
+        # Refresh the guard state on EVERY tick, empty queue included: it is the
+        # RPC thread's only safe view of whether a dialog/popup is in the way.
+        _probe_guard_state()
+        if not _force_queue.empty():
+            # Forced tasks run BEFORE (and regardless of) the interaction guards:
+            # dismissing the dialog that is holding the queue back must work
+            # while it holds it, or no client without a GUI can ever recover.
+            forced = _force_queue.get()
+            try:
+                forced()
+            except Exception as e:
+                logger.error(
+                    "unhandled exception in forced GUI task: %s: %s",
+                    type(e).__name__,
+                    e,
+                    exc_info=True,
+                )
+            return
         if _rpc_request_queue.empty():
             _clear_defer()
             return  # nothing queued; skip cursor/status-bar churn on idle heartbeat ticks
@@ -380,12 +500,17 @@ def request_shutdown() -> None:
     _rpc_request_queue.put(_SHUTDOWN)
 
 
-def dispatch_to_gui(task: Callable[[], Any], timeout: float = 60) -> Any:
+def dispatch_to_gui(task: Callable[[], Any], timeout: float = 60, force: bool = False) -> Any:
     """Run ``task`` on the GUI thread and return its result.
 
     Uses a per-call response queue so a timeout in one call never corrupts
     the response for a subsequent call. Wakes the GUI thread immediately via
     a Qt signal instead of waiting for the next 500 ms heartbeat.
+
+    ``force=True`` puts the task on the forced queue, which the drain runs
+    BEFORE the interaction guards: only an operation that must work while the
+    queue is deliberately held back (dismissing the modal dialog that holds it)
+    belongs there.
 
     On timeout the queued task is cancelled: if it has not started yet it
     will never run, so a caller retrying after a timeout cannot trigger a
@@ -416,7 +541,7 @@ def dispatch_to_gui(task: Callable[[], Any], timeout: float = 60) -> Any:
         response_queue.put(res)
 
     queued_at = time.monotonic()
-    _rpc_request_queue.put(_wrapped)
+    (_force_queue if force else _rpc_request_queue).put(_wrapped)
     if _waker is not None:
         _waker.wake()  # immediate wake via Qt signal (thread-safe)
 
@@ -437,7 +562,7 @@ def dispatch_to_gui(task: Callable[[], Any], timeout: float = 60) -> Any:
             # that lands during a brief hold and then runs longer than the grace
             # slice is misreported as "user holding a mouse button" while the
             # work completes in FreeCAD — and a retry would duplicate it.
-            if _defer_reason is not None and not _processing:
+            if not force and _defer_reason is not None and not _processing:
                 # The guards are holding the queue back on purpose and will keep
                 # doing so while the interaction lasts, so waiting out the rest
                 # of the timeout cannot succeed — report the actionable reason
@@ -480,7 +605,8 @@ def dispatch_to_gui(task: Callable[[], Any], timeout: float = 60) -> Any:
                 f"CADPilot could not act on the document within {_USER_HOLD_GRACE:.0f}s because "
                 f"{label}. The queued work is held back deliberately while the user interacts, "
                 "so nothing is stuck: close the dialog or menu (or release the mouse button) "
-                "and retry; the queue drains by itself."
+                "and retry; the queue drains by itself. A modal dialog can also be closed for "
+                "you with the dismiss_blocking_dialog tool, which is not held back."
             ),
         }
     if _processing:

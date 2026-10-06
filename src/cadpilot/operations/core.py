@@ -209,6 +209,11 @@ def execute_code_operation(
                         f"execute_code: {code[:80]}",
                         params_summary=code[:200],
                         result_summary=str(res.get("message", ""))[:200],
+                        # The addon reports the object fingerprint of the document
+                        # whose transaction it owns; without it a rollback ending
+                        # on this step compared against an EMPTY target set and
+                        # always reported a mismatch.
+                        objects_after=_normalize_object_names(res.get("objects", [])),
                         atomic=True,
                     )
                     save_session(sess)
@@ -534,7 +539,12 @@ def _record_step_if_tracked(
         params_summary=params_summary,
         result_summary=summary,
         objects_after=_normalize_object_names(res.get("objects", [])),
-        atomic=bool(res.get("transaction", True)),
+        # ``transaction`` reports that a transaction was OPEN; ``undoable``
+        # reports that an undo entry actually landed. A no-op step (a same-value
+        # edit) opens one and commits nothing — counting it as atomic made
+        # session rollback pop one transaction too many, and the object-set check
+        # could not see it because only properties had moved.
+        atomic=bool(res.get("undoable", res.get("transaction", True))),
     )
     save_session(sess)
     return f" [step #{step.step_number} of session '{sess.name}']"
@@ -890,7 +900,11 @@ def session_rollback_operation(
     # post-undo read would hide exactly the drift this check exists to catch.
     journal = _journal_snapshot(freecad, sess.doc_name)
     try:
-        res = freecad.undo_transactions(sess.doc_name, n)
+        # ``trust_journal`` (when not forced): the addon refuses to pop entries
+        # that are not CADPilot's own, so a manual GUI edit sitting on top is
+        # reported instead of being consumed in place of a session step — the
+        # object-set check below cannot catch that, since only properties move.
+        res = freecad.undo_transactions(sess.doc_name, n, trust_journal=not force)
     except Exception as e:
         return text_response(f"Rollback failed: {e!s}")
     if not res.get("success"):
@@ -990,7 +1004,10 @@ def session_redo_operation(freecad: FreeCADConnection, n: int = 1) -> ToolRespon
         return text_response("Nothing to redo (no previously rolled-back steps).")
     n = max(1, min(int(n), len(sess.redo_buffer)))
     try:
-        res = freecad.redo_transactions(sess.doc_name, n)
+        # ``trust_journal``: the addon refuses to replay an entry that is not
+        # CADPilot's own, so a manual edit sitting on the redo stack is reported
+        # instead of being applied in place of a step this session rolled back.
+        res = freecad.redo_transactions(sess.doc_name, n, trust_journal=True)
     except Exception as e:
         return text_response(f"Redo failed: {e!s}")
     if not res.get("success"):
@@ -1206,6 +1223,36 @@ def diagnose_operation(
     from ..diagnostics import diagnose, format_report
 
     return text_response(format_report(diagnose(host, port, timeout)))
+
+
+def dismiss_blocking_dialog_operation(freecad: FreeCADConnection) -> ToolResponse:
+    """Close the modal dialog that blocks every document call (Cancel semantics).
+
+    The recovery path for a client that cannot operate the GUI: FreeCAD's
+    document-recovery dialog (shown after an unclean shutdown) holds the whole
+    GUI queue back, so every other call times out. This one is NOT queued behind
+    that guard, and it only ever cancels, never confirms.
+    """
+    res = freecad.dismiss_blocking_dialog()
+    if not res.get("success"):
+        return json_response(
+            {
+                "success": False,
+                "error": res.get("error") or res.get("note") or "could not dismiss a dialog",
+                "hint": (
+                    "Either nothing was blocking or the dialog overrides Cancel. Read the "
+                    "current blocker with the diagnose tool, or look at FreeCAD's screen."
+                ),
+            }
+        )
+    dismissed = res.get("dismissed")
+    if isinstance(dismissed, dict):
+        where = dismissed.get("title") or dismissed.get("type") or "dialog"
+        return text_response(
+            f"Dismissed the blocking dialog '{where}' with Cancel semantics: nothing was "
+            "confirmed and the GUI queue can drain again. Retry the call that timed out."
+        )
+    return text_response("No modal dialog was open, so nothing held the GUI queue back.")
 
 
 def session_pause_operation() -> ToolResponse:

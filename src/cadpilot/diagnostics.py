@@ -415,6 +415,32 @@ def probe_rpc(host: str, port: int, timeout: float = PROBE_TIMEOUT) -> dict[str,
     }
 
 
+def probe_gui_state(host: str, port: int, timeout: float = PROBE_TIMEOUT) -> dict[str, object]:
+    """Ask the addon WHY its GUI queue is not draining (``get_gui_state``).
+
+    Only meaningful once ping answered: this method is deliberately not
+    GUI-dispatched, so it answers while a modal dialog holds the queue back —
+    the exact situation where every document call times out and nothing else
+    can say whether FreeCAD is broken or simply waiting for a human. An older
+    addon has no such method: that is reported, not treated as a fault.
+    """
+    from .freecad_client import _resolve_connect_host
+
+    uri = f"http://{_resolve_connect_host(host)}:{port}"
+    proxy = xmlrpc.client.ServerProxy(
+        uri, allow_none=True, transport=_ShortTimeoutTransport(timeout)
+    )
+    try:
+        state = proxy.get_gui_state()
+    except xmlrpc.client.Fault as e:
+        return {"available": False, "error": f"the addon has no get_gui_state ({e.faultString})"}
+    except Exception as e:
+        return {"available": False, "error": f"{type(e).__name__}: {e}"}
+    if not isinstance(state, dict):
+        return {"available": False, "error": f"unexpected reply: {state!r}"}
+    return {"available": True, **state}
+
+
 def tcp_open(host: str, port: int, timeout: float = PROBE_TIMEOUT) -> bool:
     """Raw socket connect: is anything at all accepting on the port?"""
     from .freecad_client import _resolve_connect_host
@@ -445,14 +471,71 @@ Diagnostic order that applies on Windows, macOS and Linux alike:
 """
 
 
+def gui_state_note(state: dict | None) -> str:
+    """What the addon's GUI queue is waiting for, and what to do about it.
+
+    The three held-back cases want opposite actions and are indistinguishable
+    from outside the process, which is why the addon is asked instead of
+    guessed: a modal dialog and a mouse drag both look like "FreeCAD stopped
+    answering", and neither is a reason to restart anything.
+    """
+    if not state or not state.get("available"):
+        return ""
+    reason = state.get("defer_reason")
+    queue = state.get("queue_depth")
+    if reason == "modal":
+        return (
+            f"GUI back-pressure: a MODAL DIALOG is open (held back "
+            f"{state.get('deferred_s')}s, queue depth {queue}). "
+            "This is not a wedged thread and not a setup problem: the addon "
+            "refuses to run document work while a modal dialog is up, so every "
+            "document call times out until it is closed.\n"
+            "  SOLUTION: call the dismiss_blocking_dialog tool. It is the one "
+            "call that is not held back by the dialog and closes it with Cancel "
+            "semantics, so nothing on screen gets confirmed. Without such a "
+            "tool (or if the dialog refuses to close), dismiss it by hand: the "
+            "usual culprit is the Document recovery dialog FreeCAD shows after "
+            "an unclean shutdown, which waits there indefinitely. Its buttons "
+            "are Cancel, Clear and Start recovery; they appear localized "
+            "(a Chinese FreeCAD shows 取消 / 清除 / 开始恢复). Cancel only "
+            "dismisses it, Clear empties the file list, and Start recovery "
+            "reopens and rewrites the listed documents, so use that one only if "
+            "you want them back. Exit FreeCAD cleanly to stop it appearing."
+        )
+    if reason == "button":
+        return (
+            f"GUI back-pressure: a mouse button is being held in the FreeCAD "
+            f"window (held back {state.get('deferred_s')}s, queue depth {queue}). "
+            "Nothing is broken: release the button and retry, the queue drains "
+            "by itself."
+        )
+    if reason == "popup":
+        return (
+            f"GUI back-pressure: a popup/context menu is open in FreeCAD (held "
+            f"back {state.get('deferred_s')}s, queue depth {queue}). Press Escape "
+            "or click elsewhere and retry."
+        )
+    if state.get("processing"):
+        return (
+            f"GUI back-pressure: the GUI thread is busy with an operation that "
+            f"has been running {state.get('processing_s')}s (queue depth {queue}). "
+            "Wait for it, or use execute_code_async for heavy OCCT work."
+        )
+    return ""
+
+
 def _verdict(
     rpc: dict,
     listeners: list[str],
     procs: list[dict],
     logs: list[dict],
     crash_logs: list[dict] | None = None,
+    gui_state: dict | None = None,
 ) -> str:
+    note = gui_state_note(gui_state)
     if rpc.get("reachable"):
+        if note:
+            return "FreeCAD is reachable, but " + note
         return "FreeCAD is reachable — the RPC server answered."
     if listeners:
         return (
@@ -503,6 +586,11 @@ def diagnose(host: str, port: int = DEFAULT_PORT, timeout: float = PROBE_TIMEOUT
     opened = False if rpc.get("reachable") else tcp_open(host, port, timeout)
     report["rpc"] = rpc
     report["tcp_open"] = opened
+    # Only asked once the endpoint answered: this call is NOT GUI-dispatched,
+    # so a held-back queue (modal dialog, mid-drag) still gets a truthful answer
+    # — which is the one case where "nothing runs" is not a fault.
+    if rpc.get("reachable"):
+        report["gui_state"] = probe_gui_state(host, port, timeout)
 
     if is_local:
         method, procs = freecad_processes()
@@ -531,7 +619,12 @@ def diagnose(host: str, port: int = DEFAULT_PORT, timeout: float = PROBE_TIMEOUT
         report["settings"] = settings_status()
 
     report["verdict"] = _verdict(
-        rpc, listeners, procs, report.get("addon_logs") or [], report.get("bootstrap_logs")
+        rpc,
+        listeners,
+        procs,
+        report.get("addon_logs") or [],
+        report.get("bootstrap_logs"),
+        report.get("gui_state"),
     )
     return report
 
@@ -551,6 +644,19 @@ def format_report(report: dict) -> str:
         lines.append("TCP port : open (something accepts connections)")
     elif not rpc.get("reachable"):
         lines.append("TCP port : closed")
+
+    state = report.get("gui_state")
+    if isinstance(state, dict) and state.get("available"):
+        lines.append(
+            "GUI queue: {label} (deferred {ds}s, processing {ps}s, queue {qd})".format(
+                label=state.get("defer_label") or "draining",
+                ds=state.get("deferred_s"),
+                ps=state.get("processing_s"),
+                qd=state.get("queue_depth"),
+            )
+        )
+    elif isinstance(state, dict) and state.get("error"):
+        lines.append(f"GUI queue: unknown ({state['error']})")
 
     listeners = report.get("listeners") or []
     if listeners:

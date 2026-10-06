@@ -104,7 +104,13 @@ both means two overlapping parts — the reply names it as hidden_base; its
 data is untouched). A base inside a Body must BE that
 Body's Tip: dressing a mid-chain feature is refused, because FreeCAD moves the
 Body's Tip onto the new dress-up and would silently drop every later feature
-(pockets, patterns).""",
+(pockets, patterns).
+Many edges in one call can defeat OCC: live on 1.1.4 the six bore rims of a
+patterned plate failed at 0.5 mm while every rim was fine on its own. When a
+multi-edge call does fail, the error says what the retry found (each edge alone
+succeeds → split the edges across several calls; specific edges fail alone →
+name them, try a smaller radius). A single invalid first recompute is retried in
+place before failing, since a stale recompute alone can produce it.""",
     "chamfer": """\
 chamfer — parametric chamfer (obj_name = base object).
 Required in obj_properties: edges (selector), size. Optional: name.
@@ -133,6 +139,14 @@ Two VERY different behaviours, picked by the base object:
   the FEATURE (e.g. a bolt hole) — one solid with N holes.
 - Base is a Part-level solid (a boolean result, a primitive): a Draft array
   replicates the whole object.
+A polar pattern turns about the AXIS LINE it references, and without `center`
+that is the body's own X/Y/Z origin axis: a bolt circle drawn around a face
+centre then rotates about the body origin, so occurrences that fall outside the
+material are clipped away silently (live: a hole at (60,35) about the origin
+gave 1 clean hole and 1 half-hole where 6 were asked for, reported as success).
+Pass center: [x, y, z] whenever the rotation centre is not the body origin —
+the op builds a datum line there and uses that as the axis. A linear pattern
+has no centre: spacing + axis alone decide where the copies land.
 PartDesign patterns are refused (clear error, nothing created) when the
 transform has no effect — FreeCAD 1.1 cannot drive a PartDesign pattern
 reliably through this API, and silently returning one hole instead of six is

@@ -15,7 +15,7 @@ import FreeCADGui
 import Part  # noqa: F401 - pre-imported for execute_code snippets (exec_snippet copies globals)
 from PySide import QtCore
 
-from rpc_server import dbglog, step_engine, step_journal, watchdog
+from rpc_server import dbglog, gui_dispatch, step_engine, step_journal, watchdog
 from rpc_server.assembly_ops import (
     assemble as _assemble,
 )
@@ -144,6 +144,33 @@ class FreeCADRPC:
     def ping(self):
         return True
 
+    def get_gui_state(self) -> dict[str, Any]:
+        """Report why the GUI queue is (or is not) draining.
+
+        NOT dispatched on purpose: the answer is needed exactly when nothing
+        else runs — a modal dialog holding the queue back, the user mid-drag, a
+        long recompute — so dispatching this call would make it as stuck as the
+        work it is explaining. ``diagnose`` reads it to tell back-pressure
+        (nothing is broken) from a wedged GUI thread (restart).
+        """
+        try:
+            return gui_dispatch.backpressure()
+        except Exception as e:
+            return {"success": False, "error": f"{type(e).__name__}: {e}"}
+
+    def dismiss_blocking_dialog(self) -> dict[str, Any]:
+        """Close the modal dialog holding CADPilot back (Cancel semantics).
+
+        The recovery path for a client that cannot drive the GUI itself: the
+        document-recovery dialog FreeCAD shows after an unclean shutdown blocks
+        every dispatched call, so this one is forced through the interaction
+        guards instead of being queued behind them.
+        """
+        try:
+            return gui_dispatch.dismiss_blocking_dialog()
+        except Exception as e:
+            return {"success": False, "error": f"{type(e).__name__}: {e}"}
+
     # --- mutations (with optional inline screenshot) ----------------------
 
     def _run_op_with_screenshot(
@@ -203,9 +230,16 @@ class FreeCADRPC:
 
         def _task_body(doc):
             in_transaction = False
+            tx_name = transaction
             if transaction and doc is not None:
+                # Unique per step (step_engine.transaction_name): the journal
+                # decides whether a rollback may pop natively by comparing these
+                # names against its own records, and a repeated
+                # "CADPilot: edit_object Box" made two property-only steps
+                # indistinguishable on the stack.
+                tx_name = step_engine.transaction_name(doc, transaction)
                 try:
-                    doc.openTransaction(transaction)
+                    doc.openTransaction(tx_name)
                     in_transaction = True
                 except Exception as e:
                     FreeCAD.Console.PrintWarning(f"CADPilot: cannot open transaction: {e}\n")
@@ -226,17 +260,32 @@ class FreeCADRPC:
             ok = res is True or (isinstance(res, dict) and res.get("success"))
             should_commit = ok if commit_if is None else bool(commit_if(res))
             objects = None
+            undoable = False
             if in_transaction:
                 if should_commit:
                     objects = sorted(o.Name for o in doc.Objects) if doc is not None else []
                     rec = None
                     if journal and doc is not None:
+                        params = journal.get("params")
+                        if (
+                            isinstance(res, dict)
+                            and res.get("moved_object")
+                            and isinstance(params, dict)
+                        ):
+                            # What the op ACTUALLY acted on. A move of a PartDesign
+                            # feature goes to its owning Body, and the journal's
+                            # sync claims must follow the object that moved rather
+                            # than the one that was named — otherwise the Body is
+                            # untracked (a manual drag of it syncs nowhere) and the
+                            # claim sits on a feature whose Placement FreeCAD
+                            # rewrites on every recompute.
+                            params = {**params, "moved_object": res["moved_object"]}
                         rec = step_engine.record_commit(
                             doc,
                             operation=journal.get("operation", "unknown"),
                             label=journal.get("label", ""),
-                            params=journal.get("params"),
-                            transaction=transaction,
+                            params=params,
+                            transaction=tx_name,
                             atomic=bool(journal.get("atomic", True)),
                             executable=journal.get("executable"),
                             objects_before=objects_before,
@@ -244,10 +293,23 @@ class FreeCADRPC:
                         )
                     doc.commitTransaction()
                     step_engine.downgrade_if_no_undo(doc, rec, token_before)
-                    dbglog.get_logger("tx").info("committed transaction %r", transaction)
+                    # Did an undo entry really land? A committed transaction that
+                    # changed nothing (a no-op edit, a rejected same-value write)
+                    # adds none, and the journal downgrades that record — this is
+                    # the same signal for callers that keep their own log (the
+                    # MCP session), which otherwise counted such a step as
+                    # atomic and popped one transaction too many on rollback.
+                    undoable = (
+                        bool(rec.transaction)
+                        if rec is not None
+                        else step_engine.undo_token(doc) != token_before
+                    )
+                    dbglog.get_logger("tx").info(
+                        "committed transaction %r (undo entry: %s)", tx_name, undoable
+                    )
                 else:
                     doc.abortTransaction()
-                    dbglog.get_logger("tx").info("aborted transaction %r", transaction)
+                    dbglog.get_logger("tx").info("aborted transaction %r", tx_name)
             # Whenever a transaction was committed the document changed, so the
             # caller needs the fingerprint even for partial batch failures —
             # otherwise the session log and the undo stack would desync.
@@ -265,7 +327,7 @@ class FreeCADRPC:
                     except Exception:
                         objects = []
             if tmp_path is None:
-                return res, None, in_transaction, objects
+                return res, None, in_transaction, objects, undoable
             shot = save_active_screenshot(
                 tmp_path,
                 screenshot.get("view_name", "Isometric"),
@@ -273,7 +335,7 @@ class FreeCADRPC:
                 screenshot.get("height"),
                 screenshot.get("focus_object"),
             )
-            return res, tmp_path if shot is True else None, in_transaction, objects
+            return res, tmp_path if shot is True else None, in_transaction, objects, undoable
 
         try:
             out = dispatch_to_gui(task)
@@ -282,6 +344,7 @@ class FreeCADRPC:
             res, shot_path = out[0], out[1]
             in_transaction = out[2] if len(out) > 2 else False
             objects = out[3] if len(out) > 3 else None
+            undoable = out[4] if len(out) > 4 else None
             if isinstance(res, dict):
                 result = {**success_payload, **res}
             elif res is True:
@@ -290,6 +353,12 @@ class FreeCADRPC:
                 return _err(res)
             if transaction:
                 result["transaction"] = in_transaction
+                if undoable is not None:
+                    # Distinguishes "a transaction was open" (what callers used to
+                    # read as a step that can be undone) from "an undo entry
+                    # really landed". Anything that keeps its own log must key on
+                    # this one, or a no-op step counts toward its rollback count.
+                    result["undoable"] = bool(undoable)
             if objects is not None:
                 result["objects"] = objects
             if shot_path is not None:
@@ -478,6 +547,16 @@ class FreeCADRPC:
             for op in ops:
                 before = [o.Name for o in doc.Objects] if doc is not None else []
                 res = self._run_one_operation(doc_name, op, is_batch=True)
+                if isinstance(op, dict) and res.get("success"):
+                    # Record on the sub-op what it REALLY acted on (the batch
+                    # journal's params ARE these dicts): a re-directed move went
+                    # to a PartDesign feature's Body, and FreeCAD may have
+                    # de-duplicated a requested create name. The manual-edit sync
+                    # claims follow the real object, not the requested one.
+                    if res.get("moved_object"):
+                        op["moved_object"] = res["moved_object"]
+                    if step_journal.sub_operation(op) == "create_object" and res.get("object_name"):
+                        op["created_object"] = res["object_name"]
                 if doc is not None and not res.get("success"):
                     # A sub-op can fail AFTER creating its object (a bad
                     # property value, a later validation step). Those
@@ -604,7 +683,9 @@ class FreeCADRPC:
 
     # --- undo/redo, save, introspection (modeling-session support) -----------
 
-    def _undo_redo(self, doc_name: str, n: int, undo: bool) -> dict[str, Any]:
+    def _undo_redo(
+        self, doc_name: str, n: int, undo: bool, trust_journal: bool = False
+    ) -> dict[str, Any]:
         try:
             n = int(n)
         except (TypeError, ValueError):
@@ -622,6 +703,27 @@ class FreeCADRPC:
                 stack_before = list(getattr(doc, stack_attr, []) or [])
             except Exception:
                 stack_before = []
+            # The caller keeps its own log and cannot name the transactions it
+            # expects (session step numbers are not journal indices), so it can
+            # only ask "are the entries you are about to pop yours at all?".
+            # Refusing beats popping a manual GUI edit in a step's place: only
+            # properties move, so the caller's object-set check stays silent.
+            if trust_journal:
+                foreign = step_engine.foreign_undo_entries(doc, n, undo=undo)
+                if foreign:
+                    verb = "undo" if undo else "redo"
+                    return {
+                        "success": False,
+                        "error": (
+                            f"{len(foreign)} of the {n} transaction(s) the {verb} would pop were "
+                            f"not created by CADPilot: {foreign}. A manual FreeCAD edit or "
+                            "another tool's write owns them, so proceeding would move the wrong "
+                            "change and leave the steps applied. Retry with force=true to "
+                            "proceed anyway."
+                        ),
+                        "foreign_entries": foreign,
+                        "stack_before": stack_before,
+                    }
             # step_engine owns the loop: it never calls undo()/redo() blind past
             # the end of the stack, skips ghost entries owned by other
             # documents, and reports the count that actually went.
@@ -657,9 +759,16 @@ class FreeCADRPC:
             return res
         return _err(res)
 
-    def undo_transactions(self, doc_name: str, n: int = 1) -> dict[str, Any]:
-        """Undo the n most recent document transactions (session rollback)."""
-        return self._undo_redo(doc_name, n, undo=True)
+    def undo_transactions(
+        self, doc_name: str, n: int = 1, trust_journal: bool = False
+    ) -> dict[str, Any]:
+        """Undo the n most recent document transactions (session rollback).
+
+        ``trust_journal`` refuses when the entries about to be popped are not
+        CADPilot's own (a manual edit, another tool), instead of eating them in
+        place of the step the caller meant.
+        """
+        return self._undo_redo(doc_name, n, undo=True, trust_journal=trust_journal)
 
     def redo_transactions(self, doc_name: str, n: int = 1) -> dict[str, Any]:
         """Redo n previously undone transactions (only valid until a new op)."""
@@ -1102,8 +1211,14 @@ class FreeCADRPC:
             # document change" for a run that did mutate) and filed the step
             # into the wrong document's journal.
             docs_before = step_engine.document_tokens()
+            tx_label = ""
             if wrapped:
-                doc.openTransaction("CADPilot: execute_code")
+                # Unique per snippet (step_engine.transaction_name): the journal
+                # decides whether a rollback may pop natively by comparing these
+                # names against its own records, and a shared literal would make
+                # two snippets' entries interchangeable on the stack.
+                tx_label = step_engine.transaction_name(doc, "execute_code")
+                doc.openTransaction(tx_label)
             try:
                 # Muted like every RPC mutation: the snippet's change is its
                 # own journal step, not a manual edit on an earlier one.
@@ -1138,6 +1253,7 @@ class FreeCADRPC:
                         code=code,
                         changed=tx_changed,
                         objects_before=before,
+                        transaction=tx_label,
                     )
             except Exception:
                 pass
@@ -1163,8 +1279,23 @@ class FreeCADRPC:
                     document,
                     wrapped,
                     foreign,
+                    # The object fingerprint of the document whose transaction we
+                    # own: the MCP session stores it per step and compares it
+                    # after a rollback. Without it an execute_code step's
+                    # fingerprint was EMPTY, so a rollback ending on such a step
+                    # always reported "the document differs from the recorded
+                    # step" (live-analyzed false failure).
+                    step_engine.object_names(doc),
                 )
-            return True, None, bool(changed_docs), document, wrapped, foreign
+            return (
+                True,
+                None,
+                bool(changed_docs),
+                document,
+                wrapped,
+                foreign,
+                step_engine.object_names(doc),
+            )
 
         try:
             out = dispatch_to_gui(combined_task, timeout=self.EXECUTE_CODE_TIMEOUT)
@@ -1176,6 +1307,7 @@ class FreeCADRPC:
                 changed_doc = out[3] if len(out) > 3 else None
                 attributed = out[4] if len(out) > 4 else True
                 foreign = out[5] if len(out) > 5 else []
+                own_objects = out[6] if len(out) > 6 else []
             else:
                 # Timeout or error from dispatch layer
                 code_preview = code if len(code) <= 800 else code[:800] + "\n...(truncated)"
@@ -1190,6 +1322,10 @@ class FreeCADRPC:
                     "success": True,
                     "changed": bool(changed),
                     "document": changed_doc,
+                    # The session keeps its own log and needs a per-step object
+                    # fingerprint to verify a rollback; an empty one made every
+                    # rollback ending on an execute_code step report a mismatch.
+                    "objects": list(own_objects or []),
                     # False when a transaction was already open, so the change
                     # cannot be attributed to a transaction we own: the step is
                     # rollback-able only by whatever owns that transaction.

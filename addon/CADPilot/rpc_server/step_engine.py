@@ -97,6 +97,13 @@ def _undo_names(doc) -> list[str]:
         return []
 
 
+def _redo_names(doc) -> list[str]:
+    try:
+        return list(getattr(doc, "RedoNames", []) or [])
+    except Exception:
+        return []
+
+
 def _is_ghost_entry(name) -> bool:
     """A transaction belonging to ANOTHER document, parked on this stack.
 
@@ -115,30 +122,64 @@ def _real_undo_names(doc) -> list[str]:
     return [n for n in _undo_names(doc) if not _is_ghost_entry(n)]
 
 
-def _stack_holds_journal(
-    doc, records: list[sj.StepRecord], upto_index: int, undo_count: int
-) -> bool:
-    """Can the native undo be trusted to revert exactly these steps?
+def _undo_cap() -> int:
+    """FreeCAD's ``MaxUndoSize``: how many transactions the undo stack keeps.
 
-    The undo stack is shared with the GUI, and it does not survive a reopen:
-    after one it holds NOTHING of the journal, while manual edits interleave on
-    it in every session. Popping blind then undoes the WRONG transactions — and
-    for a step that only changed properties no object moves, so the object-set
-    verification in ``_rollback`` cannot tell. The stack's own names are the
-    check: the entries about to be popped must be exactly the journal's
-    transactions for these steps, most recent first (UndoNames[0] is the next
-    entry undo() would take). Same-named entries are indistinguishable — every
-    execute_code step commits as "CADPilot: execute_code" — but any foreign
-    name in the way (or a too-short stack) downgrades to the rebuild path.
+    Once the stack is full every commit evicts the oldest entry, so a journal
+    longer than the cap can never be undone natively back to its start.
     """
-    if undo_count <= 0:
-        return True
-    expected = [r.transaction for r in reversed(records) if r.index > upto_index and r.transaction]
-    # Ghosts (other documents' transactions parked here) sit between this
-    # document's entries; _stack_op pops straight past them, so the comparison
-    # must look at the same non-ghost sequence or every rollback degraded to
-    # the full rebuild while a model was merely sharing the FreeCAD instance.
-    return _real_undo_names(doc)[:undo_count] == expected[:undo_count]
+    with contextlib.suppress(Exception):
+        return int(
+            FreeCAD.ParamGet("User parameter:BaseApp/Preferences/Document").GetInt(
+                "MaxUndoSize", 20
+            )
+        )
+    return 20
+
+
+def _undo_trust(
+    doc, records: list[sj.StepRecord], upto_index: int, undo_count: int
+) -> tuple[int, str]:
+    """How much of this span the undo stack can revert, and why it falls short.
+
+    The stack is shared with the GUI and does not survive a reopen, while manual
+    edits interleave on it in every session, so its own names are the check: the
+    entries about to be popped must be exactly the journal's transactions for
+    these steps, most recent first (UndoNames[0] is the next entry undo() would
+    take). Same-named entries are indistinguishable — every execute_code step
+    commits as "CADPilot: execute_code" — and a foreign name in the way stops the
+    matching prefix, because popping past it would undo the WRONG transaction.
+
+    The answer is a SPAN, not a yes/no. FreeCAD caps the undo stack
+    (``MaxUndoSize``, 20 by default), so a journal longer than the cap has its
+    oldest entries evicted: the stack can never hold the whole span again, and
+    judging it "does not hold the journal's transactions" (the reopened-document
+    verdict) popped nothing and forced a full rebuild on every deep rollback
+    while every entry it DID hold matched, in order. ``why`` is empty when the
+    whole span is covered, and otherwise names the real cause instead of
+    guessing between a reopen and an off-journal edit.
+    """
+    names = _real_undo_names(doc)
+    span = sj.undo_trust_span(names, records, upto_index, undo_count)
+    if span >= undo_count:
+        return span, ""
+    if span == 0:
+        why = (
+            "the undo stack holds none of the journal's transactions for these steps "
+            "(the document was reopened, or edited outside the journal)"
+        )
+    elif len(names) < undo_count:
+        why = (
+            f"the undo stack holds only {span} of the {undo_count} transactions this range "
+            f"needs: FreeCAD keeps just the last {_undo_cap()} undo entries, so the oldest "
+            "step(s) can no longer be undone natively"
+        )
+    else:
+        why = (
+            f"the undo stack holds only {span} of the {undo_count} transactions this range "
+            "needs: a foreign (off-journal) transaction sits in the way"
+        )
+    return span, why
 
 
 def _object_names(doc) -> list[str]:
@@ -151,6 +192,62 @@ def _object_names(doc) -> list[str]:
 def _transaction_name(rec: sj.StepRecord) -> str:
     name = rec.params.get("obj_name") or ""
     return f"CADPilot: {rec.operation} {name}".strip()
+
+
+# Per-document sequence so every undo entry gets a distinct name. Keyed by
+# document NAME and never reset: a closed-and-reopened document simply keeps
+# counting, which is harmless (names only need to be unique while they are on a
+# stack, and a reopen throws the stack away).
+_TX_SEQ: dict[str, int] = {}
+
+# Every CADPilot transaction starts with this; "which entries are ours" is how
+# a caller with its own log (the MCP session) refuses to eat a manual edit.
+TX_PREFIX = "CADPilot: "
+
+
+def transaction_name(doc, label: str) -> str:
+    """Unique FreeCAD undo-entry name: ``CADPilot: #<seq> <label>``.
+
+    Uniqueness is load-bearing, not cosmetics. The journal verifies a rollback
+    by comparing the undo stack's names against its own records, so two steps
+    sharing a name are indistinguishable — and before the sequence number every
+    ``edit_object Box`` committed as the identical ``"CADPilot: edit_object
+    Box"``. A manual Ctrl+Z of the newest step then left an older same-named
+    entry on the stack, the drift check (a membership test) still answered
+    "present", and a rollback popped the WRONG transaction while every
+    object-set verification stayed silent, because only properties had changed.
+    A record stores the name at commit time and never recomputes it, so
+    journals written before this (and their stacks) keep matching themselves.
+    """
+    key = str(getattr(doc, "Name", "") or "")
+    seq = _TX_SEQ.get(key, 0) + 1
+    _TX_SEQ[key] = seq
+    rest = str(label or "op")
+    if rest.startswith(TX_PREFIX):
+        rest = rest[len(TX_PREFIX) :]
+    return f"{TX_PREFIX}#{seq} {rest}"
+
+
+def _real_redo_names(doc) -> list[str]:
+    """Redo-stack names minus other documents' ghosts (see _is_ghost_entry)."""
+    return [n for n in _redo_names(doc) if not _is_ghost_entry(n)]
+
+
+def foreign_undo_entries(doc, n: int, undo: bool = True) -> list[str]:
+    """Names among the ``n`` entries an undo/redo would pop that are NOT ours.
+
+    The journal path verifies the exact step names before popping; a caller
+    keeping its own log (the MCP session) cannot, but it can still refuse to eat
+    a transaction that was never one of its steps — a manual GUI edit, another
+    tool's write. Without this check the session's count-based rollback popped
+    the manual edit instead and reported success while every session step stayed
+    applied: only properties had moved, so the object-set verification saw
+    nothing (live-analyzed; same class as the journal's name check).
+    """
+    if n <= 0:
+        return []
+    names = _real_undo_names(doc) if undo else _real_redo_names(doc)
+    return [str(name) for name in names[:n] if not str(name).startswith(TX_PREFIX)]
 
 
 # --- engine-echo mute -----------------------------------------------------------
@@ -177,7 +274,15 @@ class _EngineQuiet:
 
     def __exit__(self, *exc: object) -> bool:
         global _ENGINE_ACTIVE
-        _ENGINE_ACTIVE -= 1
+        # CLAMPED at zero: a window left open across a hot reload still runs its
+        # __exit__ against the freshly re-executed (zeroed) counter, and that
+        # unbalanced decrement used to leave the counter at -1 — permanently, so
+        # every later `engine_quiet()` brought it to 0 instead of 1 and the mute
+        # silently STOPPED WORKING for the rest of the session. The observer then
+        # synced machine writes into the owning step's params (live: after one
+        # restart-from-execute_code, execute_code's own writes rewrote the batch
+        # step's obj_properties — the exact bleed this window exists to prevent).
+        _ENGINE_ACTIVE = max(0, _ENGINE_ACTIVE - 1)
         return False
 
 
@@ -383,6 +488,7 @@ def append_execute_code(
     code: str,
     changed: bool,
     objects_before: list[str] | None = None,
+    transaction: str = "",
 ) -> None:
     """Record an execute_code step.
 
@@ -423,7 +529,7 @@ def append_execute_code(
                 # The code is ALWAYS kept, read-only or not: the panel shows it
                 # as the step's detail, and without it a row is an opaque "{}".
                 params={"code": code},
-                transaction="CADPilot: execute_code" if changed else "",
+                transaction=(transaction or "CADPilot: execute_code") if changed else "",
                 atomic=changed,
                 mutated=changed,
                 executable=changed,
@@ -651,7 +757,7 @@ def run_record(doc, records: list[sj.StepRecord], rec: sj.StepRecord) -> dict[st
 
 
 def _run_record_locked(doc, records: list[sj.StepRecord], rec: sj.StepRecord) -> dict[str, Any]:
-    tx = _transaction_name(rec)
+    tx = transaction_name(doc, _transaction_name(rec))
     before = _object_names(doc)
     token_before = None
     with contextlib.suppress(Exception):
@@ -674,6 +780,12 @@ def _run_record_locked(doc, records: list[sj.StepRecord], rec: sj.StepRecord) ->
             doc.abortTransaction()
         rec.state = sj.STATE_FAILED
         rec.error = str(res.get("error") or "unknown error")
+        # The abort destroyed the transaction, so the record owns no undo entry
+        # any more. Keeping the OLD name (a re-run of a step that previously
+        # succeeded) put a name in the journal that is not on the stack, which
+        # broke the rollback trust check at that position and turned a healthy
+        # rollback into a full rebuild.
+        rec.transaction = ""
         logger.warning("aborted transaction %r: %s", tx, rec.error)
         # The transaction is gone, so this write is deliberately outside one.
         with contextlib.suppress(Exception):
@@ -1105,23 +1217,28 @@ def _remove_objects_locked(doc, names: list[str]) -> list[str]:
     targets = [n for n in names if n in present]
     if not targets:
         return removed
-    doc.openTransaction("CADPilot: rollback cleanup")
+    doc.openTransaction(transaction_name(doc, "rollback cleanup"))
     try:
-        for name in targets:
-            obj = doc.getObject(name)
-            if obj is None:
-                continue
-            try:
-                doc.removeObject(name)
-                removed.append(name)
-            except Exception as exc:  # still referenced, or not removable
-                FreeCAD.Console.PrintWarning(f"CADPilot: could not remove '{name}': {exc}\n")
-        doc.recompute()
-        # Removing the feature that WAS a Body's Tip leaves the Body Invalid
-        # until the tip is re-pointed; a rollback that drops a tip feature must
-        # leave a usable document behind.
-        if repair_body_tips(doc):
+        # Engine-driven by definition: the recompute after a removal can fire
+        # changed-object events (a dependant feature's AttachmentOffset, a
+        # Body's tip), and mirroring those back into the journal would rewrite a
+        # step's params from a state this very operation is tearing down.
+        with _EngineQuiet():
+            for name in targets:
+                obj = doc.getObject(name)
+                if obj is None:
+                    continue
+                try:
+                    doc.removeObject(name)
+                    removed.append(name)
+                except Exception as exc:  # still referenced, or not removable
+                    FreeCAD.Console.PrintWarning(f"CADPilot: could not remove '{name}': {exc}\n")
             doc.recompute()
+            # Removing the feature that WAS a Body's Tip leaves the Body Invalid
+            # until the tip is re-pointed; a rollback that drops a tip feature must
+            # leave a usable document behind.
+            if repair_body_tips(doc):
+                doc.recompute()
         doc.commitTransaction()
     except Exception:
         with contextlib.suppress(Exception):
@@ -1150,8 +1267,8 @@ def _rollback(doc, records, to_index: int, force: bool) -> dict[str, Any]:
                 "pass force=true to roll back across them"
             ),
         }
-    trust_undo = _stack_holds_journal(doc, records, to_index, plan["undo_count"])
-    res = undo_n(doc, plan["undo_count"] if trust_undo else 0)
+    span, undo_why = _undo_trust(doc, records, to_index, plan["undo_count"])
+    res = undo_n(doc, span)
     # doc.undo() does NOT rewind the journal — the property is document-level and
     # FreeCAD only tracks undo for objects. This reconciliation is what makes
     # the log match the model again, so it runs on every rollback, not just as a
@@ -1175,12 +1292,12 @@ def _rollback(doc, records, to_index: int, force: bool) -> dict[str, Any]:
     stranded = sj.steps_without_undo(records, to_index)
 
     triggers: list[str] = []
-    if not trust_undo:
-        triggers.append(
-            "the undo stack does not hold the journal's transactions for these steps "
-            "(the document was reopened, or edited outside the journal)"
-        )
-    elif res["count"] < plan["undo_count"]:
+    if undo_why:
+        # A capped stack is the common cause (MaxUndoSize), and the text names
+        # it: the old wording blamed a reopen or an off-journal edit for a stack
+        # whose surviving entries matched the journal exactly.
+        triggers.append(undo_why)
+    elif res["count"] < span:
         triggers.append(
             f"the undo stack held only {res['count']}/{plan['undo_count']} of the "
             "journal's transactions"
@@ -1188,10 +1305,11 @@ def _rollback(doc, records, to_index: int, force: bool) -> dict[str, Any]:
     if stranded:
         triggers.append(f"step(s) {stranded} own no undo entry")
     if leftover:
-        triggers.append(
-            f"object(s) {leftover} from the rolled-back steps are still present "
-            "(off-journal edits on the undo stack?)"
-        )
+        # Only guess at an off-journal edit when the stack was otherwise
+        # complete: with a short span the cap already explains the leftovers,
+        # and the old wording blamed the user for FreeCAD's own eviction.
+        cause = "" if undo_why else " (off-journal edits on the undo stack?)"
+        triggers.append(f"object(s) {leftover} from the rolled-back steps are still present{cause}")
     if missing:
         triggers.append(f"object(s) {missing} that step {to_index} should have are gone")
 
@@ -1251,7 +1369,11 @@ def _rollback(doc, records, to_index: int, force: bool) -> dict[str, Any]:
                     f"object(s) {still} could not be removed and are still in the document"
                 )
 
-    extra = sj.done_count(records) - to_index
+    # How many DONE records the rollback affected — NOT done_count - to_index,
+    # which assumes 1..to_index are all done and so under-rewinds (leaving
+    # records marked done whose transactions were already undone) whenever a
+    # FAILED or PLANNED record sits in between.
+    extra = sj.done_after_index(records, to_index)
     if extra > 0:
         sj.rewind(records, extra)
         with contextlib.suppress(Exception):
@@ -1286,15 +1408,12 @@ def _reject(doc, records, index: int, force: bool, reason: str) -> dict[str, Any
                 f"{sj.blocking_text(records, plan['blocking'])}; pass force=true"
             ),
         }
-    trust_undo = _stack_holds_journal(doc, records, index - 1, plan["undo_count"])
-    res = undo_n(doc, plan["undo_count"] if trust_undo else 0)
+    span, undo_why = _undo_trust(doc, records, index - 1, plan["undo_count"])
+    res = undo_n(doc, span)
     records = read_journal(doc)
     warnings: list[str] = []
-    if not trust_undo:
-        warnings.append(
-            "the undo stack does not hold the journal's transactions for these steps "
-            "(the document was reopened, or edited outside the journal)"
-        )
+    if undo_why:
+        warnings.append(undo_why)
     # The same undo-stack problems as rollback: a rejected step with no undo
     # entry leaves its objects behind, and a manual edit interleaved on the
     # stack pops under this reject's name. The records are about to be DROPPED,
@@ -1319,7 +1438,7 @@ def _reject(doc, records, index: int, force: bool, reason: str) -> dict[str, Any
             f"object(s) {gone} that the kept steps created are missing (off-journal "
             "edits on the undo stack?); replay the journal to rebuild them"
         )
-    if trust_undo and res["count"] < plan["undo_count"]:
+    if res["count"] < span:
         warnings.append(
             f"only {res['count']}/{plan['undo_count']} transactions could be undone "
             "(the FreeCAD undo stack was shorter than the journal)"
@@ -1376,25 +1495,34 @@ def _reexecute(
                 f"{plan['accepted']}; pass force=true"
             ),
         }
-    trust_undo = _stack_holds_journal(doc, records, index - 1, plan["undo_count"])
-    res = undo_n(doc, plan["undo_count"] if trust_undo else 0)
-    records = read_journal(doc)
     # Re-running a step is only sound on a clean base: if the undo came up
     # short, popped the wrong transactions (off-journal edits on the stack), or
     # was skipped as untrustworthy, re-running would duplicate objects under
     # deduplicated names instead of failing. Verify the stack and object sets
     # first and point at rollback_to, which can rebuild, instead.
+    #
+    # A span the stack cannot fully cover is a REFUSAL, not a partial undo:
+    # popping the reachable part and then bailing out would leave the document
+    # rolled back AND un-rerun, which is further from what the caller asked for
+    # than not touching it at all.
+    _span, undo_why = _undo_trust(doc, records, index - 1, plan["undo_count"])
+    if undo_why:
+        return {
+            "success": False,
+            "error": (
+                f"cannot re-run step {index}: {undo_why}; "
+                "run rollback_to first, it can rebuild the model"
+            ),
+        }
+    res = undo_n(doc, plan["undo_count"])
+    records = read_journal(doc)
     if res["count"] < plan["undo_count"]:
-        why = (
-            "the undo stack does not match the journal (reopened document or off-journal edits)"
-            if not trust_undo
-            else "the undo stack is shorter than the journal"
-        )
         return {
             "success": False,
             "error": (
                 f"only {res['count']}/{plan['undo_count']} transactions could be undone "
-                f"({why}); run rollback_to first, it can rebuild the model"
+                "(the FreeCAD undo stack was shorter than the journal); "
+                "run rollback_to first, it can rebuild the model"
             ),
         }
     present = set(_object_names(doc))
@@ -1411,10 +1539,15 @@ def _reexecute(
     rec = next((r for r in records if r.index == index), None)
     if rec is None:
         return {"success": False, "error": f"step {index} disappeared during rollback"}
-    extra = sj.done_count(records) - (index - 1)
+    extra = sj.done_after_index(records, index - 1)
     if extra > 0:
         sj.rewind(records, extra)
     rec.state = sj.STATE_PLANNED
+    # Its transaction was just undone (or rewound by the line above), so the
+    # record owns no undo entry until the re-run commits one: a stale name would
+    # sit in the journal as a transaction the stack cannot supply, which breaks
+    # the rollback trust check at that position.
+    rec.transaction = ""
     rec.params = {**(rec.params or {}), **(params or {})}
     if label:
         rec.label = label
@@ -1585,7 +1718,7 @@ class _JournalSyncObserver:
         # mutes machine-driven windows (engine undo/redo/re-run, and every
         # RPC-layer mutation — a tool's change is its own step, and letting it
         # bleed into an earlier step's params made reject/replay inconsistent).
-        if self._writing or _ENGINE_ACTIVE:
+        if self._writing or _ENGINE_ACTIVE > 0:
             return
         # An observer must never break the host's edit.
         with contextlib.suppress(Exception):
@@ -1605,13 +1738,31 @@ class _JournalSyncObserver:
         entry = cached[1].get(getattr(obj, "Name", ""))
         if entry is None:
             return
+        if prop == "ExpressionEngine":
+            # Binding or unbinding an expression rewrites ExpressionEngine and
+            # need not fire the bound property itself, so every value this
+            # object is tracked for is re-read here. Live-verified on 1.1.4:
+            # binding Pad.Length to =Vars.plate_thk in the GUI left the step's
+            # params at the last number (and unbinding left "=Vars.plate_thk"
+            # in them), even though the code below reads the live binding
+            # correctly whenever it runs.
+            records = sj.from_json(text)
+            if entry.get("sheet") is not None:
+                self._sync_cells(obj, doc, records, *entry["sheet"])
+            if entry.get("sketch") is not None:
+                self._sync_constraints(obj, doc, records, *entry["sketch"])
+            for claimed in list(entry["props"]):
+                self._sync(obj, claimed)
+            if entry.get("move") is not None:
+                self._sync_move_fold(obj, doc, records, *entry["move"])
+            return
         # The value compare inside each handler makes repeat firings (a cell
         # edit fires both 'cells' and the address) no-ops, so trigger wide.
         if entry.get("sheet") is not None:
-            self._sync_cells(obj, doc, sj.from_json(text), entry["sheet"])
+            self._sync_cells(obj, doc, sj.from_json(text), *entry["sheet"])
             return
         if entry.get("sketch") is not None and prop == "Constraints":
-            self._sync_constraints(obj, doc, sj.from_json(text), entry["sketch"])
+            self._sync_constraints(obj, doc, sj.from_json(text), *entry["sketch"])
             return
         hit = entry["props"].get(prop)
         if hit is None:
@@ -1669,13 +1820,13 @@ class _JournalSyncObserver:
             doc, records, rec.index, f"{obj.Name}.{prop}", brief(current), brief(value)
         )
 
-    def _sync_cells(self, obj, doc, records, index: int) -> None:
+    def _sync_cells(self, obj, doc, records, index: int, sub: int | None = None) -> None:
         """Mirror spreadsheet cell edits (values, formulas, aliases) into the
-        owning variables step's ``cells`` spec."""
+        owning step's ``cells`` spec (``sub`` routes into a batch sub-op)."""
         rec = next((r for r in records if r.index == index), None)
         if rec is None:
             return
-        cells = (rec.params.get("obj_properties") or {}).get("cells")
+        cells = (_sync_props_target(rec, sub) or {}).get("cells")
         if not isinstance(cells, dict) or not cells:
             return
         changed = 0
@@ -1702,7 +1853,7 @@ class _JournalSyncObserver:
             return
         self._commit_sync(doc, records, index, f"{obj.Name}.cells", "-", f"{changed} cell field(s)")
 
-    def _sync_constraints(self, obj, doc, records, index: int) -> None:
+    def _sync_constraints(self, obj, doc, records, index: int, sub: int | None = None) -> None:
         """Mirror dimensional-constraint edits into the owning sketch step.
 
         The spec's constraint list maps to the live sketch BY INDEX, so the
@@ -1713,7 +1864,7 @@ class _JournalSyncObserver:
         rec = next((r for r in records if r.index == index), None)
         if rec is None:
             return
-        pcons = (rec.params.get("obj_properties") or {}).get("constraints")
+        pcons = (_sync_props_target(rec, sub) or {}).get("constraints")
         if not isinstance(pcons, list) or not pcons:
             return
         live = list(getattr(obj, "Constraints", None) or [])

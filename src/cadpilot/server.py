@@ -28,6 +28,7 @@ from .operations import (
     check_interference_operation,
     create_document_operation,
     diagnose_operation,
+    dismiss_blocking_dialog_operation,
     execute_code_async_operation,
     execute_code_operation,
     get_addon_log_operation,
@@ -523,6 +524,15 @@ def diagnose(ctx: Context, host: str | None = None) -> list[TextContent]:
     Reference: operation_help("diagnose").
     """
     return diagnose_operation(host or state.rpc_host)
+
+
+@mcp.tool(annotations=_mutating("Dismiss Blocking Dialog", destructive=False))
+def dismiss_blocking_dialog(ctx: Context) -> list[TextContent]:
+    """Close the modal dialog that is blocking every CADPilot call (Cancel semantics).
+
+    Use it when calls time out while ping still answers; diagnose names the blocker.
+    """
+    return dismiss_blocking_dialog_operation(state.connection)
 
 
 @mcp.tool(annotations=_mutating("Save Pattern", destructive=False))

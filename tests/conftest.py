@@ -194,16 +194,24 @@ class FakeFreeCADConnection:
             res["screenshot"] = self.SCREENSHOT
         return self._result("execute_operations", res)
 
-    def undo_transactions(self, doc_name, n=1):
-        self._record("undo_transactions", doc_name, n)
+    def undo_transactions(self, doc_name, n=1, trust_journal=False):
+        # Only sent when set (XML-RPC is positional): an unforced rollback must
+        # look exactly like the pre-fix call.
+        if trust_journal:
+            self._record("undo_transactions", doc_name, n, trust_journal=True)
+        else:
+            self._record("undo_transactions", doc_name, n)
         count = self.undo_count if self.undo_count is not None else n
         return self._result(
             "undo_transactions",
             {"success": True, "count": count, "objects": self._doc_objects(doc_name)},
         )
 
-    def redo_transactions(self, doc_name, n=1):
-        self._record("redo_transactions", doc_name, n)
+    def redo_transactions(self, doc_name, n=1, trust_journal=False):
+        if trust_journal:
+            self._record("redo_transactions", doc_name, n, trust_journal=True)
+        else:
+            self._record("redo_transactions", doc_name, n)
         return self._result(
             "redo_transactions",
             {"success": True, "count": n, "objects": self._doc_objects(doc_name)},
