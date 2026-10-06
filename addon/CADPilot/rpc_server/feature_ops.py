@@ -1290,12 +1290,21 @@ def _auto_detect_cut_direction(doc, feat, spec, fc_type, base_vol) -> None:
     if spec.get("reversed") is not None or spec.get("midplane"):
         return
     doc.recompute()
-    forward_vol = _read_shape_state(feat, doc)[2]
+    _shape, _valid, forward_vol, _solids, forward_error = _read_shape_state(feat, doc)
+    if forward_error:
+        # An unreadable Shape reports volume 0.0, which would read as "removed
+        # EVERYTHING" and flip the cut on a feature that never computed at all.
+        # Leave the direction alone; create_feature_gui reports the real fault.
+        return
     if forward_vol < base_vol - _CUT_EPS:
         return  # it cut something: nothing to decide
     feat.Reversed = True
     doc.recompute()
-    reversed_vol = _read_shape_state(feat, doc)[2]
+    _shape, _valid, reversed_vol, _solids, reversed_error = _read_shape_state(feat, doc)
+    if reversed_error:
+        feat.Reversed = False
+        doc.recompute()
+        return
     if reversed_vol >= base_vol - _CUT_EPS:
         feat.Reversed = False  # cuts air either way: not a direction problem
         doc.recompute()
@@ -1455,6 +1464,10 @@ def _build_datum_plane(doc, spec):
         if not (isinstance(face, (list, tuple)) and len(face) == 2):
             raise ValueError("plane.face must be [object_name, 'FaceN'].")
         ref = _get_obj(doc, face[0], "datum plane face object")
+        # Never name the Body itself: its Shape is its Tip's result, so a feature
+        # built on anything attached there closes a dependency cycle (see
+        # sketcher_ops.attachment_ref).
+        ref = sketcher_ops.attachment_ref(ref)
         face_name = str(face[1])
         # Direction tokens (+Z/top/…) resolve like a sketch's plane.face —
         # face names are re-derived after every feature, so the direction is

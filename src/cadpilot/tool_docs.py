@@ -245,6 +245,10 @@ Optional: plane, offset, body, construction, external, constraints.
   face; without it the origin sits on the face's parametric origin, which is a
   CORNER on rectangular faces (a circle meant for the middle of a 100x60 side
   face lands at its corner and the cut is clipped by the part's edge).
+  Naming the BODY is allowed and is resolved to its Tip: the Body's Shape IS
+  its Tip's result, so an attachment naming the Body itself closes a dependency
+  cycle the moment a feature built on this profile joins the body, and FreeCAD
+  reports that as an unreadable shape on the new feature (not as a cycle).
   The sketch result echoes the resolved `plane` (object, face name, center,
   normal, centered) plus `sketch_origin` — where the sketch's origin actually
   landed, which is NOT the reported face center unless you passed

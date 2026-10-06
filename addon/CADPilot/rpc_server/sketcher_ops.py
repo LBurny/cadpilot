@@ -409,6 +409,35 @@ _FACE_WORDS = {
 }
 
 
+def attachment_ref(obj):
+    """The object an attachment should NAME, so it cannot form a dependency cycle.
+
+    A sketch (or datum plane) attached to a PartDesign **Body**'s face is a cycle
+    waiting for the next feature: the Body's Shape IS its Tip's result, so the
+    moment a feature built on that profile joins the body the graph closes
+    (Body.Shape -> Pocket -> profile sketch -> Body.Shape). FreeCAD neither fails
+    nor warns: the new feature stays ``Touched`` forever and reading its Shape
+    raises the bare "shape is invalid", which reads like a broken profile.
+
+    Live-caught in a plan run (document Stress2): a bolt-hole sketch created with
+    ``plane={"face": ["Body", "+Z"]}`` made every pocket on it fail with
+    "produced an invalid Shape", and the failure then cascaded (the polar pattern
+    could not find its base). Re-pointing the SAME sketch at the Pad feature made
+    the identical pocket compute exactly 57207.213 mm^3.
+
+    Resolution: name the Body's Tip, which owns the same faces under the same
+    numbering (the Body's Shape is its result), or the adopted BaseFeature when
+    the body has no tip. Anything that is not a Body comes back unchanged.
+    """
+    if getattr(obj, "TypeId", "") != "PartDesign::Body":
+        return obj
+    tip = getattr(obj, "Tip", None)
+    if tip is not None:
+        return tip
+    base = getattr(obj, "BaseFeature", None)
+    return base if base is not None else obj
+
+
 def _resolve_semantic_face(ref, token: str) -> str:
     """Resolve '+Z' / 'top' / '-X' … to the name of the matching planar face."""
     want = _FACE_WORDS.get(str(token).lower(), str(token).upper())
@@ -533,6 +562,10 @@ def _attach_sketch(sketch, doc, spec):
         ref = doc.getObject(face[0])
         if ref is None:
             raise ValueError(f"plane face object '{face[0]}' not found.")
+        # A Body's face must be named through its Tip: attaching to the Body
+        # itself makes the next feature built on this profile a dependency cycle
+        # (see attachment_ref).
+        ref = attachment_ref(ref)
         face_name = str(face[1])
         if face_name.startswith(("+", "-")) or face_name.lower() in _FACE_WORDS:
             face_name = _resolve_semantic_face(ref, face_name)

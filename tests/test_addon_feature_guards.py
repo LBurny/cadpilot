@@ -430,3 +430,40 @@ def test_the_auto_decided_direction_reaches_the_caller():
     # disagree about whether a cut removed anything.
     assert "_CUT_EPS" in setter
     assert "_CUT_EPS" in ast.unparse(_func(_FEATURE, "_cut_removed_nothing"))
+
+
+def test_an_attachment_never_names_a_body():
+    """Attaching to a PartDesign **Body**'s face is a dependency cycle waiting
+    for the next feature: the Body's Shape IS its Tip's result, so the moment a
+    feature built on that profile joins the body the graph closes
+    (Body.Shape -> Pocket -> profile sketch -> Body.Shape). FreeCAD neither
+    fails nor warns there: the feature stays Touched forever and reading its
+    Shape raises the bare "shape is invalid", which reads like a broken profile.
+
+    Live-caught in a plan run (document Stress2): a bolt-hole sketch created with
+    plane={"face": ["Body", "+Z"]} made every pocket on it fail with "produced an
+    invalid Shape", and the failure cascaded into the polar pattern. Re-pointing
+    the SAME sketch at the Pad feature made the identical pocket compute exactly
+    57207.213 mm^3; through the plan engine the whole sequence then produced the
+    analytic 49243.275."""
+    helper = ast.unparse(_func(_SKETCHER, "attachment_ref"))
+    assert "PartDesign::Body" in helper, "only a Body is the cycle risk"
+    assert "Tip" in helper, "the Tip owns the same faces and breaks the cycle"
+    assert "BaseFeature" in helper, "a body with no tip can still have material"
+    # Both attachment sites must route through it, and the sketch one must do it
+    # BEFORE resolving the face (the resolution reads that object's Shape).
+    attach = ast.unparse(_func(_SKETCHER, "_attach_sketch"))
+    assert "attachment_ref" in attach
+    assert attach.index("attachment_ref") < attach.index("_resolve_semantic_face")
+    assert "attachment_ref" in ast.unparse(_func(_FEATURE, "_build_datum_plane"))
+
+
+def test_direction_probe_ignores_an_unreadable_shape():
+    """_read_shape_state reports volume 0.0 on a failed read, which this probe
+    would take for "removed EVERYTHING" and flip the cut of a feature that never
+    computed at all. The error channel must decide before any volume compare."""
+    text = ast.unparse(_func(_FEATURE, "_auto_detect_cut_direction"))
+    assert "forward_error" in text and "reversed_error" in text
+    assert text.index("forward_error") < text.index("forward_vol < base_vol"), (
+        "the unreadable-shape bail-out must come first"
+    )
