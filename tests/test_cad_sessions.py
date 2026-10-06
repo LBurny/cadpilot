@@ -208,17 +208,22 @@ def test_rollback_reports_fingerprint_drift(fake_freecad, isolated_home):
     assert data["warnings"]
 
 
-def test_rollback_blocked_by_non_atomic_step(fake_freecad, isolated_home):
+def test_rollback_skips_non_atomic_steps_without_blocking(fake_freecad, isolated_home):
+    """A non-atomic step provably committed nothing (the addon's empty-commit
+    probe), so it must neither demand force=true nor consume an undo pop: the
+    rollback crosses it, undoes exactly the atomic count, and drops its log
+    row. It used to refuse the whole rollback with a misattributed
+    "execute_code without a transaction" message."""
     sess = _start_session(fake_freecad)
     sess.add_step("create_object", "a", objects_after=["A"])
     sess.add_step("execute_code", "b", atomic=False)
     resp = session_rollback_operation(fake_freecad, 0)
-    assert "Cannot roll back past step(s) [2]" in _text(resp)
-    assert sess.step_count == 2  # unchanged
-
-    resp = session_rollback_operation(fake_freecad, 0, force=True)
-    assert _json(resp)["success"] is True
-    assert sess.step_count == 0
+    data = _json(resp)
+    assert data["success"] is True
+    assert data["undone_transactions"] == 1  # only the atomic step's entry
+    assert data["removed_steps"] == [1, 2]
+    assert any("committed nothing" in w for w in data["warnings"])
+    assert fake_freecad.calls[-1][:2] == ("undo_transactions", ("Doc", 1))
 
 
 def test_rollback_partial_undo_truncates_to_match(fake_freecad, isolated_home):
@@ -623,3 +628,23 @@ def test_session_rollback_asks_the_addon_to_refuse_foreign_entries(fake_freecad,
     assert _json(session_rollback_operation(fake_freecad, 0, force=True))["success"] is True
     assert [c for c in fake_freecad.calls if c[0] == "undo_transactions"][-1][1] == ("Doc", 1)
     assert sess.step_count == 0
+
+
+def test_persistence_failure_degrades_to_a_warning(fake_freecad, isolated_home, monkeypatch):
+    """A save_session OSError used to escape the tool AFTER the mutation had
+    committed: the caller saw a hard protocol error for a change that actually
+    succeeded, and would likely retry it (double-apply). It must degrade to a
+    warning in the result."""
+    import cadpilot.session_state as ss
+
+    sess = _start_session(fake_freecad)
+
+    def boom(_session):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(ss, "save_session", boom)
+    resp = cad_operation(fake_freecad, "create_object", "Doc", obj_type="Part::Box", obj_name="Box")
+    text = _text(resp)
+    assert "created" in text  # the mutation itself succeeded
+    assert "could not be persisted" in text  # the persistence loss is visible
+    assert sess.step_count == 1

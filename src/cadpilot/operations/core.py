@@ -15,7 +15,7 @@ from ..session_state import (
     list_sessions,
     load_session,
     new_session,
-    save_session,
+    persist_session,
     set_current_session,
 )
 
@@ -216,10 +216,12 @@ def execute_code_operation(
                         objects_after=_normalize_object_names(res.get("objects", [])),
                         atomic=True,
                     )
-                    save_session(sess)
+                    persist_note = persist_session(sess)
                     step_note = (
                         f" (recorded as atomic step #{step.step_number} of session '{sess.name}')"
                     )
+                    if persist_note:
+                        step_note += f" {persist_note}"
             elif changed and not attributed:
                 step_note = (
                     " (a transaction was already open when the snippet ran, so its change "
@@ -551,8 +553,10 @@ def _record_step_if_tracked(
         # could not see it because only properties had moved.
         atomic=bool(res.get("undoable", res.get("transaction", True))),
     )
-    save_session(sess)
-    return f" [step #{step.step_number} of session '{sess.name}']"
+    persist_note = persist_session(sess)
+    return f" [step #{step.step_number} of session '{sess.name}']" + (
+        f" {persist_note}" if persist_note else ""
+    )
 
 
 def cad_operation(
@@ -768,7 +772,7 @@ def session_start_operation(
     sess = new_session(name or f"Modeling {doc_name}", doc_name, initial_objects=initial)
     set_current_session(sess)
     _set_last_doc(doc_name)
-    save_session(sess)
+    persist_session(sess)
     return json_response(
         {
             "success": True,
@@ -892,14 +896,35 @@ def session_rollback_operation(
         )
     if to_step == sess.step_count:
         return text_response("Already at this step; nothing to roll back.")
-    blocking = sess.non_atomic_steps_after(to_step)
-    if blocking and not force:
-        return text_response(
-            f"Cannot roll back past step(s) {blocking}: they were made via execute_code "
-            "without a transaction, so undo would revert the wrong change. "
-            "Pass force=True to roll back anyway (at your own risk)."
+    steps_after = sess.steps[to_step:]
+    # Only steps that own an undo entry count toward the undo pops. A
+    # non-atomic step (a same-value edit, a read-only step) provably committed
+    # nothing — the addon's empty-commit probe is the truth source — so it
+    # must neither block the rollback (it used to, demanding force=true after
+    # any trailing inspection) nor consume one of the pops.
+    n = sum(1 for s in steps_after if s.atomic)
+    skipped = [s.step_number for s in steps_after if not s.atomic]
+    if n == 0:
+        removed = sess.truncate_to(to_step)
+        persist_session(sess)
+        return json_response(
+            {
+                "success": True,
+                "rolled_back_to": sess.step_count,
+                "undone_transactions": 0,
+                "removed_steps": [s.step_number for s in removed],
+                "warnings": (
+                    [
+                        f"No step in the range owns an undo entry (steps {skipped} committed "
+                        "nothing), so the log was truncated without touching FreeCAD's undo "
+                        "stack."
+                    ]
+                    if skipped
+                    else []
+                ),
+                "state_matches_log": None,
+            }
         )
-    n = sess.step_count - to_step
     # Read the addon journal BEFORE undoing: the panel can roll back / re-run
     # behind the session log's back, and an undo rewinds the journal too — so a
     # post-undo read would hide exactly the drift this check exists to catch.
@@ -927,6 +952,12 @@ def session_rollback_operation(
             f"{ghosts} transaction(s) belonging to other documents were skipped while "
             "undoing (FreeCAD shares one undo stack across documents)."
         )
+    if skipped:
+        warnings.append(
+            f"Step(s) {skipped} committed nothing (a same-value edit or a read-only step "
+            "owns no undo entry), so undo did not need to touch them; their log rows "
+            "were removed."
+        )
     if undone < n:
         warnings.append(
             f"Only {undone}/{n} transactions could be undone, so the model was NOT fully "
@@ -943,8 +974,21 @@ def session_rollback_operation(
             "rollback; the undo count was taken from the session log and may have rolled "
             "back more or less than intended."
         )
-    removed = sess.truncate_to(sess.step_count - undone)
-    save_session(sess)
+    # Truncate the log to what the undo ACTUALLY covered. With non-atomic
+    # steps in the range, "steps" and "transactions" diverge: undo pops
+    # entries for the LAST `undone` atomic steps only, so the log keeps
+    # everything up to the earliest of those — a non-atomic step ahead of the
+    # cut stays in the log because its (nil) effect is still in the model.
+    # The old formula (step_count - undone) implicitly assumed every step
+    # owned a transaction and kept the wrong rows once they diverge.
+    if undone <= 0:
+        removed = []
+    elif undone >= n:
+        removed = sess.truncate_to(to_step)
+    else:
+        atomic_positions = [i for i, s in enumerate(steps_after) if s.atomic]
+        removed = sess.truncate_to(to_step + atomic_positions[len(atomic_positions) - undone])
+    persist_session(sess)
 
     # Verify what the undo actually did instead of trusting the count. The
     # target state is the fingerprint of the step we rolled back TO, or the
@@ -1030,7 +1074,7 @@ def session_redo_operation(freecad: FreeCADConnection, n: int = 1) -> ToolRespon
             "continuing."
         )
     restored = sess.restore_steps(count)
-    save_session(sess)
+    persist_session(sess)
     if len(restored) != count:
         return json_response(
             {
@@ -1060,7 +1104,7 @@ def session_add_note_operation(note: str, note_type: str = "observation") -> Too
     if err:
         return err
     entry = sess.add_note(note, note_type)
-    save_session(sess)
+    persist_session(sess)
     return json_response({"success": True, "note": entry})
 
 
@@ -1276,7 +1320,7 @@ def session_pause_operation() -> ToolResponse:
     if err:
         return err
     sess.status = "paused"
-    save_session(sess)
+    persist_session(sess)
     set_current_session(None)
     return json_response(
         {
@@ -1300,7 +1344,7 @@ def session_resume_operation(freecad: FreeCADConnection, session_id: str) -> Too
     sess.status = "active"
     set_current_session(sess)
     _set_last_doc(sess.doc_name)
-    save_session(sess)
+    persist_session(sess)
     warning = ""
     try:
         if sess.doc_name not in freecad.list_documents():
@@ -1371,7 +1415,7 @@ def session_complete_operation(
     else:
         pattern_warning = ""
     sess.status = "completed"
-    save_session(sess)
+    persist_session(sess)
     set_current_session(None)
     return json_response(
         {

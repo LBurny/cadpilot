@@ -2269,8 +2269,9 @@ def create_feature_gui(doc, spec):
         raise ValueError(f"unknown feature type {ftype!r}; supported: {', '.join(FEATURE_TYPES)}")
     # Notes are per-build: a replay (step_engine) also calls this, and a note it
     # leaves behind must never be reported as the NEXT caller's outcome.
-    global _AUTO_DIRECTION_NOTE
+    global _AUTO_DIRECTION_NOTE, _LAST_FEATURE_INFO
     _AUTO_DIRECTION_NOTE = ""
+    _LAST_FEATURE_INFO = None
     # Read the Shape of what this feature is built on FIRST: a lazy predecessor
     # makes the new feature compute to nothing, silently (see the helper).
     _settle_shape_caches(doc, spec)

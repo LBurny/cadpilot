@@ -513,6 +513,16 @@ def created_since(records: list[StepRecord], index: int) -> list[str]:
     for rec in records:
         if rec.state != STATE_DONE:
             continue
+        if not getattr(rec, "mutated", True):
+            # A record that provably changed nothing (a snapshot marker, a
+            # skipped read-only step) carries whole-document snapshots as its
+            # before/after span, so its "diff" names the user's own
+            # pre-journal objects — feeding them to a removal set deleted
+            # them (the v0.5.4 data-loss class re-entering via snapshot).
+            # Contribute nothing; still advance the fallback chain.
+            if rec.objects_after:
+                prev_after = set(rec.objects_after)
+            continue
         before = set(rec.objects_before) if rec.objects_before else prev_after
         if rec.index > index:
             created |= set(rec.objects_after or []) - before
@@ -1132,6 +1142,26 @@ def _num(value: float) -> int | float:
     return int(f) if f.is_integer() else f
 
 
+def _normalize_expression(expr: str) -> str:
+    """Whitespace-stripped formula, preserving string literals.
+
+    Blanket ``"".join(expr.split())`` used to strip whitespace INSIDE quoted
+    literals too, so a synced ``=IF(A1="a b",1,2)`` was re-applied as
+    ``=IF(A1="ab",1,2)`` — a corrupted formula written back by
+    reexecute/replay. FreeCAD formulas quote with double quotes and escape a
+    quote by doubling, so toggling on every quote handles both.
+    """
+    out: list[str] = []
+    in_quotes = False
+    for ch in expr:
+        if ch == '"':
+            in_quotes = not in_quotes
+            out.append(ch)
+        elif in_quotes or not ch.isspace():
+            out.append(ch)
+    return "".join(out)
+
+
 def _batch_sync_ops(rec: StepRecord) -> list[tuple[int, str, dict[str, Any]]]:
     """(position, op name, sub-op dict) of a batch record's syncable sub-ops.
 
@@ -1243,7 +1273,13 @@ def tracked_objects(records: list[StepRecord]) -> dict[str, dict[str, Any]]:
             for sub_i, sub_op, sub in _batch_sync_ops(rec):
                 if sub_op == "move":
                     continue  # the fold handler owns move sub-ops
-                props = sub.get("obj_properties") or {}
+                props = sub.get("obj_properties")
+                if not isinstance(props, dict):
+                    # A malformed sub-op is journaled verbatim by design; if
+                    # it reached .items() the whole document's manual-edit
+                    # sync died silently (the exception is swallowed in
+                    # slotChangedObject). Treat as "nothing claimable".
+                    continue
                 claims = {k: k for k, v in props.items() if isinstance(v, (int, float, str, bool))}
                 name = _created_name(rec, sub)
                 if not name:
@@ -1258,7 +1294,9 @@ def tracked_objects(records: list[StepRecord]) -> dict[str, dict[str, Any]]:
                 if _claims_cells(sub_op, props):
                     entry["sheet"] = (rec.index, sub_i)
             continue
-        props = params.get("obj_properties") or {}
+        props = params.get("obj_properties")
+        if not isinstance(props, dict):
+            props = {}
         op = rec.operation
         if op in ("create_object", "edit_object"):
             claims = {k: k for k, v in props.items() if isinstance(v, (int, float, str, bool))}
@@ -1325,7 +1363,7 @@ def map_cell_value(old: Any, live_contents: Any) -> Any:
     if not c:
         return UNREADABLE  # a cleared cell has no spec representation
     if c.startswith("="):
-        return "=" + "".join(c[1:].split())
+        return "=" + _normalize_expression(c[1:])
     if c.startswith("'"):
         text = c[1:].removesuffix("'")
         if len(text) >= 2 and text.startswith('"') and text.endswith('"'):
@@ -1346,7 +1384,7 @@ def map_constraint_value(ctype: str, old: Any, live_value: Any, live_expr: str |
     spec value into ``=expr``, unbinding turns it back into the datum number.
     """
     if live_expr:
-        return "=" + "".join(str(live_expr).split())
+        return "=" + _normalize_expression(str(live_expr))
     try:
         value = float(live_value)
     except (TypeError, ValueError):

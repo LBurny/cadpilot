@@ -239,6 +239,14 @@ def assembly_session_operation(
             return err
         session.joints = [j for j in session.joints if j["name"] != joint]
         astate.save(session)
+        # An unmate deletes the joint object; nothing records how to rebuild
+        # it, so a later assembly_session rollback cannot restore it. Say so
+        # instead of letting the rollback's precomputed undo name a joint
+        # that no longer exists.
+        res.setdefault("warnings", []).append(
+            f"Joint '{joint}' was deleted and is not recoverable by assembly_session "
+            "rollback (the earlier mate step's undo still names it). Re-mate if needed."
+        )
         return json_response(res)
 
     if operation == "rollback":

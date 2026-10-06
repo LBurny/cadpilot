@@ -1290,3 +1290,66 @@ def test_done_after_index_survives_holes_before_the_target():
     assert sj.plan_rollback(recs, 1)["affected"] == [2]
     assert sj.done_after_index(recs, 1) == 1
     assert sj.done_count(recs) - 1 == 0, "the old arithmetic under-rewound by one"
+
+
+# --- round-1 stress findings -------------------------------------------------
+
+
+def _record(index, state=None, mutated=True, before=None, after=None, op="create_object"):
+    rec = sj.StepRecord(
+        index=index,
+        state=state or sj.STATE_DONE,
+        operation=op,
+        label="",
+        params={"obj_name": "x"},
+        atomic=mutated,
+        mutated=mutated,
+    )
+    rec.objects_before = before or []
+    rec.objects_after = after or []
+    return rec
+
+
+def test_created_since_ignores_non_mutated_records():
+    """A snapshot marker stores whole-document before/after spans. Its "diff"
+    names the user's OWN pre-journal objects, and created_since fed exactly
+    that set to _reject/_rollback's removal path: rejecting a baseline
+    snapshot deleted imported geometry with no force prompt (the v0.5.4
+    data-loss class re-entering through the snapshot flow)."""
+    recs = [
+        _record(1, mutated=False, before=[], after=["UserBox", "UserCyl"]),
+        _record(
+            2, mutated=True, before=["UserBox", "UserCyl"], after=["UserBox", "UserCyl", "Box"]
+        ),
+    ]
+    assert sj.created_since(recs, 0) == ["Box"]
+    assert sj.created_since(recs, 1) == ["Box"]
+
+
+def test_created_since_snapshot_only_journal_creates_nothing():
+    recs = [_record(1, mutated=False, before=[], after=["UserBox"])]
+    assert sj.created_since(recs, 0) == []
+
+
+def test_tracked_objects_survives_a_malformed_batch_sub_op():
+    """A batch sub-op with obj_properties as a list/str is journaled verbatim;
+    tracked_objects used to raise AttributeError on it, and the observer
+    swallows exceptions, so the whole document's manual-edit sync died
+    silently and a later reexecute reverted GUI edits."""
+    rec = sj.StepRecord(
+        index=1,
+        state=sj.STATE_DONE,
+        operation="batch",
+        params={"ops": [{"action": "create_object", "obj_name": "A", "obj_properties": ["bad"]}]},
+        objects_before=[],
+        objects_after=["A"],
+    )
+    claims = sj.tracked_objects([rec])
+    assert claims == {} or all(k != "A" for k in claims)
+
+
+def test_normalize_expression_keeps_string_literals():
+    raw = 'IF(A1 = "a b", 1, 2)'
+    out = sj._normalize_expression(raw)
+    assert out == 'IF(A1="a b",1,2)'  # whitespace outside quotes stripped, inside kept
+    assert sj._normalize_expression('"a""b"  c') == '"a""b"c'

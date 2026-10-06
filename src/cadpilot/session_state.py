@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import tempfile
 import threading
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -21,10 +23,25 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+# Session ids are uuid4().hex[:12]. The regex is a path-traversal guard: a
+# session_id is joined into a filename, so a caller-supplied "../.." must be
+# refused before it ever touches the filesystem.
+# Path-safety, not uuid-purity: tests and legacy stores use short
+# ids like "s1". What matters is that no separator or dot can slip
+# through, so the id can never traverse out of its directory.
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def valid_session_id(session_id: str) -> bool:
+    return bool(_SESSION_ID_RE.fullmatch(str(session_id or "")))
+
 
 def data_dir() -> Path:
     """Root directory for MCP-side persistent state (sessions, patterns)."""
-    return Path(os.environ.get("CADPILOT_HOME", Path.home() / ".cadpilot"))
+    # `or` (not a default=) because CADPILOT_HOME="" must not resolve to the
+    # process working directory: Path("") is ".", and sessions/patterns would
+    # silently land wherever the server happened to start.
+    return Path(os.environ.get("CADPILOT_HOME") or (Path.home() / ".cadpilot"))
 
 
 def sessions_dir() -> Path:
@@ -148,18 +165,24 @@ class ModelingSession:
         return removed
 
     def restore_steps(self, n: int) -> list[Step]:
-        """Pop n steps from the redo buffer back onto the log (after a redo)."""
+        """Pop n steps from the redo buffer back onto the log (after a redo).
+
+        Only ATOMIC steps count toward n and are restored: a non-atomic entry
+        in the buffer owns no undo entry, so FreeCAD's redo never re-applied
+        it and its effect never left the model — restoring its log row would
+        desynchronize the log from the document by one step per skipped
+        entry. Such entries are dropped as they surface.
+        """
         restored: list[Step] = []
-        for _ in range(min(n, len(self.redo_buffer))):
+        while len(restored) < n and self.redo_buffer:
             step = self.redo_buffer.pop(0)
+            if not step.atomic:
+                continue
             step.step_number = len(self.steps) + 1
             self.steps.append(step)
             restored.append(step)
         self.updated_at = _now()
         return restored
-
-    def non_atomic_steps_after(self, step_number: int) -> list[int]:
-        return [s.step_number for s in self.steps[step_number:] if not s.atomic]
 
     # --- serialization ------------------------------------------------------
 
@@ -215,21 +238,55 @@ def new_session(
 
 
 def save_session(session: ModelingSession) -> Path:
+    if not valid_session_id(session.session_id):
+        # A session loaded from a hand-edited file could carry any string in
+        # its id field; saving it would write outside CADPILOT_HOME.
+        raise ValueError(f"invalid session id: {session.session_id!r}")
     path = sessions_dir() / f"{session.session_id}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(session.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    # A UNIQUE tmp per write: two overlapping mutations to one session (MCP
+    # tools run on a thread pool) used to share one fixed `<sid>.tmp` and the
+    # loser crashed on os.replace.
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.stem}.", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(session.to_dict(), f, ensure_ascii=False, indent=2)
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
     return path
 
 
+def persist_session(session: ModelingSession) -> str:
+    """save_session for tool paths: a persistence failure must not escape the
+    tool AFTER the mutation itself committed — the caller would see a hard
+    protocol error for a change that actually succeeded, and likely retry it
+    (double-apply). Returns "" on success or a warning to append."""
+    try:
+        save_session(session)
+    except OSError as e:
+        return (
+            f"WARNING: the session could not be persisted ({e}); this step is "
+            "recorded in memory only and will be lost when the server exits."
+        )
+    return ""
+
+
 def load_session(session_id: str) -> ModelingSession | None:
+    if not valid_session_id(session_id):
+        return None
     path = sessions_dir() / f"{session_id}.json"
     if not path.exists():
         return None
     try:
-        return ModelingSession.from_dict(json.loads(path.read_text(encoding="utf-8")))
-    except (json.JSONDecodeError, KeyError, TypeError):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            # Valid JSON of the wrong shape is corrupt the same way: reading
+            # it used to escape as AttributeError out of the tool.
+            return None
+        return ModelingSession.from_dict(data)
+    except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
         return None
 
 
@@ -244,6 +301,8 @@ def list_sessions() -> list[dict[str, Any]]:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             continue
+        if not isinstance(data, dict):
+            continue  # valid JSON of the wrong shape: skip, don't crash
         out.append(
             {
                 "session_id": data.get("session_id", path.stem),

@@ -92,3 +92,15 @@ def test_a_non_list_store_is_corrupt_too(isolated_home):
     store._store_path().write_text('{"patterns": []}', encoding="utf-8")
     with pytest.raises(RuntimeError):
         add_pattern("x", "y")
+
+
+def test_store_of_non_dict_entries_reads_as_unwritable(isolated_home, monkeypatch):
+    """Valid JSON holding non-dict entries used to crash search_patterns'
+    entry.get as AttributeError; treat it like any other corrupt store."""
+    from cadpilot import pattern_store
+
+    monkeypatch.setenv("CADPILOT_HOME", str(isolated_home))
+    path = pattern_store._store_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('["a string", 42]', encoding="utf-8")
+    assert pattern_store._load() is None

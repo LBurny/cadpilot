@@ -357,7 +357,7 @@ def get_objects(
     doc_name: Annotated[str, Field(min_length=1)],
     obj_name: str | None = None,
     limit: Annotated[int, Field(ge=1, le=500)] = 50,
-    offset: Annotated[int, Field(ge=0)] = 0,
+    offset: Annotated[int, Field(ge=0, le=10_000_000)] = 0,
 ) -> list[TextContent]:
     """List a document's objects, or read one object's full properties.
 
@@ -378,7 +378,7 @@ def get_objects(
 def list_documents(
     ctx: Context,
     limit: Annotated[int, Field(ge=1, le=500)] = 50,
-    offset: Annotated[int, Field(ge=0)] = 0,
+    offset: Annotated[int, Field(ge=0, le=10_000_000)] = 0,
 ) -> list[TextContent]:
     """List the open FreeCAD documents.
 
@@ -412,7 +412,7 @@ def session(
     session_id: str = "",
     name: str = "",
     create_document: bool = False,
-    to_step: Annotated[int, Field(ge=0)] | None = None,
+    to_step: Annotated[int, Field(ge=0, le=1_000_000)] | None = None,
     n: Annotated[int, Field(ge=1)] = 1,
     force: bool = False,
     note: str = "",
@@ -422,7 +422,7 @@ def session(
     description: str = "",
     tags: list[str] | None = None,
     limit: Annotated[int, Field(ge=1, le=500)] = 50,
-    offset: Annotated[int, Field(ge=0)] = 0,
+    offset: Annotated[int, Field(ge=0, le=10_000_000)] = 0,
 ) -> list[TextContent]:
     """A modeling session bound to a document; cad() mutations become transaction-backed steps you can roll back or redo.
 
@@ -493,7 +493,7 @@ def get_addon_log(
     ctx: Context,
     level: str = "INFO",
     grep: str = "",
-    since_seq: Annotated[int, Field(ge=0)] = 0,
+    since_seq: Annotated[int, Field(ge=0, le=1_000_000_000)] = 0,
     limit: Annotated[int, Field(ge=1, le=1000)] = 100,
 ) -> list[TextContent]:
     """Read the addon's ring-buffer debug log (newest last) while FreeCAD is wedged or a call misbehaves.
@@ -613,7 +613,7 @@ def get_topology(
     obj_name: str,
     element: Literal["faces", "edges", "vertices"] = "faces",
     limit: Annotated[int, Field(ge=1, le=200)] = 50,
-    offset: Annotated[int, Field(ge=0)] = 0,
+    offset: Annotated[int, Field(ge=0, le=10_000_000)] = 0,
 ) -> list[TextContent]:
     """List an object's topology for selection: faces by area, edges by length, vertices by distance, largest first. The names (Face1, Edge3, ...) feed fillet, boolean, sketch-on-face and friends.
 
@@ -644,7 +644,7 @@ def get_positioning_info(
     doc_name: str,
     obj_name: str,
     element: Literal["face", "edge", "vertex"],
-    element_index: Annotated[int, Field(ge=0)],
+    element_index: Annotated[int, Field(ge=0, le=1_000_000)],
 ) -> list[TextContent]:
     """One face, edge or vertex in global coordinates: center, normal, axis, radius, endpoints; the Placement is already applied. Prefer it over get_topology for precise positioning before alignment or assembly.
 
@@ -663,12 +663,12 @@ def align_shapes(
     doc_name: str,
     obj_name: str,
     element: Literal["face", "edge", "vertex"],
-    element_index: Annotated[int, Field(ge=0)],
+    element_index: Annotated[int, Field(ge=0, le=1_000_000)],
     target_obj: str,
     target_element: Literal["face", "edge", "vertex"],
-    target_element_index: Annotated[int, Field(ge=0)],
+    target_element_index: Annotated[int, Field(ge=0, le=1_000_000)],
     mode: Literal["touch", "center", "axis"] = "touch",
-    offset: float = 0.0,
+    offset: Annotated[float, Field(allow_inf_nan=False)] = 0.0,
 ) -> list[TextContent]:
     """Move an object so the chosen element aligns with an element of the target.
 
@@ -732,7 +732,7 @@ def assemble(
     ctx: Context,
     doc_name: str,
     mates: list[dict[str, Any]],
-    tolerance: Annotated[float, Field(ge=0)] = 0.1,
+    tolerance: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 0.1,
     stop_on_error: bool = True,
 ) -> list[TextContent]:
     """Snap parts together by matching named anchors in one transaction. For persistent joints use assembly_session.
@@ -758,8 +758,8 @@ def verify_assembly(
     ctx: Context,
     doc_name: str,
     checks: list[dict[str, Any]] | None = None,
-    float_threshold: Annotated[float, Field(ge=0)] = 1.0,
-    interference_min_volume: Annotated[float, Field(ge=0)] = 1.0,
+    float_threshold: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 1.0,
+    interference_min_volume: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 1.0,
 ) -> list[TextContent]:
     """Audit a document's spatial health, read-only: floating parts, interferences, and anchor-pair distances. Hidden objects are skipped. Trust these numbers over a screenshot.
 
@@ -791,7 +791,7 @@ def assembly_session(
     b: dict[str, Any] | None = None,
     joint_type: str = "fixed",
     trim: dict[str, Any] | None = None,
-    to_step: Annotated[int, Field(ge=0)] | None = None,
+    to_step: Annotated[int, Field(ge=0, le=1_000_000)] | None = None,
     gap_samples: Annotated[int, Field(ge=2, le=64)] = 8,
 ) -> list[TextContent]:
     """Persistent-joint assembly on FreeCAD's Assembly workbench; prefer it over the one-shot assemble when joints must survive later moves.

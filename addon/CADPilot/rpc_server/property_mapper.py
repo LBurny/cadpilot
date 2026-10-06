@@ -214,6 +214,28 @@ def set_object_property(
                     else:
                         pos = {}
                     rot = val.get("Rotation", {})
+                    if not isinstance(rot, dict):
+                        rot = {}
+                    # Accept the axis/angle(/_deg) spellings too: `move.rotate`
+                    # documents exactly those keys, and a caller reusing that
+                    # shape inside Placement used to get an IDENTITY rotation
+                    # (axis defaulted to (0,0,1), Angle to 0) reported as
+                    # success. Unknown non-empty dicts raise instead of
+                    # silently rotating nothing.
+                    _ROT_KEYS = ("Axis", "axis", "Angle", "angle", "angle_deg", "Angle_deg")
+                    unknown = set(rot) - set(_ROT_KEYS)
+                    if unknown:
+                        raise ValueError(
+                            f"Placement.Rotation accepts {list(_ROT_KEYS)} keys; "
+                            f"got unknown {sorted(unknown)}"
+                        )
+                    axis_in = rot.get("Axis") or rot.get("axis") or {}
+                    if not isinstance(axis_in, dict):
+                        axis_in = {}
+                    if "Angle" in rot or "angle" in rot:
+                        angle = rot.get("Angle", rot.get("angle", 0))
+                    else:
+                        angle = rot.get("angle_deg", rot.get("Angle_deg", 0))
                     placement = FreeCAD.Placement(
                         FreeCAD.Vector(
                             pos.get("x", 0),
@@ -222,11 +244,11 @@ def set_object_property(
                         ),
                         FreeCAD.Rotation(
                             FreeCAD.Vector(
-                                rot.get("Axis", {}).get("x", 0),
-                                rot.get("Axis", {}).get("y", 0),
-                                rot.get("Axis", {}).get("z", 1),
+                                axis_in.get("x", 0),
+                                axis_in.get("y", 0),
+                                axis_in.get("z", 1),
                             ),
-                            rot.get("Angle", 0),
+                            angle,
                         ),
                     )
                     setattr(obj, prop, placement)

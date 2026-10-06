@@ -1,12 +1,18 @@
 """Tests for session_state: step log, rollback bookkeeping, persistence."""
 
+from pathlib import Path
+
+import pytest
+
 from cadpilot.session_state import (
     Step,
+    data_dir,
     get_current_session,
     list_sessions,
     load_session,
     new_session,
     save_session,
+    sessions_dir,
     set_current_session,
 )
 
@@ -40,13 +46,22 @@ def test_truncate_and_restore(isolated_home):
     assert sess.redo_buffer == []
 
 
-def test_non_atomic_steps_after(isolated_home):
+def test_restore_steps_skips_non_atomic_buffer_entries(isolated_home):
+    """A non-atomic step owns no undo entry, so FreeCAD's redo never re-applied
+    it: popping it back onto the log desynchronized the log from the document
+    by one step per skipped entry. The buffer drops such entries as they
+    surface and only atomic ones count toward n."""
     sess = new_session("test", "Doc")
     sess.add_step("create_object", "a")
     sess.add_step("execute_code", "b", atomic=False)
     sess.add_step("edit_object", "c")
-    assert sess.non_atomic_steps_after(1) == [2]
-    assert sess.non_atomic_steps_after(2) == []
+    sess.truncate_to(0)
+    assert [s.step_number for s in sess.redo_buffer] == [1, 2, 3]
+    restored = sess.restore_steps(2)  # redo 2 TRANSACTIONS
+    # Restored steps are RENUMBERED (len(steps)+1), so step 3 re-enters as row 2.
+    assert [s.step_number for s in restored] == [1, 2]  # the non-atomic one is dropped
+    assert sess.step_count == 2
+    assert sess.redo_buffer == []
 
 
 def test_add_note(isolated_home):
@@ -104,3 +119,49 @@ def test_step_from_dict_defaults(isolated_home):
     step = Step.from_dict({"step_number": 1, "operation": "create_object"})
     assert step.atomic is True
     assert step.objects_after == []
+
+
+# --- round-1 stress findings -------------------------------------------------
+
+
+def test_load_and_list_reject_valid_json_of_the_wrong_shape(isolated_home):
+    """A session file containing `[1,2,3]` (or a bare string) parsed fine and
+    then crashed data.get(...) as AttributeError, escaping the tool."""
+    home = isolated_home / "sessions"
+    home.mkdir(parents=True, exist_ok=True)
+    bad = "0123456789ab"
+    (home / f"{bad}.json").write_text("[1,2,3]", encoding="utf-8")
+    (home / "0123456789cd.json").write_text('"just a string"', encoding="utf-8")
+    assert load_session(bad) is None
+    assert list_sessions() == []  # skipped, not crashed
+
+
+def test_session_ids_are_path_safe(isolated_home):
+    """session_id is joined into a filename: `../../secret` used to read any
+    JSON file on disk, and a loaded file's own id field wrote outside
+    CADPILOT_HOME on the next save."""
+    assert load_session("../../secret") is None
+    assert load_session("") is None
+    sess = new_session("t", "Doc")
+    sess.session_id = "../../evil"
+    with pytest.raises(ValueError):
+        save_session(sess)
+
+
+def test_save_survives_a_stale_tmp_file(isolated_home):
+    """Overlapping saves shared one fixed `<sid>.tmp`; the loser crashed on
+    os.replace. Unique tmp names per write make a stale/leftover tmp inert."""
+    sess = new_session("t", "Doc")
+    stale = sessions_dir() / f".{sess.session_id}.0.tmp"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text("garbage", encoding="utf-8")
+    save_session(sess)  # must not raise
+    assert load_session(sess.session_id) is not None
+    assert stale.exists()  # the unique tmp left the stale one untouched
+
+
+def test_empty_cadpilot_home_falls_back_to_the_home_dir(monkeypatch, tmp_path):
+    monkeypatch.setenv("CADPILOT_HOME", "")
+    assert data_dir() == Path.home() / ".cadpilot"
+    monkeypatch.setenv("CADPILOT_HOME", str(tmp_path))
+    assert data_dir() == tmp_path

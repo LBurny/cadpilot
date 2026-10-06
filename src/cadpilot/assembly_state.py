@@ -12,14 +12,23 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
+import tempfile
 import threading
 import uuid
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any
 
 from .session_state import _now, data_dir
 
 logger = logging.getLogger("CADPilot")
+
+# Path-safety, not uuid-purity: tests and legacy stores use short
+# ids like "s1". What matters is that no separator or dot can slip
+# through, so the id can never traverse out of its directory.
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 _lock = threading.Lock()
 _current: AssemblySession | None = None
@@ -63,9 +72,13 @@ def save(session: AssemblySession) -> None:
     session.updated_at = _now()
     path = assembly_dir() / f"{session.session_id}.json"
     payload = asdict(session)
-    tmp = path.with_suffix(".tmp")
+    # Unique tmp per write (see session_state.save_session): a shared fixed
+    # tmp name raced between thread-pool workers and the finally-unlink could
+    # delete a sibling's freshly written tmp.
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.stem}.", suffix=".tmp")
+    tmp = Path(tmp_name)
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=1)
         tmp.replace(path)
     finally:
@@ -74,6 +87,8 @@ def save(session: AssemblySession) -> None:
 
 def load(session_id: str) -> AssemblySession | None:
     """加载会话；文件缺失/损坏/结构不符时返回 None（与 session_state 一致）。"""
+    if not _SESSION_ID_RE.fullmatch(str(session_id or "")):
+        return None  # session_id 会拼进文件名：拒绝路径穿越
     path = assembly_dir() / f"{session_id}.json"
     if not path.exists():
         return None

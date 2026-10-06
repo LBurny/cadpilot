@@ -384,7 +384,15 @@ def _settle_shapes(doc, asm) -> None:
 def _op_start(doc, spec: dict) -> dict:
     JointObject, UtilsAssembly = _joint_mods()
     if doc.getObject(ASSEMBLY_NAME) is not None:
-        raise ValueError(f"{ASSEMBLY_NAME} already exists; complete/delete it first")
+        raise ValueError(
+            f'{ASSEMBLY_NAME} already exists and no active MCP session owns it '
+            "(complete never deletes the assembly; it stays as the model's joints). "
+            "To start over, delete it via execute_code first: "
+            "doc = App.ActiveDocument; "
+            "asm = doc.getObject('MCP_Assembly'); "
+            "[doc.removeObject(o.Name) for o in list(asm.OutList)]; "
+            "doc.removeObject('MCP_Assembly'); doc.recompute()"
+        )
     asm = doc.addObject("Assembly::AssemblyObject", ASSEMBLY_NAME)
     asm.Type = "Assembly"  # without this the solver treats it as non-assembly
     link = _wrap_link(doc, asm, spec["ground"])

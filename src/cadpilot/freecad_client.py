@@ -8,10 +8,48 @@ from typing import Any
 logger = logging.getLogger("CADPilot")
 
 # Errors that mean the TCP connection is dead (FreeCAD restarted, addon
-# restarted, socket reset). Retrying once on a fresh proxy is safe.
+# restarted, socket reset). Retrying once on a fresh proxy is safe for reads.
 # socket.timeout is deliberately excluded: a timeout may mean FreeCAD is
 # still executing the request, and retrying would double-execute it.
 _RECOVERABLE_ERRORS = (ConnectionError, http.client.HTTPException)
+
+# Methods whose effect is entirely reading: losing the response costs nothing,
+# so the rebuild-and-retry below is safe. EVERY OTHER method — including any
+# future one, so the safe default forgets nothing — is treated as mutating:
+# http.client.IncompleteRead and RemoteDisconnected arrive AFTER the request
+# was delivered, and a server that processed the request before the connection
+# died makes a retry a silent second execution (an object created twice, a
+# snippet run twice, two transactions undone).
+_RETRYABLE_METHODS = frozenset(
+    {
+        "ping",
+        "get_gui_state",
+        "dismiss_blocking_dialog",
+        "get_active_screenshot",
+        "get_last_screenshot_error",
+        "get_objects",
+        "get_object",
+        "list_documents",
+        "inspect_freecad",
+        "measure_geometry",
+        "get_topology",
+        "check_interference",
+        "get_positioning_info",
+        "get_anchors",
+        "verify_assembly",
+        "get_step_journal",
+        "get_addon_log",
+        "get_task_result",
+    }
+)
+
+# A dispatch-shape TypeError can only come from the XML-RPC dispatcher
+# resolving the method against its signature — before the handler body ran,
+# so nothing executed and the legacy tail-less retry is safe. An application
+# TypeError that faults after a mutation committed has a different message
+# and must NOT hit that fallback (it used to, re-running the mutation without
+# its doc_name binding, onto whatever document was active).
+_DISPATCH_SHAPE_ERRORS = ("positional argument", "keyword argument", "is not supported")
 
 # Connection-refused means the TCP connect itself failed, so nothing was sent
 # and retrying cannot double-execute an operation. The addon's watchdog
@@ -115,7 +153,18 @@ class FreeCADConnection:
     def _invoke_once(self, method: str, *args):
         try:
             return getattr(self.server, method)(*args)
+        except ConnectionRefusedError:
+            # Nothing was sent — the grace window in _invoke owns this case.
+            raise
         except _RECOVERABLE_ERRORS as e:
+            if method not in _RETRYABLE_METHODS:
+                raise RuntimeError(
+                    f"RPC '{method}': the response was lost ({type(e).__name__}) after the "
+                    "request was delivered, so the operation MAY have been applied in "
+                    "FreeCAD. Inspect the document (get_objects / measure_geometry) "
+                    "before repeating it — blindly retrying would double-apply the "
+                    "mutation."
+                ) from e
             logger.warning(
                 f"RPC connection lost during '{method}' ({e}); reconnecting and retrying once"
             )
@@ -138,7 +187,9 @@ class FreeCADConnection:
 
         Falls back to the legacy two-call path (op + get_active_screenshot)
         when the addon predates the screenshot or doc_name parameter, so a new
-        MCP server keeps working against an old addon install.
+        MCP server keeps working against an old addon install. The fallback
+        fires only for DISPATCH-SHAPE errors (see _DISPATCH_SHAPE_ERRORS):
+        those prove the handler never ran, so re-sending cannot double-apply.
         """
         if screenshot is None and doc_name is None:
             return self._invoke(method, *args)
@@ -152,7 +203,7 @@ class FreeCADConnection:
         try:
             return self._invoke(method, *args, *tail)
         except xmlrpc.client.Fault as e:
-            if "TypeError" not in str(e):
+            if not any(tok in str(e) for tok in _DISPATCH_SHAPE_ERRORS):
                 raise
             logger.info(
                 f"Addon does not support inline screenshots for '{method}'; using legacy path"

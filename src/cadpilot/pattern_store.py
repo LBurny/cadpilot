@@ -14,7 +14,9 @@ hundreds of entries, so embeddings would be overkill.
 from __future__ import annotations
 
 import json
+import os
 import re
+import tempfile
 import threading
 import uuid
 from datetime import datetime
@@ -48,16 +50,28 @@ def _load() -> list[dict[str, Any]] | None:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
-    # Valid JSON that is not a list is corrupt in exactly the same way.
-    return data if isinstance(data, list) else None
+    # Valid JSON of the wrong shape is corrupt in exactly the same way: a
+    # non-list, or a list holding non-dict entries, would crash the readers
+    # (entry.get) out of the tool. None is the do-not-write signal, so a
+    # store we cannot fully parse is never silently overwritten.
+    if not isinstance(data, list) or not all(isinstance(e, dict) for e in data):
+        return None
+    return data
 
 
 def _save(patterns: list[dict[str, Any]]) -> None:
     path = _store_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(patterns, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    # A unique tmp per write: overlapping saves shared one fixed `<file>.tmp`
+    # and the loser crashed on os.replace (MCP tools run on a thread pool).
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.stem}.", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(patterns, f, ensure_ascii=False, indent=2)
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def add_pattern(
